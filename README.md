@@ -50,9 +50,17 @@ useful beyond multikernel:
   read-only image that can be placed in any memory region (physical address, DAX device,
   or dma-buf) with no runtime allocation or device management.
 
+## Source Layout
+
+```
+include/daxfs_format.h   - On-disk format (shared by kernel module and user-space)
+kernel/                  - Kernel module source
+mkdaxfs/                 - User-space image builder
+```
+
 ## Building
 
-DAXFS builds as an out-of-tree kernel module:
+Build everything (kernel module + mkdaxfs):
 
 ```bash
 make                            # build against the running kernel
@@ -60,7 +68,29 @@ make KDIR=/path/to/kernel/build # build against a specific kernel
 make clean
 ```
 
+Build individually:
+
+```bash
+make kernel                     # kernel module only
+make mkdaxfs                    # user-space tool only
+```
+
 The target kernel must have `CONFIG_FS_DAX` enabled.
+
+## Creating Images
+
+`mkdaxfs` creates a daxfs image from a directory tree:
+
+```bash
+# Write to a file
+mkdaxfs -d /path/to/rootfs -o image.daxfs
+
+# Allocate from a DMA heap and mount
+mkdaxfs -d /path/to/rootfs -H /dev/dma_heap/multikernel -s 256M -m /mnt
+
+# Write to a physical address via /dev/mem
+mkdaxfs -d /path/to/rootfs -p 0x100000000 -s 256M
+```
 
 ## Mounting
 
@@ -132,8 +162,8 @@ daxfs holds a reference to the dma-buf for the lifetime of the mount and release
 
 ## On-Disk Format
 
-The format is defined in `daxfs_format.h`, which can be included by both the kernel module
-and user-space tools (e.g., an image builder).
+The format is defined in `include/daxfs_format.h`, shared by both the kernel module
+and user-space tools.
 
 A daxfs image has the following layout:
 
