@@ -72,10 +72,50 @@ useful beyond multikernel:
 
 ## Branching
 
-DAXFS supports copy-on-write branches, similar to git branches or container layers.
-A read-only base image provides the initial filesystem state, and each branch maintains
-its own delta log for modifications. Multiple branches can share the same base image,
-and branches can be created from other branches.
+DAXFS supports copy-on-write branches for speculative modifications. A read-only base
+image provides the initial filesystem state, and each branch maintains its own delta
+log for modifications. Branches can be nested (branch from a branch) for multi-level
+speculation.
+
+Unlike git, DAXFS branches are mutually exclusive: committing a branch discards all
+sibling branches, and aborting discards the current branch and returns to the root.
+This models the AI agent use case: an agent can speculatively modify the filesystem,
+explore multiple approaches in nested branches, then commit the successful path or
+abort failed attempts. There is no merge, no parallel long-lived branches - just
+speculative execution with a single winner.
+
+### Why not existing filesystems?
+
+| Filesystem | Log-structured | In-memory index | Hierarchical branches |
+|------------|----------------|-----------------|----------------------|
+| NILFS2 | Yes | Yes | No (linear snapshots) |
+| Btrfs | No (CoW B-tree) | No | Yes |
+| F2FS | Yes | Yes | No |
+| DAXFS | Yes | Yes | Yes |
+
+**NILFS2** uses continuous checkpointing, every sync creates a new checkpoint, and you
+can mount any checkpoint read-only. But checkpoints are linear (a timeline), not a tree.
+You cannot branch from a checkpoint, make changes, and commit independently. Converting
+a checkpoint to a snapshot protects it from garbage collection, but creating a writable
+branch from it would invalidate all subsequent checkpoints. The commit model assumes
+a single linear history.
+
+**Btrfs** supports snapshots that can themselves be snapshotted, creating a tree of
+subvolumes. However, Btrfs snapshots are full subvolumes sharing data blocks via
+reflinks. There's no built-in commit/abort semantic — "committing" is just setting
+read-only, "aborting" is deleting the subvolume. More importantly, Btrfs has no
+mechanism to discard sibling branches on commit. Each subvolume lives independently,
+so you'd need external tooling to enforce the "single winner" model that DAXFS
+provides natively.
+
+**EROFS** is architecturally incompatible with branching. Immutability is fundamental:
+inode locations are computed directly (`iloc = meta_blkaddr + (nid << islotbits)`),
+directory entries are pre-sorted for binary search, and no write path exists. Adding
+branching would require indirection on every inode lookup, unsorted delta directories
+merged at read time, and a complete write path - negating the performance that makes
+EROFS attractive.
+
+### Usage
 
 ```bash
 # Mount with a writable branch
@@ -93,16 +133,21 @@ daxfs-branch commit -m /mnt
 daxfs-branch abort -m /mnt
 ```
 
-Branch operations:
+### Branch operations
+
 - **create** — Create a new branch from a parent branch
 - **switch** — Switch the mount to a different branch
 - **list** — List all branches and their states
-- **commit** — Mark the current branch as committed (immutable)
-- **abort** — Discard all changes in the current branch
+- **commit** — Make current branch permanent, discard all sibling branches
+- **abort** — Discard current branch, switch back to root
+
+### Delta log
 
 Delta entries track writes, creates, deletes, truncates, renames, and attribute changes.
 When reading a file, DAXFS checks the branch's delta log first, falling back to parent
-branches and ultimately the base image.
+branches and ultimately the base image. Each branch maintains an in-memory index
+(rb-tree) over its delta log for fast lookups — the log-structured append-only format
+keeps writes fast while the index keeps reads fast.
 
 ## Source Layout
 
