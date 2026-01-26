@@ -115,6 +115,13 @@ branching would require indirection on every inode lookup, unsorted delta direct
 merged at read time, and a complete write path - negating the performance that makes
 EROFS attractive.
 
+| Component | EROFS today | With branching |
+|-----------|-------------|----------------|
+| Inode lookup | O(1) direct compute | O(branches) chain walk + index lookup |
+| Directory read | Binary search on sorted entries | Merge sorted base + unsorted deltas |
+| Read path | Direct to data | Check delta index first |
+| Write path | Doesn't exist | Full implementation needed |
+
 ### Usage
 
 ```bash
