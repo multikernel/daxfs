@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * daxfs-inspect - Image inspection utility for daxfs
+ * daxfs-inspect - Inspection utility for daxfs
  *
  * Copyright (C) 2026 Multikernel Technologies, Inc. All rights reserved.
  *
- * Read-only inspection of daxfs image files: list branches, show info, status.
+ * Read-only inspection of daxfs via physical memory (/dev/mem).
+ * Can parse mount point to automatically get phys/size from mountinfo.
  *
  * Usage:
- *   daxfs-inspect list -f image.daxfs
- *   daxfs-inspect info -f image.daxfs -b main
- *   daxfs-inspect status -f image.daxfs
+ *   daxfs-inspect list -m /mnt/daxfs
+ *   daxfs-inspect list -p 0x100000000 -s 256M
+ *   daxfs-inspect info -m /mnt/daxfs -b main
+ *   daxfs-inspect status -m /mnt/daxfs
  */
 
 #define _GNU_SOURCE
@@ -19,6 +21,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <getopt.h>
@@ -84,32 +87,145 @@ static struct daxfs_branch *find_branch_by_id(uint64_t id)
 	return NULL;
 }
 
-static int open_image(const char *path)
+/*
+ * Parse /proc/self/mountinfo for a daxfs mount and extract phys/size.
+ * Returns 0 on success, -1 on failure.
+ *
+ * mountinfo format example:
+ * 52 33 0:83 / /mnt/daxfs rw,relatime shared:27 - daxfs none rw,phys=0x100000000,size=33554432,branch=/main
+ */
+static int parse_mountinfo(const char *mount_point, unsigned long long *phys_addr,
+			   size_t *size)
+{
+	FILE *fp;
+	char *line = NULL;
+	size_t len = 0;
+	ssize_t read;
+	int found = 0;
+	char resolved_mount[PATH_MAX];
+
+	/* Resolve to canonical path for matching */
+	if (!realpath(mount_point, resolved_mount)) {
+		perror("realpath");
+		return -1;
+	}
+
+	fp = fopen("/proc/self/mountinfo", "r");
+	if (!fp) {
+		perror("/proc/self/mountinfo");
+		return -1;
+	}
+
+	while ((read = getline(&line, &len, fp)) != -1) {
+		char *mnt_path, *fs_type, *options;
+		char *saveptr, *token;
+		char *dash;
+
+		/* Skip to field 5 (mount point) */
+		token = strtok_r(line, " ", &saveptr);  /* mount ID */
+		if (!token) continue;
+		token = strtok_r(NULL, " ", &saveptr);  /* parent ID */
+		if (!token) continue;
+		token = strtok_r(NULL, " ", &saveptr);  /* major:minor */
+		if (!token) continue;
+		token = strtok_r(NULL, " ", &saveptr);  /* root */
+		if (!token) continue;
+		mnt_path = strtok_r(NULL, " ", &saveptr);  /* mount point */
+		if (!mnt_path) continue;
+
+		/* Check if this is our mount point */
+		if (strcmp(mnt_path, resolved_mount) != 0)
+			continue;
+
+		/* Find the "-" separator */
+		dash = strstr(saveptr, " - ");
+		if (!dash)
+			continue;
+
+		dash += 3;  /* Skip " - " */
+		fs_type = strtok_r(dash, " ", &saveptr);
+		if (!fs_type || strcmp(fs_type, "daxfs") != 0)
+			continue;
+
+		/* Skip device name */
+		token = strtok_r(NULL, " ", &saveptr);
+		if (!token) continue;
+
+		/* Get fs options */
+		options = strtok_r(NULL, "\n", &saveptr);
+		if (!options) continue;
+
+		/* Parse options looking for phys= and size= */
+		char *opts_copy = strdup(options);
+		char *opt_saveptr;
+		char *opt = strtok_r(opts_copy, ",", &opt_saveptr);
+		bool got_phys = false, got_size = false;
+
+		while (opt) {
+			if (strncmp(opt, "phys=", 5) == 0) {
+				*phys_addr = strtoull(opt + 5, NULL, 0);
+				got_phys = true;
+			} else if (strncmp(opt, "size=", 5) == 0) {
+				*size = strtoull(opt + 5, NULL, 0);
+				got_size = true;
+			}
+			opt = strtok_r(NULL, ",", &opt_saveptr);
+		}
+		free(opts_copy);
+
+		if (got_phys && got_size) {
+			found = 1;
+			break;
+		} else if (!got_phys) {
+			fprintf(stderr, "Error: daxfs mount at %s does not expose phys address\n",
+				mount_point);
+			fprintf(stderr, "Note: phys is only available when mounted via phys= option\n");
+			fprintf(stderr, "      or from a dma-buf with known physical address\n");
+			break;
+		} else if (!got_size) {
+			fprintf(stderr, "Error: daxfs mount at %s missing size option\n",
+				mount_point);
+			break;
+		}
+	}
+
+	free(line);
+	fclose(fp);
+
+	if (!found) {
+		if (!found)
+			fprintf(stderr, "Error: %s is not a daxfs mount point\n", mount_point);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int open_phys(unsigned long long phys_addr, size_t size)
 {
 	int fd;
-	struct stat st;
 
-	fd = open(path, O_RDONLY);
+	fd = open("/dev/mem", O_RDONLY | O_SYNC);
 	if (fd < 0) {
-		perror(path);
+		perror("/dev/mem");
+		fprintf(stderr, "Note: /dev/mem access may require root or CAP_SYS_RAWIO\n");
 		return -1;
 	}
 
-	if (fstat(fd, &st) < 0) {
-		perror("fstat");
-		close(fd);
-		return -1;
-	}
-
-	mem_size = st.st_size;
-	mem = mmap(NULL, mem_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	mem_size = size;
+	mem = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, phys_addr);
 	close(fd);
 
 	if (mem == MAP_FAILED) {
-		perror("mmap");
+		perror("mmap /dev/mem");
 		return -1;
 	}
 
+	return 0;
+}
+
+static int validate_and_setup(void)
+{
 	super = mem;
 	if (le32_to_cpu(super->magic) != DAXFS_SUPER_MAGIC) {
 		fprintf(stderr, "Error: invalid magic 0x%x (expected 0x%x)\n",
@@ -122,7 +238,7 @@ static int open_image(const char *path)
 	return 0;
 }
 
-static void close_image(void)
+static void close_mem(void)
 {
 	if (mem && mem != MAP_FAILED)
 		munmap(mem, mem_size);
@@ -225,7 +341,7 @@ static int cmd_info(const char *name)
 	if (delta_used > 0) {
 		void *delta_log = mem + delta_offset;
 		uint64_t offset = 0;
-		uint32_t entry_counts[8] = {0};
+		uint32_t entry_counts[9] = {0};
 
 		while (offset < delta_used) {
 			struct daxfs_delta_hdr *hdr = delta_log + offset;
@@ -235,7 +351,7 @@ static int cmd_info(const char *name)
 			if (size == 0 || offset + size > delta_used)
 				break;
 
-			if (type < 8)
+			if (type < 9)
 				entry_counts[type]++;
 
 			offset += size;
@@ -256,6 +372,8 @@ static int cmd_info(const char *name)
 			printf("    RENAME:    %u\n", entry_counts[DAXFS_DELTA_RENAME]);
 		if (entry_counts[DAXFS_DELTA_SETATTR])
 			printf("    SETATTR:   %u\n", entry_counts[DAXFS_DELTA_SETATTR]);
+		if (entry_counts[DAXFS_DELTA_SYMLINK])
+			printf("    SYMLINK:   %u\n", entry_counts[DAXFS_DELTA_SYMLINK]);
 	}
 
 	return 0;
@@ -276,8 +394,8 @@ static int cmd_status(void)
 	uint64_t commit_seq = le64_to_cpu(super->coord.commit_sequence);
 	uint64_t last_committed = le64_to_cpu(super->coord.last_committed_id);
 
-	printf("DAXFS Image Status\n");
-	printf("==================\n\n");
+	printf("DAXFS Memory Status\n");
+	printf("===================\n\n");
 
 	printf("Format:\n");
 	printf("  Magic:           0x%x\n", le32_to_cpu(super->magic));
@@ -331,29 +449,37 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "\nCommands:\n");
 	fprintf(stderr, "  list              List all branches\n");
 	fprintf(stderr, "  info              Show branch details\n");
-	fprintf(stderr, "  status            Show image status\n");
+	fprintf(stderr, "  status            Show memory status\n");
 	fprintf(stderr, "\nOptions:\n");
-	fprintf(stderr, "  -f, --file FILE   Image file (required)\n");
-	fprintf(stderr, "  -b, --branch NAME Branch name (for info)\n");
+	fprintf(stderr, "  -m, --mount PATH  Mount point (reads phys/size from mountinfo)\n");
+	fprintf(stderr, "  -p, --phys ADDR   Physical memory address (manual)\n");
+	fprintf(stderr, "  -s, --size SIZE   Memory size (required with -p)\n");
+	fprintf(stderr, "  -b, --branch NAME Branch name (for info command)\n");
 	fprintf(stderr, "  -h, --help        Show this help\n");
 	fprintf(stderr, "\nExamples:\n");
-	fprintf(stderr, "  %s list -f image.daxfs\n", prog);
-	fprintf(stderr, "  %s info -f image.daxfs -b main\n", prog);
-	fprintf(stderr, "  %s status -f image.daxfs\n", prog);
+	fprintf(stderr, "  %s list -m /mnt/daxfs\n", prog);
+	fprintf(stderr, "  %s list -p 0x100000000 -s 256M\n", prog);
+	fprintf(stderr, "  %s info -m /mnt/daxfs -b main\n", prog);
+	fprintf(stderr, "  %s status -m /mnt/daxfs\n", prog);
+	fprintf(stderr, "\nNote: Requires root or CAP_SYS_RAWIO for /dev/mem access.\n");
 }
 
 int main(int argc, char *argv[])
 {
 	static struct option long_options[] = {
-		{"file", required_argument, 0, 'f'},
+		{"mount", required_argument, 0, 'm'},
+		{"phys", required_argument, 0, 'p'},
+		{"size", required_argument, 0, 's'},
 		{"branch", required_argument, 0, 'b'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	char *image_file = NULL;
+	char *mount_point = NULL;
 	char *branch_name = NULL;
 	char *command = NULL;
+	unsigned long long phys_addr = 0;
+	size_t size = 0;
 	int opt;
 	int ret = 1;
 
@@ -365,10 +491,22 @@ int main(int argc, char *argv[])
 	command = argv[1];
 	optind = 2;  /* Start parsing after command */
 
-	while ((opt = getopt_long(argc, argv, "f:b:h", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "m:p:s:b:h", long_options, NULL)) != -1) {
 		switch (opt) {
-		case 'f':
-			image_file = optarg;
+		case 'm':
+			mount_point = optarg;
+			break;
+		case 'p':
+			phys_addr = strtoull(optarg, NULL, 0);
+			break;
+		case 's':
+			size = strtoull(optarg, NULL, 0);
+			if (strchr(optarg, 'M') || strchr(optarg, 'm'))
+				size *= 1024 * 1024;
+			else if (strchr(optarg, 'G') || strchr(optarg, 'g'))
+				size *= 1024 * 1024 * 1024;
+			else if (strchr(optarg, 'K') || strchr(optarg, 'k'))
+				size *= 1024;
 			break;
 		case 'b':
 			branch_name = optarg;
@@ -382,13 +520,35 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (!image_file) {
-		fprintf(stderr, "Error: -f/--file is required\n");
+	/* Handle mount point option - parse mountinfo for phys/size */
+	if (mount_point) {
+		if (phys_addr || size) {
+			fprintf(stderr, "Error: cannot use -m with -p/-s\n");
+			print_usage(argv[0]);
+			return 1;
+		}
+		if (parse_mountinfo(mount_point, &phys_addr, &size) < 0)
+			return 1;
+	}
+
+	/* Validate options */
+	if (!phys_addr) {
+		fprintf(stderr, "Error: -m/--mount or -p/--phys is required\n");
 		print_usage(argv[0]);
 		return 1;
 	}
 
-	if (open_image(image_file) < 0)
+	if (!size) {
+		fprintf(stderr, "Error: -s/--size is required with -p/--phys\n");
+		print_usage(argv[0]);
+		return 1;
+	}
+
+	/* Open physical memory */
+	if (open_phys(phys_addr, size) < 0)
+		return 1;
+
+	if (validate_and_setup() < 0)
 		return 1;
 
 	if (strcmp(command, "list") == 0) {
@@ -412,6 +572,6 @@ int main(int argc, char *argv[])
 		ret = 1;
 	}
 
-	close_image();
+	close_mem();
 	return ret;
 }
