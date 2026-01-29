@@ -89,6 +89,9 @@ struct daxfs_branch_ctx {
 
 	atomic_t refcount;		/* Child branches + active mounts */
 	bool committed;			/* True if commit was requested */
+
+	/* Generation tracking for invalidation detection */
+	u32 cached_generation;		/* Cached from on_dax->generation */
 };
 
 /*
@@ -130,6 +133,10 @@ struct daxfs_info {
 
 	/* Open file tracking for mmap safety */
 	atomic_t open_files;		/* Count of open regular files */
+
+	/* Global coordination for cross-mount synchronization */
+	struct daxfs_global_coord *coord;  /* Pointer to DAX coordination area */
+	u64 cached_commit_seq;		   /* Last observed commit sequence */
 };
 
 struct daxfs_inode_info {
@@ -229,6 +236,8 @@ extern int daxfs_branch_commit(struct daxfs_info *info,
 extern int daxfs_branch_abort(struct daxfs_info *info,
 			      struct daxfs_branch_ctx *branch);
 extern int daxfs_init_main_branch(struct daxfs_info *info);
+extern bool daxfs_branch_is_valid(struct daxfs_info *info);
+extern bool daxfs_commit_seq_changed(struct daxfs_info *info);
 
 /*
  * ============================================================================

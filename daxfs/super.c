@@ -324,9 +324,9 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	/* Validate magic */
 	magic = le32_to_cpu(*((__le32 *)daxfs_mem_ptr(info, 0)));
-	if (magic != DAXFS_MAGIC) {
+	if (magic != DAXFS_SUPER_MAGIC) {
 		pr_err("daxfs: invalid magic 0x%x (expected 0x%x)\n",
-		       magic, DAXFS_MAGIC);
+		       magic, DAXFS_SUPER_MAGIC);
 		ret = -EINVAL;
 		goto err_unmap;
 	}
@@ -377,7 +377,7 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 
 	sb->s_op = &daxfs_super_ops;
-	sb->s_magic = DAXFS_MAGIC;
+	sb->s_magic = DAXFS_SUPER_MAGIC;
 
 	/*
 	 * Static image (no branch table) - read-only, no branching
@@ -396,6 +396,15 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		le64_to_cpu(info->super->branch_table_offset));
 	info->delta_alloc_offset =
 		le64_to_cpu(info->super->delta_alloc_offset);
+
+	/* Initialize coordination pointer (embedded in superblock) */
+	info->coord = &info->super->coord;
+
+	/* First mount initializes coordination */
+	if (le64_to_cpu(info->coord->commit_sequence) == 0)
+		info->coord->commit_sequence = cpu_to_le64(1);
+
+	info->cached_commit_seq = le64_to_cpu(info->coord->commit_sequence);
 
 	/* Check if read-only was requested via standard VFS flags */
 	if (fc->sb_flags & SB_RDONLY)
@@ -682,7 +691,7 @@ static int daxfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	struct daxfs_info *info = DAXFS_SB(dentry->d_sb);
 
-	buf->f_type = DAXFS_MAGIC;
+	buf->f_type = DAXFS_SUPER_MAGIC;
 	buf->f_bsize = DAXFS_BLOCK_SIZE;
 	buf->f_blocks = info->size / DAXFS_BLOCK_SIZE;
 

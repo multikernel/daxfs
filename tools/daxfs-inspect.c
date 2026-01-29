@@ -111,9 +111,9 @@ static int open_image(const char *path)
 	}
 
 	super = mem;
-	if (le32_to_cpu(super->magic) != DAXFS_MAGIC) {
+	if (le32_to_cpu(super->magic) != DAXFS_SUPER_MAGIC) {
 		fprintf(stderr, "Error: invalid magic 0x%x (expected 0x%x)\n",
-			le32_to_cpu(super->magic), DAXFS_MAGIC);
+			le32_to_cpu(super->magic), DAXFS_SUPER_MAGIC);
 		munmap(mem, mem_size);
 		return -1;
 	}
@@ -133,11 +133,11 @@ static int cmd_list(void)
 	uint32_t count = le32_to_cpu(super->branch_table_entries);
 	uint32_t active = 0;
 
-	printf("%-4s  %-20s  %-10s  %-10s  %-8s  %-12s  %s\n",
-	       "ID", "NAME", "STATE", "PARENT", "REFCNT", "DELTA_USED", "DELTA_CAP");
-	printf("%-4s  %-20s  %-10s  %-10s  %-8s  %-12s  %s\n",
+	printf("%-4s  %-20s  %-10s  %-10s  %-8s  %-6s  %-12s  %s\n",
+	       "ID", "NAME", "STATE", "PARENT", "REFCNT", "GEN", "DELTA_USED", "DELTA_CAP");
+	printf("%-4s  %-20s  %-10s  %-10s  %-8s  %-6s  %-12s  %s\n",
 	       "----", "--------------------", "----------", "----------",
-	       "--------", "------------", "------------");
+	       "--------", "------", "------------", "------------");
 
 	for (uint32_t i = 0; i < count; i++) {
 		struct daxfs_branch *b = &branch_table[i];
@@ -151,6 +151,7 @@ static int cmd_list(void)
 		uint64_t id = le64_to_cpu(b->branch_id);
 		uint64_t parent_id = le64_to_cpu(b->parent_id);
 		uint32_t refcount = le32_to_cpu(b->refcount);
+		uint32_t generation = le32_to_cpu(b->generation);
 		uint64_t delta_used = le64_to_cpu(b->delta_log_size);
 		uint64_t delta_cap = le64_to_cpu(b->delta_log_capacity);
 
@@ -165,9 +166,9 @@ static int cmd_list(void)
 				snprintf(parent_str, sizeof(parent_str), "id:%lu", parent_id);
 		}
 
-		printf("%-4lu  %-20s  %-10s  %-10s  %-8u  %-12lu  %lu\n",
+		printf("%-4lu  %-20s  %-10s  %-10s  %-8u  %-6u  %-12lu  %lu\n",
 		       id, b->name, state_to_string(state), parent_str,
-		       refcount, delta_used, delta_cap);
+		       refcount, generation, delta_used, delta_cap);
 	}
 
 	printf("\nTotal: %u branches, %u slots available\n",
@@ -188,6 +189,7 @@ static int cmd_info(const char *name)
 	uint64_t parent_id = le64_to_cpu(b->parent_id);
 	uint32_t state = le32_to_cpu(b->state);
 	uint32_t refcount = le32_to_cpu(b->refcount);
+	uint32_t generation = le32_to_cpu(b->generation);
 	uint64_t delta_offset = le64_to_cpu(b->delta_log_offset);
 	uint64_t delta_used = le64_to_cpu(b->delta_log_size);
 	uint64_t delta_cap = le64_to_cpu(b->delta_log_capacity);
@@ -196,6 +198,7 @@ static int cmd_info(const char *name)
 	printf("Branch: %s\n", b->name);
 	printf("  ID:              %lu\n", id);
 	printf("  State:           %s\n", state_to_string(state));
+	printf("  Generation:      %u\n", generation);
 
 	if (parent_id == 0) {
 		printf("  Parent:          (none - root branch)\n");
@@ -270,6 +273,8 @@ static int cmd_status(void)
 	uint32_t active_branches = le32_to_cpu(super->active_branches);
 	uint64_t next_inode = le64_to_cpu(super->next_inode_id);
 	uint64_t next_branch = le64_to_cpu(super->next_branch_id);
+	uint64_t commit_seq = le64_to_cpu(super->coord.commit_sequence);
+	uint64_t last_committed = le64_to_cpu(super->coord.last_committed_id);
 
 	printf("DAXFS Image Status\n");
 	printf("==================\n\n");
@@ -290,6 +295,18 @@ static int cmd_status(void)
 	printf("  Entries:         %u (max)\n", branch_entries);
 	printf("  Active:          %u\n", active_branches);
 	printf("  Next branch ID:  %lu\n", next_branch);
+
+	printf("\nGlobal coordination:\n");
+	printf("  Commit sequence: %lu\n", commit_seq);
+	if (last_committed > 0) {
+		struct daxfs_branch *b = find_branch_by_id(last_committed);
+		if (b)
+			printf("  Last committed:  %s (id:%lu)\n", b->name, last_committed);
+		else
+			printf("  Last committed:  id:%lu\n", last_committed);
+	} else {
+		printf("  Last committed:  (none)\n");
+	}
 
 	printf("\nDelta region:\n");
 	printf("  Offset:          0x%lx\n", delta_region_offset);

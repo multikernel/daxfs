@@ -14,6 +14,49 @@
 #define INITIAL_DELTA_SIZE	(64 * 1024)	/* 64KB initial delta log */
 
 /*
+ * DAX memory spinlock - simple test-and-set for cross-mount coordination
+ */
+static inline void daxfs_coord_lock(struct daxfs_info *info)
+{
+	while (cmpxchg(&info->coord->coord_lock, 0, 1) != 0)
+		cpu_relax();
+}
+
+static inline void daxfs_coord_unlock(struct daxfs_info *info)
+{
+	smp_store_release(&info->coord->coord_lock, 0);
+}
+
+/*
+ * Fast check if any commit happened since last check
+ */
+bool daxfs_commit_seq_changed(struct daxfs_info *info)
+{
+	u64 cur_seq;
+
+	if (!info->coord)
+		return false;
+
+	cur_seq = le64_to_cpu(READ_ONCE(info->coord->commit_sequence));
+	return cur_seq != info->cached_commit_seq;
+}
+
+/*
+ * Full branch validity check
+ */
+bool daxfs_branch_is_valid(struct daxfs_info *info)
+{
+	struct daxfs_branch_ctx *branch = info->current_branch;
+	u32 state;
+
+	if (!branch)
+		return true;  /* Static image mode */
+
+	state = le32_to_cpu(READ_ONCE(branch->on_dax->state));
+	return state == DAXFS_BRANCH_ACTIVE;
+}
+
+/*
  * Find a branch by name in the active branches list
  */
 struct daxfs_branch_ctx *daxfs_find_branch_by_name(struct daxfs_info *info,
@@ -264,45 +307,90 @@ int daxfs_branch_create(struct daxfs_info *info, const char *name,
 
 /*
  * Commit a branch to its parent
+ *
+ * This invalidates all sibling branches (branches with the same parent).
+ * Sibling mounts will detect this via the fault handler and receive SIGBUS.
  */
 int daxfs_branch_commit(struct daxfs_info *info,
 			struct daxfs_branch_ctx *branch)
 {
-	struct daxfs_branch_ctx *parent;
+	struct daxfs_branch_ctx *parent, *sibling;
+	u64 parent_id;
 	int ret;
+	u32 i;
 
+	/* Acquire global coordination lock */
+	if (info->coord)
+		daxfs_coord_lock(info);
 	mutex_lock(&info->branch_lock);
-
-	/* Check for open files (mmap safety) */
-	if (atomic_read(&info->open_files) > 0) {
-		mutex_unlock(&info->branch_lock);
-		pr_err("daxfs: cannot commit with open files\n");
-		return -EBUSY;
-	}
 
 	/* Can't commit main branch */
 	if (strcmp(branch->name, "main") == 0) {
-		mutex_unlock(&info->branch_lock);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out_unlock;
 	}
 
 	parent = branch->parent;
 	if (!parent) {
-		mutex_unlock(&info->branch_lock);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out_unlock;
 	}
 
 	/* Check no active children */
 	if (atomic_read(&branch->refcount) > 1) {
-		mutex_unlock(&info->branch_lock);
-		return -EBUSY;
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+
+	parent_id = le64_to_cpu(branch->on_dax->parent_id);
+
+	/* Invalidate all sibling branches (same parent, different branch) */
+	list_for_each_entry(sibling, &info->active_branches, list) {
+		if (sibling == branch)
+			continue;
+		if (le64_to_cpu(sibling->on_dax->parent_id) != parent_id)
+			continue;
+
+		/* Mark sibling as aborted */
+		sibling->on_dax->state = cpu_to_le32(DAXFS_BRANCH_ABORTED);
+		sibling->on_dax->generation = cpu_to_le32(
+			le32_to_cpu(sibling->on_dax->generation) + 1);
+
+		pr_info("daxfs: invalidated sibling branch '%s'\n",
+			sibling->name);
+	}
+
+	/*
+	 * Also invalidate sibling branches that may be mounted by other
+	 * processes (not in our active_branches list). Scan the branch table.
+	 */
+	for (i = 0; i < info->branch_table_entries; i++) {
+		struct daxfs_branch *slot = &info->branch_table[i];
+		u32 state = le32_to_cpu(slot->state);
+
+		if (state != DAXFS_BRANCH_ACTIVE)
+			continue;
+		if (le64_to_cpu(slot->branch_id) == branch->branch_id)
+			continue;
+		if (le64_to_cpu(slot->parent_id) != parent_id)
+			continue;
+
+		/* Mark as aborted */
+		slot->state = cpu_to_le32(DAXFS_BRANCH_ABORTED);
+		slot->generation = cpu_to_le32(
+			le32_to_cpu(slot->generation) + 1);
 	}
 
 	/* Merge child's deltas into parent's log */
 	ret = daxfs_delta_merge(parent, branch);
-	if (ret) {
-		mutex_unlock(&info->branch_lock);
-		return ret;
+	if (ret)
+		goto out_unlock;
+
+	/* Update commit sequence */
+	if (info->coord) {
+		info->coord->commit_sequence = cpu_to_le64(
+			le64_to_cpu(info->coord->commit_sequence) + 1);
+		info->coord->last_committed_id = cpu_to_le64(branch->branch_id);
 	}
 
 	/* Mark branch as committed */
@@ -323,14 +411,25 @@ int daxfs_branch_commit(struct daxfs_info *info,
 	INIT_LIST_HEAD(&branch->list);
 
 	mutex_unlock(&info->branch_lock);
+	if (info->coord)
+		daxfs_coord_unlock(info);
 
 	pr_info("daxfs: committed branch '%s' to '%s'\n",
 		branch->name, parent->name);
 	return 0;
+
+out_unlock:
+	mutex_unlock(&info->branch_lock);
+	if (info->coord)
+		daxfs_coord_unlock(info);
+	return ret;
 }
 
 /*
  * Abort a branch (discard changes)
+ *
+ * Open files on this branch will receive SIGBUS on subsequent access
+ * via the fault handler's branch validity check.
  */
 int daxfs_branch_abort(struct daxfs_info *info,
 		       struct daxfs_branch_ctx *branch)
@@ -338,13 +437,6 @@ int daxfs_branch_abort(struct daxfs_info *info,
 	struct daxfs_branch_ctx *parent;
 
 	mutex_lock(&info->branch_lock);
-
-	/* Check for open files (mmap safety) */
-	if (atomic_read(&info->open_files) > 0) {
-		mutex_unlock(&info->branch_lock);
-		pr_err("daxfs: cannot abort with open files\n");
-		return -EBUSY;
-	}
 
 	/* Can't abort main branch */
 	if (strcmp(branch->name, "main") == 0) {
@@ -360,8 +452,10 @@ int daxfs_branch_abort(struct daxfs_info *info,
 
 	parent = branch->parent;
 
-	/* Mark as aborted and clear name */
+	/* Mark as aborted, increment generation, and clear name */
 	branch->on_dax->state = cpu_to_le32(DAXFS_BRANCH_ABORTED);
+	branch->on_dax->generation = cpu_to_le32(
+		le32_to_cpu(branch->on_dax->generation) + 1);
 	memset(branch->on_dax->name, 0, sizeof(branch->on_dax->name));
 
 	/* Decrement parent refcount */

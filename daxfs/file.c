@@ -376,6 +376,10 @@ static int daxfs_file_open(struct inode *inode, struct file *file)
 {
 	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
 
+	/* Fail fast if branch already invalid */
+	if (!daxfs_branch_is_valid(info))
+		return -ESTALE;
+
 	if (S_ISREG(inode->i_mode))
 		atomic_inc(&info->open_files);
 	return 0;
@@ -390,12 +394,37 @@ static int daxfs_file_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+/*
+ * Custom fault handler that checks branch validity before faulting in pages.
+ * If the branch has been invalidated (e.g., sibling committed), return SIGBUS.
+ */
+static vm_fault_t daxfs_fault(struct vm_fault *vmf)
+{
+	struct inode *inode = file_inode(vmf->vma->vm_file);
+	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
+
+	/* Fast path: check commit sequence */
+	if (daxfs_commit_seq_changed(info)) {
+		/* Slow path: full validation */
+		if (!daxfs_branch_is_valid(info))
+			return VM_FAULT_SIGBUS;
+		info->cached_commit_seq = le64_to_cpu(info->coord->commit_sequence);
+	}
+
+	return filemap_fault(vmf);
+}
+
 static vm_fault_t daxfs_page_mkwrite(struct vm_fault *vmf)
 {
 	struct folio *folio = page_folio(vmf->page);
 	struct inode *inode = file_inode(vmf->vma->vm_file);
+	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
 
 	if (inode->i_sb->s_flags & SB_RDONLY)
+		return VM_FAULT_SIGBUS;
+
+	/* Must validate before allowing write */
+	if (!daxfs_branch_is_valid(info))
 		return VM_FAULT_SIGBUS;
 
 	sb_start_pagefault(inode->i_sb);
@@ -408,7 +437,7 @@ static vm_fault_t daxfs_page_mkwrite(struct vm_fault *vmf)
 }
 
 static const struct vm_operations_struct daxfs_vm_ops = {
-	.fault		= filemap_fault,
+	.fault		= daxfs_fault,
 	.map_pages	= filemap_map_pages,
 	.page_mkwrite	= daxfs_page_mkwrite,
 };

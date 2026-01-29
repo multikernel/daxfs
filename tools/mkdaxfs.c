@@ -485,7 +485,7 @@ static int write_static_image(void *mem, size_t mem_size, const char *src_dir,
 	memset(mem, 0, mem_size);
 
 	/* Write superblock */
-	super->magic = htole32(DAXFS_MAGIC);
+	super->magic = htole32(DAXFS_SUPER_MAGIC);
 	super->version = htole32(DAXFS_VERSION);
 	super->flags = htole32(0);
 	super->block_size = htole32(DAXFS_BLOCK_SIZE);
@@ -542,7 +542,7 @@ static int write_image(void *mem, size_t mem_size, const char *src_dir,
 	memset(mem, 0, mem_size);
 
 	/* Write superblock */
-	super->magic = htole32(DAXFS_MAGIC);
+	super->magic = htole32(DAXFS_SUPER_MAGIC);
 	super->version = htole32(DAXFS_VERSION);
 	super->flags = htole32(0);
 	super->block_size = htole32(DAXFS_BLOCK_SIZE);

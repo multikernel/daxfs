@@ -11,8 +11,8 @@
 
 #include <linux/types.h>
 
-#define DAXFS_MAGIC		0x64617833	/* "dax3" */
-#define DAXFS_VERSION		3
+#define DAXFS_SUPER_MAGIC	0x64617834	/* "dax4" */
+#define DAXFS_VERSION		4
 #define DAXFS_BLOCK_SIZE	4096
 #define DAXFS_INODE_SIZE	64
 #define DAXFS_NAME_MAX		128
@@ -44,8 +44,20 @@
  * On-DAX Layout:
  * [ Superblock (4KB) | Branch Table | Base Image (optional) | Delta Region ]
  */
+/*
+ * Global coordination structure for cross-mount branch synchronization.
+ * Located at offset 152 in superblock (start of reserved area).
+ */
+struct daxfs_global_coord {
+	__le64 commit_sequence;		/* Incremented on each commit */
+	__le64 last_committed_id;	/* Branch ID that last committed */
+	__le32 coord_lock;		/* Simple spinlock (0=free, 1=held) */
+	__le32 padding;
+	__u8   reserved[40];		/* Total 64 bytes */
+};
+
 struct daxfs_super {
-	__le32 magic;			/* DAXFS_MAGIC (0x64617833) */
+	__le32 magic;			/* DAXFS_SUPER_MAGIC (0x64617834) */
 	__le32 version;			/* DAXFS_VERSION */
 	__le32 flags;
 	__le32 block_size;		/* 4096 */
@@ -67,7 +79,10 @@ struct daxfs_super {
 	__le64 delta_region_size;	/* Total size of delta region */
 	__le64 delta_alloc_offset;	/* Next free byte in delta region */
 
-	__u8   reserved[3944];		/* Pad to 4KB */
+	/* Global coordination - at offset 152 (64 bytes) */
+	struct daxfs_global_coord coord;
+
+	__u8   reserved[3880];		/* Pad to 4KB (3944 - 64) */
 };
 
 /*
@@ -83,7 +98,8 @@ struct daxfs_branch {
 	__le32 refcount;		/* Child branches + active mounts */
 	__le64 next_local_ino;		/* Branch-local inode counter */
 	char   name[32];		/* Branch name (null-terminated) */
-	__u8   reserved[40];		/* Pad to 128 bytes */
+	__le32 generation;		/* Incremented on invalidation */
+	__u8   reserved[36];		/* Pad to 128 bytes */
 };
 
 /*
@@ -186,19 +202,19 @@ struct daxfs_delta_symlink {
  * The base image is an optional embedded read-only filesystem image
  * that provides the initial state. New changes are stored in deltas.
  *
- * Version 3 uses flat directories: directory contents are stored as an
+ * Version 4 uses flat directories: directory contents are stored as an
  * array of daxfs_dirent entries in the data area. No linked lists, no
  * string table - names are stored directly in directory entries.
  */
 
-#define DAXFS_BASE_MAGIC	0x64646179	/* "dday" - version 3 */
+#define DAXFS_BASE_MAGIC	0x64646134	/* "dda4" - version 4 */
 
 /*
  * Base image superblock - always at base_offset, padded to DAXFS_BLOCK_SIZE
  */
 struct daxfs_base_super {
 	__le32 magic;		/* DAXFS_BASE_MAGIC */
-	__le32 version;		/* 3 */
+	__le32 version;		/* 4 */
 	__le32 flags;
 	__le32 block_size;	/* Always DAXFS_BLOCK_SIZE */
 	__le64 total_size;	/* Total base image size in bytes */
