@@ -97,6 +97,20 @@ Committing a branch discards all sibling branches. Aborting discards the current
 branch. No merge, no parallel long-lived branches - just speculative execution
 with a single winner.
 
+### Why not subvolumes?
+
+Btrfs-style COW subvolumes are independent trees with no natural merge operation. DAXFS
+branches use delta-logs instead:
+
+| Aspect | COW Subvolumes | Delta-log Branches |
+|--------|----------------|-------------------|
+| Create | Snapshot tree metadata | Allocate log region |
+| Commit | Diff trees + apply (expensive) | Append deltas to parent (fast) |
+| Abort | Delete snapshot | Discard log region |
+
+Speculative execution needs fast commit. Delta-logs give O(deltas) merge; COW subvolumes
+require O(tree) diffing. The delta-log model is purpose-built for speculative branching.
+
 ### Why not existing filesystems for branching?
 
 | Filesystem | Log-structured | In-memory index | Hierarchical branches |
