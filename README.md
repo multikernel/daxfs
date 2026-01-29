@@ -15,7 +15,7 @@ loads with no page cache, no buffer heads, and no copies.
 
 ## Security
 
-DAXFS v3 uses a flat directory format designed for safe handling of untrusted images:
+DAXFS v4 uses a flat directory format designed for safe handling of untrusted images:
 
 | Property | Benefit |
 |----------|---------|
@@ -89,13 +89,19 @@ Branches enable speculative modifications with a single-winner model:
 ```bash
 daxfs-branch create feature -m /mnt -p main  # create and switch
 daxfs-branch list -m /mnt                     # list branches
-daxfs-branch commit -m /mnt                   # commit (discards siblings)
+daxfs-branch commit -m /mnt                   # commit (invalidates siblings)
 daxfs-branch abort -m /mnt                    # abort (discards changes)
 ```
 
-Committing a branch discards all sibling branches. Aborting discards the current
-branch. No merge, no parallel long-lived branches - just speculative execution
-with a single winner.
+**Per-mount branch views**: Different mounts of the same image can operate on
+different branches simultaneously. Each mount has its own branch context.
+
+**Sibling invalidation**: Committing a branch invalidates all sibling branches.
+Processes with mmap'd files on invalidated branches receive SIGBUS on access.
+File opens on invalidated branches return ESTALE.
+
+No merge, no parallel long-lived branches - just speculative execution with a
+single winner.
 
 ### Why not subvolumes?
 
@@ -130,12 +136,15 @@ Defined in `include/daxfs_format.h`. Layout:
 
 | Region | Content |
 |--------|---------|
-| Superblock | Magic, version, offsets (4KB) |
+| Superblock | Magic, version, offsets, global coordination (4KB) |
 | Branch table | 128-byte entries, up to 256 branches |
 | Base image | Read-only snapshot (inode table + data) |
 | Delta region | Branch delta logs |
 
-**Base image** (v3 flat format):
+**Global coordination** (in superblock): commit sequence counter and lock for
+cross-mount synchronization. Enables per-mount branch views with safe invalidation.
+
+**Base image** (v4 flat format):
 - Inode table: fixed 64-byte entries
 - Data area: file contents + directory entry arrays
 - Directories store `daxfs_dirent` arrays (144 bytes each, 128-char max name)
