@@ -11,6 +11,7 @@
 #include <linux/pagemap.h>
 #include <linux/highmem.h>
 #include <linux/writeback.h>
+#include <linux/dma-buf.h>
 #include "daxfs.h"
 
 static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
@@ -454,6 +455,31 @@ static int daxfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 	return 0;
 }
 
+/*
+ * ioctl handler - works for both files and directories.
+ * Allows userspace tools to get the dma-buf fd for inspection.
+ */
+long daxfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct daxfs_info *info = DAXFS_SB(file_inode(file)->i_sb);
+
+	switch (cmd) {
+	case DAXFS_IOC_GET_DMABUF: {
+		int fd;
+
+		if (!info->dmabuf)
+			return -ENOENT;	/* Not a dma-buf mount */
+
+		get_dma_buf(info->dmabuf);
+		fd = dma_buf_fd(info->dmabuf, O_RDONLY | O_CLOEXEC);
+		if (fd < 0)
+			dma_buf_put(info->dmabuf);
+		return fd;
+	}
+	}
+	return -ENOTTY;
+}
+
 const struct file_operations daxfs_file_ops = {
 	.llseek		= generic_file_llseek,
 	.read_iter	= daxfs_read_iter,
@@ -463,6 +489,7 @@ const struct file_operations daxfs_file_ops = {
 	.release	= daxfs_file_release,
 	.mmap		= daxfs_file_mmap,
 	.fsync		= generic_file_fsync,
+	.unlocked_ioctl	= daxfs_ioctl,
 };
 
 const struct inode_operations daxfs_file_inode_ops = {
@@ -592,7 +619,7 @@ const struct file_operations daxfs_file_ops_ro = {
 	.read_iter	= daxfs_read_iter_ro,
 	.splice_read	= filemap_splice_read,
 	.mmap		= daxfs_file_mmap_ro,
-	/* No write_iter, no open/release tracking needed */
+	.unlocked_ioctl	= daxfs_ioctl,
 };
 
 const struct inode_operations daxfs_file_inode_ops_ro = {

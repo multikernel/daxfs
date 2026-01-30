@@ -10,6 +10,10 @@
 #define _DAXFS_FORMAT_H
 
 #include <linux/types.h>
+#include <linux/ioctl.h>
+
+/* ioctl commands */
+#define DAXFS_IOC_GET_DMABUF	_IO('D', 1)	/* Get dma-buf fd for this mount */
 
 #define DAXFS_SUPER_MAGIC	0x64617834	/* "dax4" */
 #define DAXFS_VERSION		4

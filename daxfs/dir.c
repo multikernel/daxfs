@@ -539,6 +539,7 @@ const struct file_operations daxfs_dir_ops = {
 	.iterate_shared	= daxfs_iterate,
 	.read		= generic_read_dir,
 	.llseek		= generic_file_llseek,
+	.unlocked_ioctl	= daxfs_ioctl,
 };
 
 /*
@@ -639,4 +640,5 @@ const struct file_operations daxfs_dir_ops_ro = {
 	.iterate_shared	= daxfs_iterate_ro,
 	.read		= generic_read_dir,
 	.llseek		= generic_file_llseek,
+	.unlocked_ioctl	= daxfs_ioctl,
 };

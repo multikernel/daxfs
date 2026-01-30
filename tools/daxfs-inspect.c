@@ -24,6 +24,7 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <getopt.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -38,6 +39,7 @@
 
 static void *mem;
 static size_t mem_size;
+static int dmabuf_fd = -1;  /* Keep dma-buf fd open until munmap */
 static struct daxfs_super *super;
 static struct daxfs_branch *branch_table;
 
@@ -88,23 +90,18 @@ static struct daxfs_branch *find_branch_by_id(uint64_t id)
 }
 
 /*
- * Parse /proc/self/mountinfo for a daxfs mount and extract phys/size.
+ * Get size from /proc/self/mountinfo for a daxfs mount.
  * Returns 0 on success, -1 on failure.
- *
- * mountinfo format example:
- * 52 33 0:83 / /mnt/daxfs rw,relatime shared:27 - daxfs none rw,phys=0x100000000,size=33554432,branch=/main
  */
-static int parse_mountinfo(const char *mount_point, unsigned long long *phys_addr,
-			   size_t *size)
+static int get_mount_size(const char *mount_point, size_t *size)
 {
 	FILE *fp;
 	char *line = NULL;
 	size_t len = 0;
-	ssize_t read;
+	ssize_t nread;
 	int found = 0;
 	char resolved_mount[PATH_MAX];
 
-	/* Resolve to canonical path for matching */
 	if (!realpath(mount_point, resolved_mount)) {
 		perror("realpath");
 		return -1;
@@ -116,85 +113,111 @@ static int parse_mountinfo(const char *mount_point, unsigned long long *phys_add
 		return -1;
 	}
 
-	while ((read = getline(&line, &len, fp)) != -1) {
+	while ((nread = getline(&line, &len, fp)) != -1) {
 		char *mnt_path, *fs_type, *options;
 		char *saveptr, *token;
 		char *dash;
 
-		/* Skip to field 5 (mount point) */
-		token = strtok_r(line, " ", &saveptr);  /* mount ID */
+		token = strtok_r(line, " ", &saveptr);
 		if (!token) continue;
-		token = strtok_r(NULL, " ", &saveptr);  /* parent ID */
+		token = strtok_r(NULL, " ", &saveptr);
 		if (!token) continue;
-		token = strtok_r(NULL, " ", &saveptr);  /* major:minor */
+		token = strtok_r(NULL, " ", &saveptr);
 		if (!token) continue;
-		token = strtok_r(NULL, " ", &saveptr);  /* root */
+		token = strtok_r(NULL, " ", &saveptr);
 		if (!token) continue;
-		mnt_path = strtok_r(NULL, " ", &saveptr);  /* mount point */
+		mnt_path = strtok_r(NULL, " ", &saveptr);
 		if (!mnt_path) continue;
 
-		/* Check if this is our mount point */
 		if (strcmp(mnt_path, resolved_mount) != 0)
 			continue;
 
-		/* Find the "-" separator */
 		dash = strstr(saveptr, " - ");
 		if (!dash)
 			continue;
 
-		dash += 3;  /* Skip " - " */
+		dash += 3;
 		fs_type = strtok_r(dash, " ", &saveptr);
 		if (!fs_type || strcmp(fs_type, "daxfs") != 0)
 			continue;
 
-		/* Skip device name */
 		token = strtok_r(NULL, " ", &saveptr);
 		if (!token) continue;
 
-		/* Get fs options */
 		options = strtok_r(NULL, "\n", &saveptr);
 		if (!options) continue;
 
-		/* Parse options looking for phys= and size= */
 		char *opts_copy = strdup(options);
 		char *opt_saveptr;
 		char *opt = strtok_r(opts_copy, ",", &opt_saveptr);
-		bool got_phys = false, got_size = false;
 
 		while (opt) {
-			if (strncmp(opt, "phys=", 5) == 0) {
-				*phys_addr = strtoull(opt + 5, NULL, 0);
-				got_phys = true;
-			} else if (strncmp(opt, "size=", 5) == 0) {
+			if (strncmp(opt, "size=", 5) == 0) {
 				*size = strtoull(opt + 5, NULL, 0);
-				got_size = true;
+				found = 1;
+				break;
 			}
 			opt = strtok_r(NULL, ",", &opt_saveptr);
 		}
 		free(opts_copy);
-
-		if (got_phys && got_size) {
-			found = 1;
-			break;
-		} else if (!got_phys) {
-			fprintf(stderr, "Error: daxfs mount at %s does not expose phys address\n",
-				mount_point);
-			fprintf(stderr, "Note: phys is only available when mounted via phys= option\n");
-			fprintf(stderr, "      or from a dma-buf with known physical address\n");
-			break;
-		} else if (!got_size) {
-			fprintf(stderr, "Error: daxfs mount at %s missing size option\n",
-				mount_point);
-			break;
-		}
+		break;
 	}
 
 	free(line);
 	fclose(fp);
 
 	if (!found) {
-		if (!found)
-			fprintf(stderr, "Error: %s is not a daxfs mount point\n", mount_point);
+		fprintf(stderr, "Error: %s is not a daxfs mount or missing size\n",
+			mount_point);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Open memory via mount point.
+ * First tries ioctl to get dma-buf fd (no root needed for dma-buf mounts).
+ * Returns 0 on success, -1 on failure.
+ */
+static int open_mount(const char *mount_point)
+{
+	int fd;
+	size_t size;
+
+	/* Get size from mountinfo */
+	if (get_mount_size(mount_point, &size) < 0)
+		return -1;
+
+	/* Open mount point and try ioctl */
+	fd = open(mount_point, O_RDONLY);
+	if (fd < 0) {
+		perror(mount_point);
+		return -1;
+	}
+
+	dmabuf_fd = ioctl(fd, DAXFS_IOC_GET_DMABUF);
+	close(fd);
+
+	if (dmabuf_fd < 0) {
+		if (errno == ENOENT) {
+			fprintf(stderr, "Error: %s is not a dma-buf backed mount\n",
+				mount_point);
+			fprintf(stderr, "Use -p/-s for phys-based mounts (requires root)\n");
+		} else {
+			perror("ioctl DAXFS_IOC_GET_DMABUF");
+		}
+		return -1;
+	}
+
+	/* mmap the dma-buf - keep fd open until munmap */
+	mem_size = size;
+	mem = mmap(NULL, size, PROT_READ, MAP_SHARED, dmabuf_fd, 0);
+
+	if (mem == MAP_FAILED) {
+		perror("mmap dma-buf");
+		close(dmabuf_fd);
+		dmabuf_fd = -1;
 		return -1;
 	}
 
@@ -242,6 +265,10 @@ static void close_mem(void)
 {
 	if (mem && mem != MAP_FAILED)
 		munmap(mem, mem_size);
+	if (dmabuf_fd >= 0) {
+		close(dmabuf_fd);
+		dmabuf_fd = -1;
+	}
 }
 
 static int cmd_list(void)
@@ -451,17 +478,18 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  info              Show branch details\n");
 	fprintf(stderr, "  status            Show memory status\n");
 	fprintf(stderr, "\nOptions:\n");
-	fprintf(stderr, "  -m, --mount PATH  Mount point (reads phys/size from mountinfo)\n");
-	fprintf(stderr, "  -p, --phys ADDR   Physical memory address (manual)\n");
+	fprintf(stderr, "  -m, --mount PATH  Mount point (uses ioctl, no root for dma-buf)\n");
+	fprintf(stderr, "  -p, --phys ADDR   Physical memory address (via /dev/mem)\n");
 	fprintf(stderr, "  -s, --size SIZE   Memory size (required with -p)\n");
 	fprintf(stderr, "  -b, --branch NAME Branch name (for info command)\n");
 	fprintf(stderr, "  -h, --help        Show this help\n");
 	fprintf(stderr, "\nExamples:\n");
 	fprintf(stderr, "  %s list -m /mnt/daxfs\n", prog);
-	fprintf(stderr, "  %s list -p 0x100000000 -s 256M\n", prog);
-	fprintf(stderr, "  %s info -m /mnt/daxfs -b main\n", prog);
 	fprintf(stderr, "  %s status -m /mnt/daxfs\n", prog);
-	fprintf(stderr, "\nNote: Requires root or CAP_SYS_RAWIO for /dev/mem access.\n");
+	fprintf(stderr, "  %s info -m /mnt/daxfs -b main\n", prog);
+	fprintf(stderr, "  %s list -p 0x100000000 -s 256M\n", prog);
+	fprintf(stderr, "\nNote: -m works without root for dma-buf backed mounts.\n");
+	fprintf(stderr, "      -p requires root or CAP_SYS_RAWIO for /dev/mem.\n");
 }
 
 int main(int argc, char *argv[])
@@ -520,33 +548,28 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* Handle mount point option - parse mountinfo for phys/size */
+	/* Handle mount point option - use ioctl to get dma-buf */
 	if (mount_point) {
 		if (phys_addr || size) {
 			fprintf(stderr, "Error: cannot use -m with -p/-s\n");
 			print_usage(argv[0]);
 			return 1;
 		}
-		if (parse_mountinfo(mount_point, &phys_addr, &size) < 0)
+		if (open_mount(mount_point) < 0)
 			return 1;
-	}
-
-	/* Validate options */
-	if (!phys_addr) {
+	} else if (phys_addr) {
+		if (!size) {
+			fprintf(stderr, "Error: -s/--size is required with -p/--phys\n");
+			print_usage(argv[0]);
+			return 1;
+		}
+		if (open_phys(phys_addr, size) < 0)
+			return 1;
+	} else {
 		fprintf(stderr, "Error: -m/--mount or -p/--phys is required\n");
 		print_usage(argv[0]);
 		return 1;
 	}
-
-	if (!size) {
-		fprintf(stderr, "Error: -s/--size is required with -p/--phys\n");
-		print_usage(argv[0]);
-		return 1;
-	}
-
-	/* Open physical memory */
-	if (open_phys(phys_addr, size) < 0)
-		return 1;
 
 	if (validate_and_setup() < 0)
 		return 1;

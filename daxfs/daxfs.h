@@ -179,6 +179,7 @@ extern const struct file_operations daxfs_dir_ops_ro;
 extern const struct inode_operations daxfs_file_inode_ops;
 extern const struct file_operations daxfs_file_ops;
 extern const struct address_space_operations daxfs_aops;
+extern long daxfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 
 /* file.c - read-only ops */
 extern const struct inode_operations daxfs_file_inode_ops_ro;
