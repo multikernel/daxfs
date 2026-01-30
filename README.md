@@ -1,6 +1,6 @@
 # DAXFS
 
-**Secure delta-log filesystem for byte-addressable persistent memory.**
+**Secure delta-log memory native filesystem with speculative branching.**
 
 DAXFS operates directly on DAX-capable memory (persistent memory, CXL memory, or DMA
 buffers) via direct load/store access. It combines a read-only base image with
@@ -8,8 +8,8 @@ copy-on-write branches - file reads resolve to direct memory loads with no page 
 no buffer heads, and no copies.
 
 **Not for traditional disks.** DAXFS requires byte-addressable memory with DAX support.
-It cannot run on block devices (spinning disks, standard SSDs) - the entire design
-assumes direct pointer access without block I/O.
+It cannot run on block devices, the entire design assumes direct memory pointer access
+and synchronization with `cmpxchg`.
 
 ## Features
 
@@ -35,7 +35,7 @@ pointer chasing required.
 ## Use Cases
 
 - **AI agent speculative execution** - Parallel exploration with single-winner commit
-- **Multikernel** - Shared rootfs across kernel instances
+- **Multikernel** - Shared rootfs across kernel instances with cross-kernel branch coordination
 - **CXL memory pooling** - Common filesystem across CXL-connected hosts
 - **GPU/accelerator** - Zero-copy access to data via dma-buf
 - **Container rootfs** - Shared base image with per-container branches
@@ -113,13 +113,17 @@ naturally require deeper speculation trees.
 
 **Commit semantics**: Commits the entire branch chain to main and invalidates
 ALL sibling branches at every level. Processes with mmap'd files on invalidated
-branches receive SIGBUS. File opens return ESTALE.
+branches receive SIGBUS. File/directory operations return ESTALE.
 
 **Abort semantics**: Discards the entire branch chain back to main. Does NOT
 affect sibling branches (they continue unaffected).
 
 **Unmount semantics**: Discards only the current branch. Parent chain remains,
 allowing single-level backtracking.
+
+**Multi-kernel coordination**: Multiple kernels can mount sibling branches on
+the same DAX region. Coordination uses hardware atomics on shared DAX memory,
+no distributed consensus needed.
 
 This model is designed for AI agent speculative execution - multiple agents
 explore different paths, one wins (commit), others are discarded.
@@ -164,8 +168,9 @@ Defined in `include/daxfs_format.h`. Layout:
 | Base image | Read-only snapshot (inode table + data) |
 | Delta region | Branch delta logs |
 
-**Global coordination** (in superblock): commit sequence counter and lock for
-cross-mount synchronization. Enables per-mount branch views with safe invalidation.
+**Global coordination** (in superblock): commit sequence counter and spinlock for
+cross-kernel synchronization. Uses `cmpxchg` on DAX memory - works across kernel
+instances without distributed locking protocols.
 
 **Base image** (v4 flat format):
 - Inode table: fixed 64-byte entries
