@@ -175,12 +175,12 @@ instances without distributed locking protocols.
 **Base image** (v4 flat format):
 - Inode table: fixed 64-byte entries
 - Data area: file contents + directory entry arrays
-- Directories store `daxfs_dirent` arrays (144 bytes each, 128-char max name)
+- Directories store `daxfs_dirent` arrays (271 bytes each, 255-char max name)
 
 **Delta log** entries: write, create, delete, truncate, mkdir, rename, setattr, symlink.
 
 ## Limitations
 
 - No hard links (by design - simplifies delta log)
-- Filename max 128 characters
+- Filename max 255 characters (matches VFS NAME_MAX)
 - Branch table max 256 entries

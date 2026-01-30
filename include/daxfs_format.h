@@ -19,7 +19,7 @@
 #define DAXFS_VERSION		4
 #define DAXFS_BLOCK_SIZE	4096
 #define DAXFS_INODE_SIZE	64
-#define DAXFS_NAME_MAX		128
+#define DAXFS_NAME_MAX		255
 #define DAXFS_DIRENT_SIZE	(16 + DAXFS_NAME_MAX)	/* ino + mode + name_len + reserved + name */
 #define DAXFS_ROOT_INO		1
 
