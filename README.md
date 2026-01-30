@@ -1,10 +1,15 @@
 # DAXFS
 
-**Secure copy-on-write filesystem for shared memory.**
+**Secure delta-log filesystem for byte-addressable persistent memory.**
 
-DAXFS operates directly on shared physical memory via DAX (Direct Access). It combines
-a read-only base image with copy-on-write branches - file reads resolve to direct memory
-loads with no page cache, no buffer heads, and no copies.
+DAXFS operates directly on DAX-capable memory (persistent memory, CXL memory, or DMA
+buffers) via direct load/store access. It combines a read-only base image with
+copy-on-write branches - file reads resolve to direct memory loads with no page cache,
+no buffer heads, and no copies.
+
+**Not for traditional disks.** DAXFS requires byte-addressable memory with DAX support.
+It cannot run on block devices (spinning disks, standard SSDs) - the entire design
+assumes direct pointer access without block I/O.
 
 ## Features
 
