@@ -598,39 +598,6 @@ static int daxfs_reconfigure(struct fs_context *fc)
 			pr_err("daxfs: abort failed: %d\n", ret);
 		else
 			pr_info("daxfs: aborted and switched to main branch\n");
-	} else if (ctx->branch_name && ctx->parent_name) {
-		/* Create new branch and switch to it */
-		struct daxfs_branch_ctx *new_branch;
-		struct daxfs_branch_ctx *old_branch;
-
-		if (sb->s_flags & SB_RDONLY) {
-			pr_err("daxfs: branch creation requires rw mount\n");
-			return -EROFS;
-		}
-
-		ret = daxfs_branch_create(info, ctx->branch_name,
-					  ctx->parent_name, &new_branch);
-		if (ret) {
-			pr_err("daxfs: branch create failed: %d\n", ret);
-			return ret;
-		}
-
-		/* Build delta index for new branch */
-		ret = daxfs_delta_build_index(new_branch);
-		if (ret) {
-			pr_err("daxfs: delta index build failed: %d\n", ret);
-			daxfs_branch_abort(info, new_branch);
-			return ret;
-		}
-
-		/* Switch to new branch */
-		old_branch = info->current_branch;
-		info->current_branch = new_branch;
-
-		/* Release old branch reference */
-		atomic_dec(&old_branch->refcount);
-
-		pr_info("daxfs: switched to new branch '%s'\n", ctx->branch_name);
 	}
 
 	return ret;
