@@ -210,6 +210,8 @@ extern struct daxfs_delta_hdr *daxfs_delta_lookup_dirent(
 	struct daxfs_branch_ctx *branch, u64 parent_ino,
 	const char *name, int namelen);
 extern bool daxfs_delta_is_deleted(struct daxfs_branch_ctx *branch, u64 ino);
+extern bool daxfs_delta_has_children(struct daxfs_branch_ctx *branch,
+				     u64 parent_ino);
 extern int daxfs_delta_get_size(struct daxfs_branch_ctx *branch, u64 ino,
 				loff_t *size);
 extern int daxfs_resolve_inode(struct super_block *sb, u64 ino,

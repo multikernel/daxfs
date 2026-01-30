@@ -785,6 +785,45 @@ bool daxfs_delta_is_deleted(struct daxfs_branch_ctx *branch, u64 ino)
 }
 
 /*
+ * Check if directory has any non-deleted children in this branch's delta log
+ */
+bool daxfs_delta_has_children(struct daxfs_branch_ctx *branch, u64 parent_ino)
+{
+	u64 offset = 0;
+
+	while (offset < branch->delta_size) {
+		struct daxfs_delta_hdr *hdr = branch->delta_log + offset;
+		u32 type = le32_to_cpu(hdr->type);
+		u32 total_size = le32_to_cpu(hdr->total_size);
+		u64 entry_parent, child_ino;
+
+		if (total_size == 0)
+			break;
+
+		if (type == DAXFS_DELTA_CREATE || type == DAXFS_DELTA_MKDIR) {
+			struct daxfs_delta_create *cr = (void *)hdr + sizeof(*hdr);
+			entry_parent = le64_to_cpu(cr->parent_ino);
+			child_ino = le64_to_cpu(cr->new_ino);
+		} else if (type == DAXFS_DELTA_SYMLINK) {
+			struct daxfs_delta_symlink *sl = (void *)hdr + sizeof(*hdr);
+			entry_parent = le64_to_cpu(sl->parent_ino);
+			child_ino = le64_to_cpu(sl->new_ino);
+		} else {
+			offset += total_size;
+			continue;
+		}
+
+		if (entry_parent == parent_ino &&
+		    !daxfs_delta_is_deleted(branch, child_ino))
+			return true;
+
+		offset += total_size;
+	}
+
+	return false;
+}
+
+/*
  * Get current size of an inode (from delta or return -1 if not found)
  */
 int daxfs_delta_get_size(struct daxfs_branch_ctx *branch, u64 ino, loff_t *size)

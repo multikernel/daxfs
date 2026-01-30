@@ -293,14 +293,50 @@ static int daxfs_unlink(struct inode *dir, struct dentry *dentry)
 	return 0;
 }
 
+/*
+ * Check if directory is empty (has no entries other than . and ..)
+ */
+static bool daxfs_dir_is_empty(struct super_block *sb, u64 dir_ino)
+{
+	struct daxfs_info *info = DAXFS_SB(sb);
+	struct daxfs_branch_ctx *b;
+	struct daxfs_dirent *dirents;
+	u32 count, i;
+
+	/* Check base image entries */
+	dirents = daxfs_get_base_dirents(info, dir_ino, &count);
+	for (i = 0; i < count; i++) {
+		u32 child_ino = le32_to_cpu(dirents[i].ino);
+
+		/* Check if this entry was deleted in delta */
+		for (b = info->current_branch; b; b = b->parent) {
+			if (daxfs_delta_is_deleted(b, child_ino))
+				goto next_base;
+		}
+		return false;  /* Found non-deleted entry */
+next_base:;
+	}
+
+	/* Check delta entries created in this directory */
+	for (b = info->current_branch; b; b = b->parent) {
+		if (daxfs_delta_has_children(b, dir_ino))
+			return false;
+	}
+
+	return true;
+}
+
 static int daxfs_rmdir(struct inode *dir, struct dentry *dentry)
 {
+	struct inode *inode = d_inode(dentry);
 	struct daxfs_info *info = DAXFS_SB(dir->i_sb);
 
 	if (!daxfs_branch_is_valid(info))
 		return -ESTALE;
 
-	/* TODO: Check if directory is empty */
+	if (!daxfs_dir_is_empty(dir->i_sb, inode->i_ino))
+		return -ENOTEMPTY;
+
 	return daxfs_unlink(dir, dentry);
 }
 
