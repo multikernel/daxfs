@@ -385,7 +385,7 @@ static int cmd_commit(const char *mountpoint)
 		return 1;
 	}
 
-	printf("Committing branch '%s' to parent...\n", mi.branch);
+	printf("Committing branch chain to main...\n");
 
 	char *argv[] = {"mount", "-o", "remount,commit", (char *)mountpoint, NULL};
 	ret = run_mount(argv);
@@ -395,7 +395,7 @@ static int cmd_commit(const char *mountpoint)
 		return 1;
 	}
 
-	printf("Branch '%s' committed successfully\n", mi.branch);
+	printf("Branch chain merged to main (all siblings invalidated)\n");
 	free_mount_info(&mi);
 	return 0;
 }
@@ -417,7 +417,7 @@ static int cmd_abort(const char *mountpoint)
 		return 1;
 	}
 
-	printf("Aborting branch '%s' (discarding changes)...\n", mi.branch);
+	printf("Aborting entire branch chain...\n");
 
 	char *argv[] = {"mount", "-o", "remount,abort", (char *)mountpoint, NULL};
 	ret = run_mount(argv);
@@ -427,7 +427,7 @@ static int cmd_abort(const char *mountpoint)
 		return 1;
 	}
 
-	printf("Branch '%s' aborted\n", mi.branch);
+	printf("Branch chain aborted (back to main)\n");
 	free_mount_info(&mi);
 	return 0;
 }
@@ -438,8 +438,8 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "\nCommands:\n");
 	fprintf(stderr, "  list              List daxfs mounts or show mount info\n");
 	fprintf(stderr, "  create NAME       Create a new branch and mount it\n");
-	fprintf(stderr, "  commit            Commit current branch to parent\n");
-	fprintf(stderr, "  abort             Abort current branch (discard changes)\n");
+	fprintf(stderr, "  commit            Commit entire branch chain to main\n");
+	fprintf(stderr, "  abort             Abort entire branch chain (discard all changes)\n");
 	fprintf(stderr, "\nOptions:\n");
 	fprintf(stderr, "  -m, --mount PATH  Mountpoint for the branch\n");
 	fprintf(stderr, "  -p, --parent NAME Parent branch name (required for create)\n");
@@ -450,6 +450,10 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  %s create feature -m /mnt/feature -p main\n", prog);
 	fprintf(stderr, "  %s commit -m /mnt/feature\n", prog);
 	fprintf(stderr, "  %s abort -m /mnt/feature\n", prog);
+	fprintf(stderr, "\nSpeculative execution semantics:\n");
+	fprintf(stderr, "  commit  - Merges entire chain to main, invalidates all siblings\n");
+	fprintf(stderr, "  abort   - Discards entire chain back to main\n");
+	fprintf(stderr, "  umount  - Discards only current branch (use to backtrack one level)\n");
 	fprintf(stderr, "\nNote: Use 'daxfs-inspect' to inspect raw image files.\n");
 }
 
