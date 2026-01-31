@@ -18,6 +18,26 @@ static inline bool check_add_overflow_u64(u64 a, u64 b, u64 *result)
 	return check_add_overflow(a, b, result);
 }
 
+static inline bool daxfs_valid_file_type(umode_t mode)
+{
+	switch (mode & S_IFMT) {
+	case S_IFREG:
+	case S_IFDIR:
+	case S_IFLNK:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static inline bool regions_overlap(u64 a_start, u64 a_size,
+				   u64 b_start, u64 b_size)
+{
+	if (a_size == 0 || b_size == 0)
+		return false;
+	return a_start < b_start + b_size && b_start < a_start + a_size;
+}
+
 /*
  * Validate hard link consistency in the base image.
  * - Count directory references to each inode
@@ -199,6 +219,13 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 		u64 file_size = le64_to_cpu(raw->size);
 		u32 mode = le32_to_cpu(raw->mode);
 
+		/* Validate file type is supported */
+		if (!daxfs_valid_file_type(mode)) {
+			pr_err("daxfs: inode %u has unsupported file type 0%o\n",
+			       i + 1, (mode & S_IFMT) >> 12);
+			return -EINVAL;
+		}
+
 		/* Validate data offset bounds */
 		if (file_size > 0) {
 			if (!daxfs_valid_base_offset(info, file_data_offset, file_size)) {
@@ -255,6 +282,23 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 					       i + 1, j);
 					return -EINVAL;
 				}
+
+				/* Check for duplicate names (O(n^2) but only at validation) */
+				if (name_len > 0) {
+					u32 k;
+
+					for (k = 0; k < j; k++) {
+						struct daxfs_dirent *prev = &dirents[k];
+						u16 prev_len = le16_to_cpu(prev->name_len);
+
+						if (prev_len == name_len &&
+						    memcmp(de->name, prev->name, name_len) == 0) {
+							pr_err("daxfs: dir %u has duplicate name at entries %u and %u\n",
+							       i + 1, k, j);
+							return -EINVAL;
+						}
+					}
+				}
 			}
 		}
 
@@ -309,6 +353,7 @@ int daxfs_validate_super(struct daxfs_info *info)
 				sizeof(struct daxfs_branch);
 	u64 delta_offset = le64_to_cpu(info->super->delta_region_offset);
 	u64 delta_size = le64_to_cpu(info->super->delta_region_size);
+	u64 super_size = sizeof(struct daxfs_super);
 
 	/* Validate base image region bounds */
 	if (base_offset != 0) {
@@ -332,6 +377,48 @@ int daxfs_validate_super(struct daxfs_info *info)
 			pr_err("daxfs: delta region exceeds image bounds\n");
 			return -EINVAL;
 		}
+	}
+
+	/*
+	 * Validate regions don't overlap with each other or the superblock.
+	 * Superblock is at offset 0.
+	 */
+	if (base_size > 0 && regions_overlap(0, super_size, base_offset, base_size)) {
+		pr_err("daxfs: base image overlaps superblock\n");
+		return -EINVAL;
+	}
+
+	if (branch_table_size > 0 && regions_overlap(0, super_size,
+						     branch_table_offset,
+						     branch_table_size)) {
+		pr_err("daxfs: branch table overlaps superblock\n");
+		return -EINVAL;
+	}
+
+	if (delta_size > 0 && regions_overlap(0, super_size,
+					      delta_offset, delta_size)) {
+		pr_err("daxfs: delta region overlaps superblock\n");
+		return -EINVAL;
+	}
+
+	if (base_size > 0 && branch_table_size > 0 &&
+	    regions_overlap(base_offset, base_size,
+			    branch_table_offset, branch_table_size)) {
+		pr_err("daxfs: base image overlaps branch table\n");
+		return -EINVAL;
+	}
+
+	if (base_size > 0 && delta_size > 0 &&
+	    regions_overlap(base_offset, base_size, delta_offset, delta_size)) {
+		pr_err("daxfs: base image overlaps delta region\n");
+		return -EINVAL;
+	}
+
+	if (branch_table_size > 0 && delta_size > 0 &&
+	    regions_overlap(branch_table_offset, branch_table_size,
+			    delta_offset, delta_size)) {
+		pr_err("daxfs: branch table overlaps delta region\n");
+		return -EINVAL;
 	}
 
 	return 0;
