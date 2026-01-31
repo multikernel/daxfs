@@ -12,7 +12,7 @@
 #include <linux/mm.h>
 #include "daxfs.h"
 
-#define INITIAL_DELTA_SIZE	(64 * 1024)	/* 64KB initial delta log */
+#define INITIAL_DELTA_SIZE	(1024 * 1024)	/* 1MB initial delta log */
 
 /*
  * DAX memory spinlock - simple test-and-set for cross-mount coordination
