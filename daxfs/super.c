@@ -107,6 +107,79 @@ static int daxfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	return 0;
 }
 
+static int daxfs_validate_hardlinks(struct daxfs_info *info)
+{
+	u64 base_offset = le64_to_cpu(info->super->base_offset);
+	u32 inode_count = info->base_inode_count;
+	u32 *refcount;
+	u32 i;
+	int ret = 0;
+
+	refcount = kvzalloc(array_size(inode_count, sizeof(u32)), GFP_KERNEL);
+	if (!refcount)
+		return -ENOMEM;
+
+	/* Pass 1: Count directory references to each inode */
+	for (i = 0; i < inode_count; i++) {
+		struct daxfs_base_inode *raw = &info->base_inodes[i];
+		u32 mode = le32_to_cpu(raw->mode);
+
+		if (S_ISDIR(mode)) {
+			u64 file_data_offset = le64_to_cpu(raw->data_offset);
+			u64 file_size = le64_to_cpu(raw->size);
+			u32 num_entries = file_size / DAXFS_DIRENT_SIZE;
+			struct daxfs_dirent *dirents;
+			u32 j;
+
+			if (file_size == 0)
+				continue;
+
+			dirents = daxfs_mem_ptr(info, base_offset + file_data_offset);
+
+			for (j = 0; j < num_entries; j++) {
+				u32 child_ino = le32_to_cpu(dirents[j].ino);
+				/* ino is 1-based, refcount is 0-based */
+				refcount[child_ino - 1]++;
+			}
+		}
+	}
+
+	/* Pass 2: Verify nlink matches refcount and hard link rules */
+	for (i = 0; i < inode_count; i++) {
+		struct daxfs_base_inode *raw = &info->base_inodes[i];
+		u32 nlink = le32_to_cpu(raw->nlink);
+		u32 mode = le32_to_cpu(raw->mode);
+		u32 ino = i + 1;
+
+		/* nlink should match directory reference count */
+		if (nlink != refcount[i]) {
+			pr_err("daxfs: inode %u nlink mismatch: nlink=%u refcount=%u\n",
+			       ino, nlink, refcount[i]);
+			ret = -EINVAL;
+			goto out;
+		}
+
+		/* Hard links (nlink > 1) only allowed for regular files */
+		if (nlink > 1 && !S_ISREG(mode)) {
+			pr_err("daxfs: inode %u has nlink=%u but is not a regular file\n",
+			       ino, nlink);
+			ret = -EINVAL;
+			goto out;
+		}
+
+		/* Every inode must have at least one reference */
+		if (nlink == 0) {
+			pr_err("daxfs: inode %u has no references (nlink=0)\n", ino);
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+
+out:
+	kvfree(refcount);
+	return ret;
+}
+
 /*
  * Validate the base image structure for security (v3 flat directory format)
  * Returns 0 on success, -errno on error
@@ -118,6 +191,7 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 	u64 base_size = le64_to_cpu(info->super->base_size);
 	u64 inode_offset, data_offset;
 	u32 inode_count, i;
+	int ret;
 
 	if (!base)
 		return 0;  /* No base image */
@@ -228,6 +302,11 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 			}
 		}
 	}
+
+	/* Validate hard link consistency */
+	ret = daxfs_validate_hardlinks(info);
+	if (ret)
+		return ret;
 
 	/* No cycle detection needed - flat directory format has no linked lists */
 
