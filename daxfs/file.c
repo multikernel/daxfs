@@ -597,6 +597,11 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 	 * Solution: copy DAX data to anonymous pages for ALL private accesses.
 	 * This sacrifices DAX benefits for private mappings but ensures
 	 * correct COW semantics for any read/write access pattern.
+	 *
+	 * For write faults, the kernel's do_cow_fault() allocates cow_page,
+	 * calls our handler, copies from vmf->page to cow_page, then installs
+	 * cow_page. We must return a locked page so the kernel can properly
+	 * unlock and release it after copying.
 	 */
 	if (!is_shared) {
 		struct page *page;
@@ -605,26 +610,18 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 		data = daxfs_resolve_file_data(sb, inode->i_ino, pos,
 					       PAGE_SIZE, &len);
 
-		if (is_write) {
-			if (!vmf->cow_page)
-				return VM_FAULT_SIGBUS;
-			page = vmf->cow_page;
-		} else {
-			page = alloc_page(GFP_HIGHUSER_MOVABLE);
-			if (!page)
-				return VM_FAULT_OOM;
-		}
+		page = alloc_page(GFP_HIGHUSER_MOVABLE);
+		if (!page)
+			return VM_FAULT_OOM;
 
 		dst = kmap_local_page(page);
 		daxfs_copy_page(dst, data, len);
 		kunmap_local(dst);
 
-		if (is_write)
-			return VM_FAULT_DONE_COW;
-
 		__SetPageUptodate(page);
+		lock_page(page);
 		vmf->page = page;
-		return 0;
+		return VM_FAULT_LOCKED;
 	}
 
 	/*
@@ -638,7 +635,12 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 	} else {
 		data = daxfs_resolve_file_data(sb, inode->i_ino, pos,
 					       PAGE_SIZE, &len);
-		if (!data) {
+		/*
+		 * For PFN mapping, data must be page-aligned. write() stores
+		 * data inline (not page-aligned), so we need to copy it to
+		 * a page-aligned extent for mmap to work correctly.
+		 */
+		if (!data || !IS_ALIGNED((unsigned long)data, PAGE_SIZE)) {
 			sb_start_pagefault(sb);
 			data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &len);
 			sb_end_pagefault(sb);
