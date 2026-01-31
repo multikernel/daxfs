@@ -654,6 +654,17 @@ static int daxfs_iterate(struct file *file, struct dir_context *ctx)
 	return 0;
 }
 
+/*
+ * Hard link creation is not supported in branches.
+ * Hard links from the base image are preserved and work correctly,
+ * but new hard links cannot be created.
+ */
+static int daxfs_link(struct dentry *old_dentry, struct inode *dir,
+		      struct dentry *dentry)
+{
+	return -EPERM;
+}
+
 const struct inode_operations daxfs_dir_inode_ops = {
 	.lookup		= daxfs_lookup,
 	.create		= daxfs_create,
@@ -662,6 +673,7 @@ const struct inode_operations daxfs_dir_inode_ops = {
 	.rmdir		= daxfs_rmdir,
 	.rename		= daxfs_rename,
 	.symlink	= daxfs_symlink,
+	.link		= daxfs_link,
 };
 
 const struct file_operations daxfs_dir_ops = {

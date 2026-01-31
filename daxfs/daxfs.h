@@ -47,7 +47,9 @@ struct daxfs_delta_inode_entry {
 	u32 mode;			/* Current mode */
 	u32 uid;			/* Current uid */
 	u32 gid;			/* Current gid */
-	bool deleted;			/* Tombstone marker */
+	u32 base_nlink;			/* nlink from base image (0 if delta-created) */
+	s32 nlink_delta;		/* Accumulated change from unlinks */
+	bool deleted;			/* True when base_nlink + nlink_delta <= 0 */
 	struct list_head write_extents;	/* List of writes, newest first */
 	char *symlink_target;		/* For symlinks: target path (in delta log) */
 };
@@ -240,6 +242,7 @@ extern int daxfs_index_add_write_extent(struct daxfs_branch_ctx *branch,
 extern int daxfs_delta_merge(struct daxfs_branch_ctx *parent,
 			     struct daxfs_branch_ctx *child);
 extern char *daxfs_delta_get_symlink(struct daxfs_branch_ctx *branch, u64 ino);
+extern int daxfs_get_effective_nlink(struct super_block *sb, u64 ino, u32 *nlink);
 
 /* branch.c */
 extern struct daxfs_branch_ctx *daxfs_find_branch_by_name(

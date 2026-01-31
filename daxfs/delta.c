@@ -160,67 +160,104 @@ void *daxfs_delta_alloc_mmap(struct daxfs_info *info,
 }
 
 /*
- * Insert or update inode index entry
+ * Get base image nlink for an inode.
+ * Returns 0 if inode is not in base image (delta-created).
  */
-static int index_add_inode(struct daxfs_branch_ctx *branch, u64 ino,
-			   struct daxfs_delta_hdr *hdr, bool deleted,
-			   u64 size, u32 mode, u32 uid, u32 gid,
-			   char *symlink_target)
+static u32 get_base_nlink(struct daxfs_info *info, u64 ino)
+{
+	if (info->base_inodes && ino <= info->base_inode_count)
+		return le32_to_cpu(info->base_inodes[ino - 1].nlink);
+	return 0;
+}
+
+/*
+ * Find or create inode index entry (caller must hold index_lock)
+ * Returns entry on success, NULL on allocation failure
+ */
+static struct daxfs_delta_inode_entry *find_or_create_inode_entry(
+	struct daxfs_branch_ctx *branch, u64 ino,
+	struct rb_node **parent_out, struct rb_node ***link_out)
 {
 	struct rb_node **link = &branch->inode_index.rb_node;
 	struct rb_node *parent = NULL;
 	struct daxfs_delta_inode_entry *entry;
-	unsigned long flags;
 
-	spin_lock_irqsave(&branch->index_lock, flags);
-
-	/* Search for existing entry */
 	while (*link) {
 		parent = *link;
 		entry = rb_entry(parent, struct daxfs_delta_inode_entry, rb_node);
 
-		if (ino < entry->ino) {
+		if (ino < entry->ino)
 			link = &parent->rb_left;
-		} else if (ino > entry->ino) {
+		else if (ino > entry->ino)
 			link = &parent->rb_right;
-		} else {
-			/* Update existing entry */
-			entry->hdr = hdr;
-			entry->deleted = deleted;
-			if (size != (u64)-1)
-				entry->size = size;
-			if (mode != (u32)-1)
-				entry->mode = mode;
-			if (uid != (u32)-1)
-				entry->uid = uid;
-			if (gid != (u32)-1)
-				entry->gid = gid;
-			if (symlink_target)
-				entry->symlink_target = symlink_target;
-			spin_unlock_irqrestore(&branch->index_lock, flags);
-			return 0;
-		}
+		else
+			return entry;
 	}
 
-	/* Create new entry */
+	/* Not found - create new entry */
 	entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
+	if (!entry)
+		return NULL;
+
+	entry->ino = ino;
+	entry->base_nlink = get_base_nlink(branch->info, ino);
+	INIT_LIST_HEAD(&entry->write_extents);
+
+	*parent_out = parent;
+	*link_out = link;
+	return entry;
+}
+
+/*
+ * Insert or update inode index entry
+ *
+ * Use (u64)-1 for size and (u32)-1 for mode/uid/gid to leave unchanged.
+ * Set nlink_adjust to -1 for unlink, 0 for no change.
+ */
+static int index_add_inode(struct daxfs_branch_ctx *branch, u64 ino,
+			   struct daxfs_delta_hdr *hdr,
+			   u64 size, u32 mode, u32 uid, u32 gid,
+			   char *symlink_target, s32 nlink_adjust)
+{
+	struct daxfs_delta_inode_entry *entry;
+	struct rb_node *parent = NULL;
+	struct rb_node **link = NULL;
+	unsigned long flags;
+	bool is_new;
+
+	spin_lock_irqsave(&branch->index_lock, flags);
+
+	entry = find_or_create_inode_entry(branch, ino, &parent, &link);
 	if (!entry) {
 		spin_unlock_irqrestore(&branch->index_lock, flags);
 		return -ENOMEM;
 	}
 
-	entry->ino = ino;
-	entry->hdr = hdr;
-	entry->deleted = deleted;
-	entry->size = (size != (u64)-1) ? size : 0;
-	entry->mode = (mode != (u32)-1) ? mode : 0;
-	entry->uid = (uid != (u32)-1) ? uid : 0;
-	entry->gid = (gid != (u32)-1) ? gid : 0;
-	entry->symlink_target = symlink_target;
-	INIT_LIST_HEAD(&entry->write_extents);
+	is_new = (link != NULL);
 
-	rb_link_node(&entry->rb_node, parent, link);
-	rb_insert_color(&entry->rb_node, &branch->inode_index);
+	/* Update entry fields */
+	entry->hdr = hdr;
+
+	if (size != (u64)-1)
+		entry->size = size;
+	if (mode != (u32)-1)
+		entry->mode = mode;
+	if (uid != (u32)-1)
+		entry->uid = uid;
+	if (gid != (u32)-1)
+		entry->gid = gid;
+	if (symlink_target)
+		entry->symlink_target = symlink_target;
+
+	/* Handle nlink adjustment */
+	entry->nlink_delta += nlink_adjust;
+	entry->deleted = (entry->base_nlink + entry->nlink_delta <= 0);
+
+	/* Insert new entry into tree */
+	if (is_new) {
+		rb_link_node(&entry->rb_node, parent, link);
+		rb_insert_color(&entry->rb_node, &branch->inode_index);
+	}
 
 	spin_unlock_irqrestore(&branch->index_lock, flags);
 	return 0;
@@ -392,8 +429,7 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 		u32 gid = le32_to_cpu(cr->gid);
 		u16 name_len = le16_to_cpu(cr->name_len);
 
-		index_add_inode(branch, new_ino, hdr, false, 0, mode,
-				uid, gid, NULL);
+		index_add_inode(branch, new_ino, hdr, 0, mode, uid, gid, NULL, 0);
 		index_add_dirent(branch, parent_ino, name, name_len, hdr, false);
 		break;
 	}
@@ -403,7 +439,8 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 		u64 parent_ino = le64_to_cpu(del->parent_ino);
 		u16 name_len = le16_to_cpu(del->name_len);
 
-		index_add_inode(branch, ino, hdr, true, -1, -1, -1, -1, NULL);
+		/* Decrement nlink; inode deleted when nlink reaches 0 */
+		index_add_inode(branch, ino, hdr, -1, -1, -1, -1, NULL, -1);
 		index_add_dirent(branch, parent_ino, name, name_len, hdr, true);
 		break;
 	}
@@ -411,7 +448,7 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 		struct daxfs_delta_truncate *tr = entry + sizeof(*hdr);
 		u64 new_size = le64_to_cpu(tr->new_size);
 
-		index_add_inode(branch, ino, hdr, false, new_size, -1, -1, -1, NULL);
+		index_add_inode(branch, ino, hdr, new_size, -1, -1, -1, NULL, 0);
 		break;
 	}
 	case DAXFS_DELTA_WRITE: {
@@ -422,7 +459,7 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 		void *wr_data = (void *)(wr + 1);
 
 		/* Update size if write extends file */
-		index_add_inode(branch, ino, hdr, false, end, -1, -1, -1, NULL);
+		index_add_inode(branch, ino, hdr, end, -1, -1, -1, NULL, 0);
 		/* Add write extent for fast data lookup */
 		daxfs_index_add_write_extent(branch, ino, wr_offset, wr_len, wr_data);
 		break;
@@ -439,8 +476,7 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 		u32 gid = (valid & DAXFS_ATTR_GID) ?
 			  le32_to_cpu(sa->gid) : (u32)-1;
 
-		index_add_inode(branch, ino, hdr, false, size, mode,
-				uid, gid, NULL);
+		index_add_inode(branch, ino, hdr, size, mode, uid, gid, NULL, 0);
 		break;
 	}
 	case DAXFS_DELTA_SYMLINK: {
@@ -454,8 +490,8 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 		u16 name_len = le16_to_cpu(sl->name_len);
 		u16 target_len = le16_to_cpu(sl->target_len);
 
-		index_add_inode(branch, new_ino, hdr, false, target_len,
-				S_IFLNK | 0777, uid, gid, target);
+		index_add_inode(branch, new_ino, hdr, target_len,
+				S_IFLNK | 0777, uid, gid, target, 0);
 		index_add_dirent(branch, parent_ino, name, name_len, hdr, false);
 		break;
 	}
@@ -653,9 +689,9 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 			char *name = (char *)(cr + 1);
 
 			index_add_inode(branch, le64_to_cpu(cr->new_ino), hdr,
-					false, 0, le32_to_cpu(cr->mode),
+					0, le32_to_cpu(cr->mode),
 					le32_to_cpu(cr->uid),
-					le32_to_cpu(cr->gid), NULL);
+					le32_to_cpu(cr->gid), NULL, 0);
 			index_add_dirent(branch, le64_to_cpu(cr->parent_ino),
 					 name, le16_to_cpu(cr->name_len),
 					 hdr, false);
@@ -666,8 +702,9 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 				(void *)hdr + sizeof(*hdr);
 			char *name = (char *)(del + 1);
 
+			/* Decrement nlink; inode deleted when nlink reaches 0 */
 			index_add_inode(branch, le64_to_cpu(hdr->ino), hdr,
-					true, -1, -1, -1, -1, NULL);
+					-1, -1, -1, -1, NULL, -1);
 			index_add_dirent(branch, le64_to_cpu(del->parent_ino),
 					 name, le16_to_cpu(del->name_len),
 					 hdr, true);
@@ -678,8 +715,8 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 				(void *)hdr + sizeof(*hdr);
 
 			index_add_inode(branch, le64_to_cpu(hdr->ino), hdr,
-					false, le64_to_cpu(tr->new_size), -1,
-					-1, -1, NULL);
+					le64_to_cpu(tr->new_size), -1,
+					-1, -1, NULL, 0);
 			break;
 		}
 		case DAXFS_DELTA_WRITE: {
@@ -691,7 +728,7 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 			void *wr_data = (void *)(wr + 1);
 
 			index_add_inode(branch, le64_to_cpu(hdr->ino), hdr,
-					false, end, -1, -1, -1, NULL);
+					end, -1, -1, -1, NULL, 0);
 			/* Add write extent for fast data lookup */
 			daxfs_index_add_write_extent(branch, le64_to_cpu(hdr->ino),
 					       wr_offset, wr_len, wr_data);
@@ -703,7 +740,6 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 			u32 valid = le32_to_cpu(sa->valid);
 
 			index_add_inode(branch, le64_to_cpu(hdr->ino), hdr,
-					false,
 					(valid & DAXFS_ATTR_SIZE) ?
 						le64_to_cpu(sa->size) : (u64)-1,
 					(valid & DAXFS_ATTR_MODE) ?
@@ -712,7 +748,7 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 						le32_to_cpu(sa->uid) : (u32)-1,
 					(valid & DAXFS_ATTR_GID) ?
 						le32_to_cpu(sa->gid) : (u32)-1,
-					NULL);
+					NULL, 0);
 			break;
 		}
 		case DAXFS_DELTA_SYMLINK: {
@@ -723,9 +759,9 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 			u16 target_len = le16_to_cpu(sl->target_len);
 
 			index_add_inode(branch, le64_to_cpu(sl->new_ino), hdr,
-					false, target_len, S_IFLNK | 0777,
+					target_len, S_IFLNK | 0777,
 					le32_to_cpu(sl->uid),
-					le32_to_cpu(sl->gid), target);
+					le32_to_cpu(sl->gid), target, 0);
 			index_add_dirent(branch, le64_to_cpu(sl->parent_ino),
 					 name, le16_to_cpu(sl->name_len),
 					 hdr, false);
@@ -830,33 +866,53 @@ struct daxfs_delta_hdr *daxfs_delta_lookup_dirent(struct daxfs_branch_ctx *branc
 }
 
 /*
- * Check if inode is deleted in this branch
+ * Check if inode is deleted in this branch (accumulates nlink across chain)
  */
 bool daxfs_delta_is_deleted(struct daxfs_branch_ctx *branch, u64 ino)
 {
+	struct daxfs_info *info = branch->info;
+	struct daxfs_branch_ctx *b;
 	struct rb_node *node;
 	struct daxfs_delta_inode_entry *entry;
 	unsigned long flags;
+	u32 base_nlink;
+	s32 total_delta = 0;
+	bool found_in_delta = false;
 
-	spin_lock_irqsave(&branch->index_lock, flags);
+	/* Get base nlink */
+	base_nlink = get_base_nlink(info, ino);
 
-	node = branch->inode_index.rb_node;
-	while (node) {
-		entry = rb_entry(node, struct daxfs_delta_inode_entry, rb_node);
+	/* Accumulate nlink_delta across the entire branch chain */
+	for (b = branch; b != NULL; b = b->parent) {
+		spin_lock_irqsave(&b->index_lock, flags);
 
-		if (ino < entry->ino)
-			node = node->rb_left;
-		else if (ino > entry->ino)
-			node = node->rb_right;
-		else {
-			bool deleted = entry->deleted;
-			spin_unlock_irqrestore(&branch->index_lock, flags);
-			return deleted;
+		node = b->inode_index.rb_node;
+		while (node) {
+			entry = rb_entry(node, struct daxfs_delta_inode_entry, rb_node);
+
+			if (ino < entry->ino) {
+				node = node->rb_left;
+			} else if (ino > entry->ino) {
+				node = node->rb_right;
+			} else {
+				total_delta += entry->nlink_delta;
+				found_in_delta = true;
+				/* For delta-created inodes, base_nlink is 1 */
+				if (base_nlink == 0 && entry->base_nlink == 0)
+					base_nlink = 1;
+				break;
+			}
 		}
+
+		spin_unlock_irqrestore(&b->index_lock, flags);
 	}
 
-	spin_unlock_irqrestore(&branch->index_lock, flags);
-	return false;
+	/* If never touched in delta and not in base, not deleted (doesn't exist) */
+	if (!found_in_delta && base_nlink == 0)
+		return false;
+
+	/* Inode is deleted when effective nlink <= 0 */
+	return (base_nlink + total_delta) <= 0;
 }
 
 /*
@@ -1145,4 +1201,60 @@ int daxfs_delta_merge(struct daxfs_branch_ctx *parent,
 	daxfs_delta_build_index(parent);
 
 	return 0;
+}
+
+/*
+ * Get effective nlink for an inode (base + delta adjustments across chain)
+ */
+int daxfs_get_effective_nlink(struct super_block *sb, u64 ino, u32 *nlink)
+{
+	struct daxfs_info *info = DAXFS_SB(sb);
+	struct daxfs_branch_ctx *b;
+	struct rb_node *node;
+	struct daxfs_delta_inode_entry *entry;
+	unsigned long flags;
+	u32 base_nlink;
+	s32 total_delta = 0;
+	bool found = false;
+
+	/* Get base nlink */
+	base_nlink = get_base_nlink(info, ino);
+
+	/* Accumulate nlink_delta across the entire branch chain */
+	for (b = info->current_branch; b != NULL; b = b->parent) {
+		spin_lock_irqsave(&b->index_lock, flags);
+
+		node = b->inode_index.rb_node;
+		while (node) {
+			entry = rb_entry(node, struct daxfs_delta_inode_entry, rb_node);
+
+			if (ino < entry->ino) {
+				node = node->rb_left;
+			} else if (ino > entry->ino) {
+				node = node->rb_right;
+			} else {
+				total_delta += entry->nlink_delta;
+				found = true;
+				break;
+			}
+		}
+
+		spin_unlock_irqrestore(&b->index_lock, flags);
+	}
+
+	/* If in base image, use base nlink (possibly adjusted) */
+	if (base_nlink > 0) {
+		s32 effective = base_nlink + total_delta;
+		*nlink = (effective > 0) ? effective : 0;
+		return 0;
+	}
+
+	/* Delta-created inode: nlink is 1 unless deleted */
+	if (found) {
+		s32 effective = 1 + total_delta;
+		*nlink = (effective > 0) ? effective : 0;
+		return 0;
+	}
+
+	return -ENOENT;
 }

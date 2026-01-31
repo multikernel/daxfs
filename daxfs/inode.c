@@ -103,7 +103,17 @@ struct inode *daxfs_iget(struct super_block *sb, u64 ino)
 	inode->i_uid = make_kuid(&init_user_ns, uid);
 	inode->i_gid = make_kgid(&init_user_ns, gid);
 	inode->i_size = size;
-	set_nlink(inode, 1);
+
+	/* Set nlink from base image or delta, accounting for unlinks */
+	{
+		u32 effective_nlink = 1;
+		if (daxfs_get_effective_nlink(sb, ino, &effective_nlink) == 0)
+			set_nlink(inode, effective_nlink);
+		else if (di->raw)
+			set_nlink(inode, le32_to_cpu(di->raw->nlink));
+		else
+			set_nlink(inode, 1);
+	}
 
 	inode_set_mtime_to_ts(inode,
 		inode_set_atime_to_ts(inode,

@@ -57,13 +57,24 @@ struct file_entry {
 	uint32_t parent_ino;
 	uint64_t data_offset;		/* For files: file data; for dirs: dirent array */
 	uint32_t child_count;		/* Number of direct children (for dirs) */
+	bool is_hardlink;		/* True if this is a hard link to another file */
 	struct file_entry *next;
+};
+
+/* Track source filesystem inodes to detect hard links */
+struct hardlink_entry {
+	dev_t dev;			/* Source device */
+	ino_t src_ino;			/* Source inode number */
+	uint32_t daxfs_ino;		/* Assigned daxfs inode */
+	uint64_t data_offset;		/* Data offset (set after calculate_offsets) */
+	struct hardlink_entry *next;
 };
 
 static struct file_entry *files_head;
 static struct file_entry *files_tail;
 static uint32_t file_count;
 static uint32_t next_ino = 1;
+static struct hardlink_entry *hardlink_map;
 
 static struct file_entry *find_by_path(const char *path)
 {
@@ -76,9 +87,34 @@ static struct file_entry *find_by_path(const char *path)
 	return NULL;
 }
 
+static struct hardlink_entry *find_hardlink(dev_t dev, ino_t ino)
+{
+	struct hardlink_entry *e;
+
+	for (e = hardlink_map; e; e = e->next) {
+		if (e->dev == dev && e->src_ino == ino)
+			return e;
+	}
+	return NULL;
+}
+
+static void add_hardlink(dev_t dev, ino_t ino, uint32_t daxfs_ino)
+{
+	struct hardlink_entry *e = calloc(1, sizeof(*e));
+
+	if (!e)
+		return;
+	e->dev = dev;
+	e->src_ino = ino;
+	e->daxfs_ino = daxfs_ino;
+	e->next = hardlink_map;
+	hardlink_map = e;
+}
+
 static struct file_entry *add_file(const char *path, struct stat *st)
 {
 	struct file_entry *e;
+	struct hardlink_entry *hl;
 	char *slash;
 	size_t name_len;
 
@@ -88,7 +124,22 @@ static struct file_entry *add_file(const char *path, struct stat *st)
 
 	strncpy(e->path, path, sizeof(e->path) - 1);
 	e->st = *st;
-	e->ino = next_ino++;
+
+	/* Check for hard link (regular files with nlink > 1) */
+	if (S_ISREG(st->st_mode) && st->st_nlink > 1) {
+		hl = find_hardlink(st->st_dev, st->st_ino);
+		if (hl) {
+			/* This is a hard link to an existing file */
+			e->ino = hl->daxfs_ino;
+			e->is_hardlink = true;
+		} else {
+			/* First occurrence of this inode */
+			e->ino = next_ino++;
+			add_hardlink(st->st_dev, st->st_ino, e->ino);
+		}
+	} else {
+		e->ino = next_ino++;
+	}
 
 	slash = strrchr(path, '/');
 	if (slash && slash[1])
@@ -208,6 +259,7 @@ static void build_tree(void)
 static void calculate_offsets(void)
 {
 	struct file_entry *e;
+	struct hardlink_entry *hl;
 	uint64_t inode_offset = DAXFS_BLOCK_SIZE;
 	/* v3 format: no string table, data area directly after inodes */
 	uint64_t data_offset = ALIGN(inode_offset + file_count * DAXFS_INODE_SIZE,
@@ -215,8 +267,20 @@ static void calculate_offsets(void)
 
 	for (e = files_head; e; e = e->next) {
 		if (S_ISREG(e->st.st_mode)) {
-			e->data_offset = data_offset;
-			data_offset += ALIGN(e->st.st_size, DAXFS_BLOCK_SIZE);
+			if (e->is_hardlink) {
+				/* Reuse data offset from first occurrence */
+				hl = find_hardlink(e->st.st_dev, e->st.st_ino);
+				if (hl)
+					e->data_offset = hl->data_offset;
+				/* Don't advance data_offset - no new data */
+			} else {
+				e->data_offset = data_offset;
+				data_offset += ALIGN(e->st.st_size, DAXFS_BLOCK_SIZE);
+				/* Update hardlink map with data offset */
+				hl = find_hardlink(e->st.st_dev, e->st.st_ino);
+				if (hl)
+					hl->data_offset = e->data_offset;
+			}
 		} else if (S_ISLNK(e->st.st_mode)) {
 			e->data_offset = data_offset;
 			/* +1 for null terminator */
@@ -267,23 +331,26 @@ static int write_base_image(void *mem, size_t mem_size, const char *src_dir)
 		di->nlink = htole32(e->st.st_nlink);
 
 		if (S_ISREG(e->st.st_mode)) {
-			char fullpath[PATH_MAX * 2];
-			int fd;
-			ssize_t n;
-
 			di->size = htole64(e->st.st_size);
 			di->data_offset = htole64(e->data_offset);
 
-			snprintf(fullpath, sizeof(fullpath), "%s/%s", src_dir, e->path);
-			fd = open(fullpath, O_RDONLY);
-			if (fd < 0) {
-				perror(fullpath);
-				continue;
+			/* Only write data for first occurrence (hard links share data) */
+			if (!e->is_hardlink) {
+				char fullpath[PATH_MAX * 2];
+				int fd;
+				ssize_t n;
+
+				snprintf(fullpath, sizeof(fullpath), "%s/%s", src_dir, e->path);
+				fd = open(fullpath, O_RDONLY);
+				if (fd < 0) {
+					perror(fullpath);
+					continue;
+				}
+				n = read(fd, mem + e->data_offset, e->st.st_size);
+				if (n < 0)
+					perror(fullpath);
+				close(fd);
 			}
-			n = read(fd, mem + e->data_offset, e->st.st_size);
-			if (n < 0)
-				perror(fullpath);
-			close(fd);
 		} else if (S_ISLNK(e->st.st_mode)) {
 			char fullpath[PATH_MAX * 2];
 			ssize_t n;
@@ -354,12 +421,15 @@ static size_t calculate_base_size(void)
 	size_t total = data_offset;
 
 	for (e = files_head; e; e = e->next) {
-		if (S_ISREG(e->st.st_mode))
-			total += ALIGN(e->st.st_size, DAXFS_BLOCK_SIZE);
-		else if (S_ISLNK(e->st.st_mode))
+		if (S_ISREG(e->st.st_mode)) {
+			/* Only count data once for hard-linked files */
+			if (!e->is_hardlink)
+				total += ALIGN(e->st.st_size, DAXFS_BLOCK_SIZE);
+		} else if (S_ISLNK(e->st.st_mode)) {
 			total += ALIGN(e->st.st_size + 1, DAXFS_BLOCK_SIZE);  /* +1 for null */
-		else if (S_ISDIR(e->st.st_mode) && e->child_count > 0)
+		} else if (S_ISDIR(e->st.st_mode) && e->child_count > 0) {
 			total += ALIGN(e->child_count * DAXFS_DIRENT_SIZE, DAXFS_BLOCK_SIZE);
+		}
 	}
 
 	return total;

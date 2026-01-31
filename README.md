@@ -181,6 +181,7 @@ instances without distributed locking protocols.
 
 ## Limitations
 
-- No hard links (by design - simplifies delta log)
+- Hard links from base image are preserved, but cannot be created in branches
+- No mknod support (device nodes, FIFOs, sockets not supported)
 - Filename max 255 characters (matches VFS NAME_MAX)
 - Branch table max 256 entries
