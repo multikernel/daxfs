@@ -587,35 +587,44 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 		return VM_FAULT_SIGBUS;
 
 	/*
-	 * MAP_PRIVATE write: copy DAX data to kernel's anonymous page.
-	 * DAX has no struct pages, so we perform COW ourselves.
+	 * MAP_PRIVATE: always use anonymous pages to ensure COW works.
+	 *
+	 * The kernel's COW mechanism requires struct pages. DAX PFN mappings
+	 * don't have backing pages, so if we inserted a read-only PFN and
+	 * the user later writes, do_wp_page() can't do proper COW — it just
+	 * makes the PTE writable via pfn_mkwrite, corrupting shared data.
+	 *
+	 * Solution: copy DAX data to anonymous pages for ALL private accesses.
+	 * This sacrifices DAX benefits for private mappings but ensures
+	 * correct COW semantics for any read/write access pattern.
 	 */
-	if (is_write && !is_shared) {
+	if (!is_shared) {
+		struct page *page;
 		void *dst;
-
-		if (!vmf->cow_page)
-			return VM_FAULT_SIGBUS;
 
 		data = daxfs_resolve_file_data(sb, inode->i_ino, pos,
 					       PAGE_SIZE, &len);
-		dst = kmap_local_page(vmf->cow_page);
+
+		if (is_write) {
+			if (!vmf->cow_page)
+				return VM_FAULT_SIGBUS;
+			page = vmf->cow_page;
+		} else {
+			page = alloc_page(GFP_HIGHUSER_MOVABLE);
+			if (!page)
+				return VM_FAULT_OOM;
+		}
+
+		dst = kmap_local_page(page);
 		daxfs_copy_page(dst, data, len);
 		kunmap_local(dst);
 
-		return VM_FAULT_DONE_COW;
-	}
+		if (is_write)
+			return VM_FAULT_DONE_COW;
 
-	/*
-	 * MAP_PRIVATE read: map existing DAX data read-only.
-	 */
-	if (!is_shared) {
-		data = daxfs_resolve_file_data(sb, inode->i_ino, pos,
-					       PAGE_SIZE, &len);
-		pfn = daxfs_data_to_pfn(info, data);
-		if (!pfn)
-			return VM_FAULT_SIGBUS;
-
-		return vmf_insert_mixed(vma, vmf->address, pfn);
+		__SetPageUptodate(page);
+		vmf->page = page;
+		return 0;
 	}
 
 	/*
@@ -646,12 +655,8 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 }
 
 /*
- * DAX pfn_mkwrite handler - called to upgrade a write-protected PFN
- * mapping to writable.
- *
- * This is called when a read-mapped page is being written to.
- * The fault handler already allocated a page-aligned delta extent,
- * so we just need to upgrade the PTE protection to writable.
+ * DAX pfn_mkwrite handler - upgrade read-only PFN mapping to writable.
+ * Only called for MAP_SHARED (VM_PFNMAP) mappings.
  */
 static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 {
@@ -661,9 +666,12 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 	struct daxfs_info *info = DAXFS_SB(sb);
 	loff_t pos = (loff_t)vmf->pgoff << PAGE_SHIFT;
 	void *data;
-	size_t data_len;
-	phys_addr_t phys;
+	size_t len;
 	unsigned long pfn;
+
+	/* Should only be called for shared mappings */
+	if (!(vma->vm_flags & VM_SHARED))
+		return VM_FAULT_SIGBUS;
 
 	if (sb->s_flags & SB_RDONLY)
 		return VM_FAULT_SIGBUS;
@@ -673,35 +681,17 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 		return VM_FAULT_SIGBUS;
 	}
 
-	/*
-	 * Get the existing delta extent. The fault handler should have
-	 * already allocated a page-aligned extent for this position.
-	 * If not, allocate one now (shouldn't normally happen).
-	 */
 	sb_start_pagefault(sb);
-	data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &data_len);
+	data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &len);
 	sb_end_pagefault(sb);
 
-	if (!data)
+	pfn = daxfs_data_to_pfn(info, data);
+	if (!pfn)
 		return VM_FAULT_SIGBUS;
 
-	phys = daxfs_mem_phys(info, daxfs_mem_offset(info, data));
-	if (!phys)
-		return VM_FAULT_SIGBUS;
-
-	pfn = phys >> PAGE_SHIFT;
-
-	/*
-	 * Zap the old read-only PTE before inserting the writable one.
-	 * This is necessary because vmf_insert_pfn_prot will fail if
-	 * a PTE already exists at this address.
-	 */
+	/* Zap old PTE before inserting writable one */
 	zap_vma_ptes(vma, vmf->address, PAGE_SIZE);
 
-	/*
-	 * Insert writable PFN mapping with _PAGE_RW added to the base
-	 * protection.
-	 */
 	return vmf_insert_pfn_prot(vma, vmf->address, pfn,
 			__pgprot(pgprot_val(vma->vm_page_prot) | _PAGE_RW));
 }
@@ -751,13 +741,14 @@ static int daxfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 
 	file_accessed(file);
 
-	if (vma->vm_flags & VM_SHARED) {
-		/* Shared: pure DAX with VM_PFNMAP, writes to delta log */
+	/*
+	 * Shared mappings use VM_PFNMAP for direct DAX access.
+	 * Private mappings use anonymous pages (no special flags) to
+	 * ensure proper COW semantics — see daxfs_dax_fault().
+	 */
+	if (vma->vm_flags & VM_SHARED)
 		vm_flags_set(vma, VM_PFNMAP);
-	} else {
-		/* Private: VM_MIXEDMAP allows kernel COW for private writes */
-		vm_flags_set(vma, VM_MIXEDMAP);
-	}
+
 	vma->vm_ops = &daxfs_dax_vm_ops;
 
 	return 0;
