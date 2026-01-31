@@ -334,7 +334,8 @@ static inline bool daxfs_valid_base_offset(struct daxfs_info *info,
 	return offset + len <= base_size;
 }
 
-/* Validate base image on mount - returns 0 on success, -errno on error */
+/* validate.c - image validation for untrusted images */
+extern int daxfs_validate_super(struct daxfs_info *info);
 extern int daxfs_validate_base_image(struct daxfs_info *info);
 
 #endif /* _FS_DAXFS_H */
