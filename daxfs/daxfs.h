@@ -45,6 +45,8 @@ struct daxfs_delta_inode_entry {
 	struct daxfs_delta_hdr *hdr;	/* Latest delta entry for this inode */
 	u64 size;			/* Current size after all deltas */
 	u32 mode;			/* Current mode */
+	u32 uid;			/* Current uid */
+	u32 gid;			/* Current gid */
 	bool deleted;			/* Tombstone marker */
 	struct list_head write_extents;	/* List of writes, newest first */
 	char *symlink_target;		/* For symlinks: target path (in delta log) */
@@ -222,7 +224,8 @@ extern bool daxfs_delta_has_children(struct daxfs_branch_ctx *branch,
 extern int daxfs_delta_get_size(struct daxfs_branch_ctx *branch, u64 ino,
 				loff_t *size);
 extern int daxfs_resolve_inode(struct super_block *sb, u64 ino,
-			       umode_t *mode, loff_t *size, bool *deleted);
+			       umode_t *mode, loff_t *size,
+			       uid_t *uid, gid_t *gid, bool *deleted);
 extern void *daxfs_resolve_file_data(struct super_block *sb, u64 ino,
 				     loff_t pos, size_t len, size_t *out_len);
 extern void *daxfs_resolve_file_data_ex(struct super_block *sb, u64 ino,

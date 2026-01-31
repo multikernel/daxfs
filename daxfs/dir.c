@@ -163,6 +163,8 @@ static int daxfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	cr.parent_ino = cpu_to_le64(dir->i_ino);
 	cr.new_ino = cpu_to_le64(new_ino);
 	cr.mode = cpu_to_le32(mode);
+	cr.uid = cpu_to_le32(from_kuid(&init_user_ns, current_fsuid()));
+	cr.gid = cpu_to_le32(from_kgid(&init_user_ns, current_fsgid()));
 	cr.name_len = cpu_to_le16(dentry->d_name.len);
 	cr.flags = 0;
 
@@ -228,6 +230,8 @@ static struct dentry *daxfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	cr.parent_ino = cpu_to_le64(dir->i_ino);
 	cr.new_ino = cpu_to_le64(new_ino);
 	cr.mode = cpu_to_le32(mode | S_IFDIR);
+	cr.uid = cpu_to_le32(from_kuid(&init_user_ns, current_fsuid()));
+	cr.gid = cpu_to_le32(from_kgid(&init_user_ns, current_fsgid()));
 	cr.name_len = cpu_to_le16(dentry->d_name.len);
 	cr.flags = 0;
 
@@ -388,9 +392,10 @@ static int daxfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	/* Prepare SYMLINK entry */
 	sl.parent_ino = cpu_to_le64(dir->i_ino);
 	sl.new_ino = cpu_to_le64(new_ino);
+	sl.uid = cpu_to_le32(from_kuid(&init_user_ns, current_fsuid()));
+	sl.gid = cpu_to_le32(from_kgid(&init_user_ns, current_fsgid()));
 	sl.name_len = cpu_to_le16(dentry->d_name.len);
 	sl.target_len = cpu_to_le16(target_len);
-	sl.reserved = 0;
 
 	/* Entry: struct + name + target + null terminator */
 	entry_size = sizeof(sl) + dentry->d_name.len + target_len + 1;

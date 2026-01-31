@@ -63,6 +63,8 @@ struct inode *daxfs_iget(struct super_block *sb, u64 ino)
 	struct timespec64 zerotime = {0, 0};
 	umode_t mode = 0;
 	loff_t size = 0;
+	uid_t uid = 0;
+	gid_t gid = 0;
 	bool deleted = false;
 	int ret;
 
@@ -76,7 +78,7 @@ struct inode *daxfs_iget(struct super_block *sb, u64 ino)
 	di = DAXFS_I(inode);
 
 	/* First check delta logs */
-	ret = daxfs_resolve_inode(sb, ino, &mode, &size, &deleted);
+	ret = daxfs_resolve_inode(sb, ino, &mode, &size, &uid, &gid, &deleted);
 	if (ret == 0 && !deleted) {
 		/* Found in delta or base */
 		di->from_delta = true;
@@ -88,6 +90,8 @@ struct inode *daxfs_iget(struct super_block *sb, u64 ino)
 		di->data_offset = le64_to_cpu(raw->data_offset);
 		mode = le32_to_cpu(raw->mode);
 		size = le64_to_cpu(raw->size);
+		uid = le32_to_cpu(raw->uid);
+		gid = le32_to_cpu(raw->gid);
 		di->from_delta = false;
 	} else {
 		/* Not found */
@@ -96,8 +100,8 @@ struct inode *daxfs_iget(struct super_block *sb, u64 ino)
 	}
 
 	inode->i_mode = mode;
-	inode->i_uid = GLOBAL_ROOT_UID;
-	inode->i_gid = GLOBAL_ROOT_GID;
+	inode->i_uid = make_kuid(&init_user_ns, uid);
+	inode->i_gid = make_kgid(&init_user_ns, gid);
 	inode->i_size = size;
 	set_nlink(inode, 1);
 

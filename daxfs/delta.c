@@ -164,7 +164,8 @@ void *daxfs_delta_alloc_mmap(struct daxfs_info *info,
  */
 static int index_add_inode(struct daxfs_branch_ctx *branch, u64 ino,
 			   struct daxfs_delta_hdr *hdr, bool deleted,
-			   u64 size, u32 mode, char *symlink_target)
+			   u64 size, u32 mode, u32 uid, u32 gid,
+			   char *symlink_target)
 {
 	struct rb_node **link = &branch->inode_index.rb_node;
 	struct rb_node *parent = NULL;
@@ -190,6 +191,10 @@ static int index_add_inode(struct daxfs_branch_ctx *branch, u64 ino,
 				entry->size = size;
 			if (mode != (u32)-1)
 				entry->mode = mode;
+			if (uid != (u32)-1)
+				entry->uid = uid;
+			if (gid != (u32)-1)
+				entry->gid = gid;
 			if (symlink_target)
 				entry->symlink_target = symlink_target;
 			spin_unlock_irqrestore(&branch->index_lock, flags);
@@ -209,6 +214,8 @@ static int index_add_inode(struct daxfs_branch_ctx *branch, u64 ino,
 	entry->deleted = deleted;
 	entry->size = (size != (u64)-1) ? size : 0;
 	entry->mode = (mode != (u32)-1) ? mode : 0;
+	entry->uid = (uid != (u32)-1) ? uid : 0;
+	entry->gid = (gid != (u32)-1) ? gid : 0;
 	entry->symlink_target = symlink_target;
 	INIT_LIST_HEAD(&entry->write_extents);
 
@@ -381,9 +388,12 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 		u64 new_ino = le64_to_cpu(cr->new_ino);
 		u64 parent_ino = le64_to_cpu(cr->parent_ino);
 		u32 mode = le32_to_cpu(cr->mode);
+		u32 uid = le32_to_cpu(cr->uid);
+		u32 gid = le32_to_cpu(cr->gid);
 		u16 name_len = le16_to_cpu(cr->name_len);
 
-		index_add_inode(branch, new_ino, hdr, false, 0, mode, NULL);
+		index_add_inode(branch, new_ino, hdr, false, 0, mode,
+				uid, gid, NULL);
 		index_add_dirent(branch, parent_ino, name, name_len, hdr, false);
 		break;
 	}
@@ -393,7 +403,7 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 		u64 parent_ino = le64_to_cpu(del->parent_ino);
 		u16 name_len = le16_to_cpu(del->name_len);
 
-		index_add_inode(branch, ino, hdr, true, -1, -1, NULL);
+		index_add_inode(branch, ino, hdr, true, -1, -1, -1, -1, NULL);
 		index_add_dirent(branch, parent_ino, name, name_len, hdr, true);
 		break;
 	}
@@ -401,7 +411,7 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 		struct daxfs_delta_truncate *tr = entry + sizeof(*hdr);
 		u64 new_size = le64_to_cpu(tr->new_size);
 
-		index_add_inode(branch, ino, hdr, false, new_size, -1, NULL);
+		index_add_inode(branch, ino, hdr, false, new_size, -1, -1, -1, NULL);
 		break;
 	}
 	case DAXFS_DELTA_WRITE: {
@@ -412,7 +422,7 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 		void *wr_data = (void *)(wr + 1);
 
 		/* Update size if write extends file */
-		index_add_inode(branch, ino, hdr, false, end, -1, NULL);
+		index_add_inode(branch, ino, hdr, false, end, -1, -1, -1, NULL);
 		/* Add write extent for fast data lookup */
 		daxfs_index_add_write_extent(branch, ino, wr_offset, wr_len, wr_data);
 		break;
@@ -424,8 +434,13 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 			   le64_to_cpu(sa->size) : (u64)-1;
 		u32 mode = (valid & DAXFS_ATTR_MODE) ?
 			   le32_to_cpu(sa->mode) : (u32)-1;
+		u32 uid = (valid & DAXFS_ATTR_UID) ?
+			  le32_to_cpu(sa->uid) : (u32)-1;
+		u32 gid = (valid & DAXFS_ATTR_GID) ?
+			  le32_to_cpu(sa->gid) : (u32)-1;
 
-		index_add_inode(branch, ino, hdr, false, size, mode, NULL);
+		index_add_inode(branch, ino, hdr, false, size, mode,
+				uid, gid, NULL);
 		break;
 	}
 	case DAXFS_DELTA_SYMLINK: {
@@ -434,11 +449,13 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 		char *target = name + le16_to_cpu(sl->name_len);
 		u64 new_ino = le64_to_cpu(sl->new_ino);
 		u64 parent_ino = le64_to_cpu(sl->parent_ino);
+		u32 uid = le32_to_cpu(sl->uid);
+		u32 gid = le32_to_cpu(sl->gid);
 		u16 name_len = le16_to_cpu(sl->name_len);
 		u16 target_len = le16_to_cpu(sl->target_len);
 
 		index_add_inode(branch, new_ino, hdr, false, target_len,
-				S_IFLNK | 0777, target);
+				S_IFLNK | 0777, uid, gid, target);
 		index_add_dirent(branch, parent_ino, name, name_len, hdr, false);
 		break;
 	}
@@ -636,7 +653,9 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 			char *name = (char *)(cr + 1);
 
 			index_add_inode(branch, le64_to_cpu(cr->new_ino), hdr,
-					false, 0, le32_to_cpu(cr->mode), NULL);
+					false, 0, le32_to_cpu(cr->mode),
+					le32_to_cpu(cr->uid),
+					le32_to_cpu(cr->gid), NULL);
 			index_add_dirent(branch, le64_to_cpu(cr->parent_ino),
 					 name, le16_to_cpu(cr->name_len),
 					 hdr, false);
@@ -648,7 +667,7 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 			char *name = (char *)(del + 1);
 
 			index_add_inode(branch, le64_to_cpu(hdr->ino), hdr,
-					true, -1, -1, NULL);
+					true, -1, -1, -1, -1, NULL);
 			index_add_dirent(branch, le64_to_cpu(del->parent_ino),
 					 name, le16_to_cpu(del->name_len),
 					 hdr, true);
@@ -659,7 +678,8 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 				(void *)hdr + sizeof(*hdr);
 
 			index_add_inode(branch, le64_to_cpu(hdr->ino), hdr,
-					false, le64_to_cpu(tr->new_size), -1, NULL);
+					false, le64_to_cpu(tr->new_size), -1,
+					-1, -1, NULL);
 			break;
 		}
 		case DAXFS_DELTA_WRITE: {
@@ -671,7 +691,7 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 			void *wr_data = (void *)(wr + 1);
 
 			index_add_inode(branch, le64_to_cpu(hdr->ino), hdr,
-					false, end, -1, NULL);
+					false, end, -1, -1, -1, NULL);
 			/* Add write extent for fast data lookup */
 			daxfs_index_add_write_extent(branch, le64_to_cpu(hdr->ino),
 					       wr_offset, wr_len, wr_data);
@@ -688,6 +708,10 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 						le64_to_cpu(sa->size) : (u64)-1,
 					(valid & DAXFS_ATTR_MODE) ?
 						le32_to_cpu(sa->mode) : (u32)-1,
+					(valid & DAXFS_ATTR_UID) ?
+						le32_to_cpu(sa->uid) : (u32)-1,
+					(valid & DAXFS_ATTR_GID) ?
+						le32_to_cpu(sa->gid) : (u32)-1,
 					NULL);
 			break;
 		}
@@ -699,7 +723,9 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 			u16 target_len = le16_to_cpu(sl->target_len);
 
 			index_add_inode(branch, le64_to_cpu(sl->new_ino), hdr,
-					false, target_len, S_IFLNK | 0777, target);
+					false, target_len, S_IFLNK | 0777,
+					le32_to_cpu(sl->uid),
+					le32_to_cpu(sl->gid), target);
 			index_add_dirent(branch, le64_to_cpu(sl->parent_ino),
 					 name, le16_to_cpu(sl->name_len),
 					 hdr, false);
@@ -906,7 +932,8 @@ int daxfs_delta_get_size(struct daxfs_branch_ctx *branch, u64 ino, loff_t *size)
  * Resolve inode through branch chain
  */
 int daxfs_resolve_inode(struct super_block *sb, u64 ino,
-			   umode_t *mode, loff_t *size, bool *deleted)
+			umode_t *mode, loff_t *size,
+			uid_t *uid, gid_t *gid, bool *deleted)
 {
 	struct daxfs_info *info = DAXFS_SB(sb);
 	struct daxfs_branch_ctx *b;
@@ -929,7 +956,7 @@ int daxfs_resolve_inode(struct super_block *sb, u64 ino,
 				return 0;
 			}
 
-			/* Get mode and size from index */
+			/* Get mode, size, uid, gid from index */
 			struct rb_node *node;
 			struct daxfs_delta_inode_entry *entry;
 
@@ -945,6 +972,8 @@ int daxfs_resolve_inode(struct super_block *sb, u64 ino,
 				else {
 					*mode = entry->mode;
 					*size = entry->size;
+					*uid = entry->uid;
+					*gid = entry->gid;
 					return 0;
 				}
 			}
@@ -956,6 +985,8 @@ int daxfs_resolve_inode(struct super_block *sb, u64 ino,
 		struct daxfs_base_inode *raw = &info->base_inodes[ino - 1];
 		*mode = le32_to_cpu(raw->mode);
 		*size = le64_to_cpu(raw->size);
+		*uid = le32_to_cpu(raw->uid);
+		*gid = le32_to_cpu(raw->gid);
 		return 0;
 	}
 

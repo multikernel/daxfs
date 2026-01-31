@@ -133,6 +133,8 @@ struct daxfs_delta_create {
 	__le64 parent_ino;
 	__le64 new_ino;
 	__le32 mode;
+	__le32 uid;
+	__le32 gid;
 	__le16 name_len;
 	__le16 flags;
 	/* Name follows immediately */
@@ -192,9 +194,10 @@ struct daxfs_delta_setattr {
 struct daxfs_delta_symlink {
 	__le64 parent_ino;
 	__le64 new_ino;
+	__le32 uid;
+	__le32 gid;
 	__le16 name_len;
 	__le16 target_len;
-	__le32 reserved;
 	/* Name follows immediately, then target (null-terminated) */
 };
 
