@@ -926,53 +926,97 @@ struct daxfs_delta_hdr *daxfs_delta_lookup_dirent(struct daxfs_branch_ctx *branc
 }
 
 /*
+ * Get nlink_delta for an inode from a single branch (caller must hold index_lock)
+ */
+static bool get_branch_nlink_delta(struct daxfs_branch_ctx *branch, u64 ino,
+				   s32 *delta_out)
+{
+	struct rb_node *node = branch->inode_index.rb_node;
+	struct daxfs_delta_inode_entry *entry;
+
+	while (node) {
+		entry = rb_entry(node, struct daxfs_delta_inode_entry, rb_node);
+
+		if (ino < entry->ino)
+			node = node->rb_left;
+		else if (ino > entry->ino)
+			node = node->rb_right;
+		else {
+			*delta_out = entry->nlink_delta;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Accumulate nlink_delta across the entire branch chain
+ * Returns true if inode was found in any branch's delta
+ */
+static bool accumulate_nlink_delta(struct daxfs_branch_ctx *branch, u64 ino,
+				   s32 *total_delta)
+{
+	struct daxfs_branch_ctx *b;
+	unsigned long flags;
+	s32 delta;
+	bool found = false;
+
+	*total_delta = 0;
+
+	for (b = branch; b != NULL; b = b->parent) {
+		spin_lock_irqsave(&b->index_lock, flags);
+		if (get_branch_nlink_delta(b, ino, &delta)) {
+			*total_delta += delta;
+			found = true;
+		}
+		spin_unlock_irqrestore(&b->index_lock, flags);
+	}
+
+	return found;
+}
+
+/*
+ * Compute effective nlink for an inode
+ * Returns the effective nlink (base + delta), or 0 if deleted
+ */
+static u32 compute_effective_nlink(struct daxfs_info *info, u64 ino,
+				   s32 total_delta, bool found_in_delta)
+{
+	u32 base_nlink = get_base_nlink(info, ino);
+	s32 effective;
+
+	if (base_nlink > 0) {
+		effective = base_nlink + total_delta;
+		return (effective > 0) ? effective : 0;
+	}
+
+	/* Delta-created inode: base nlink is 1 */
+	if (found_in_delta) {
+		effective = 1 + total_delta;
+		return (effective > 0) ? effective : 0;
+	}
+
+	return 0;
+}
+
+/*
  * Check if inode is deleted in this branch (accumulates nlink across chain)
  */
 bool daxfs_delta_is_deleted(struct daxfs_branch_ctx *branch, u64 ino)
 {
 	struct daxfs_info *info = branch->info;
-	struct daxfs_branch_ctx *b;
-	struct rb_node *node;
-	struct daxfs_delta_inode_entry *entry;
-	unsigned long flags;
-	u32 base_nlink;
-	s32 total_delta = 0;
-	bool found_in_delta = false;
+	u32 base_nlink = get_base_nlink(info, ino);
+	s32 total_delta;
+	bool found;
 
-	/* Get base nlink */
-	base_nlink = get_base_nlink(info, ino);
-
-	/* Accumulate nlink_delta across the entire branch chain */
-	for (b = branch; b != NULL; b = b->parent) {
-		spin_lock_irqsave(&b->index_lock, flags);
-
-		node = b->inode_index.rb_node;
-		while (node) {
-			entry = rb_entry(node, struct daxfs_delta_inode_entry, rb_node);
-
-			if (ino < entry->ino) {
-				node = node->rb_left;
-			} else if (ino > entry->ino) {
-				node = node->rb_right;
-			} else {
-				total_delta += entry->nlink_delta;
-				found_in_delta = true;
-				/* For delta-created inodes, base_nlink is 1 */
-				if (base_nlink == 0 && entry->base_nlink == 0)
-					base_nlink = 1;
-				break;
-			}
-		}
-
-		spin_unlock_irqrestore(&b->index_lock, flags);
-	}
+	found = accumulate_nlink_delta(branch, ino, &total_delta);
 
 	/* If never touched in delta and not in base, not deleted (doesn't exist) */
-	if (!found_in_delta && base_nlink == 0)
+	if (!found && base_nlink == 0)
 		return false;
 
 	/* Inode is deleted when effective nlink <= 0 */
-	return (base_nlink + total_delta) <= 0;
+	return compute_effective_nlink(info, ino, total_delta, found) == 0;
 }
 
 /*
@@ -1269,50 +1313,14 @@ int daxfs_delta_merge(struct daxfs_branch_ctx *parent,
 int daxfs_get_effective_nlink(struct super_block *sb, u64 ino, u32 *nlink)
 {
 	struct daxfs_info *info = DAXFS_SB(sb);
-	struct daxfs_branch_ctx *b;
-	struct rb_node *node;
-	struct daxfs_delta_inode_entry *entry;
-	unsigned long flags;
-	u32 base_nlink;
-	s32 total_delta = 0;
-	bool found = false;
+	u32 base_nlink = get_base_nlink(info, ino);
+	s32 total_delta;
+	bool found;
 
-	/* Get base nlink */
-	base_nlink = get_base_nlink(info, ino);
+	found = accumulate_nlink_delta(info->current_branch, ino, &total_delta);
 
-	/* Accumulate nlink_delta across the entire branch chain */
-	for (b = info->current_branch; b != NULL; b = b->parent) {
-		spin_lock_irqsave(&b->index_lock, flags);
-
-		node = b->inode_index.rb_node;
-		while (node) {
-			entry = rb_entry(node, struct daxfs_delta_inode_entry, rb_node);
-
-			if (ino < entry->ino) {
-				node = node->rb_left;
-			} else if (ino > entry->ino) {
-				node = node->rb_right;
-			} else {
-				total_delta += entry->nlink_delta;
-				found = true;
-				break;
-			}
-		}
-
-		spin_unlock_irqrestore(&b->index_lock, flags);
-	}
-
-	/* If in base image, use base nlink (possibly adjusted) */
-	if (base_nlink > 0) {
-		s32 effective = base_nlink + total_delta;
-		*nlink = (effective > 0) ? effective : 0;
-		return 0;
-	}
-
-	/* Delta-created inode: nlink is 1 unless deleted */
-	if (found) {
-		s32 effective = 1 + total_delta;
-		*nlink = (effective > 0) ? effective : 0;
+	if (base_nlink > 0 || found) {
+		*nlink = compute_effective_nlink(info, ino, total_delta, found);
 		return 0;
 	}
 
