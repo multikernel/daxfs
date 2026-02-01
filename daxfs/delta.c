@@ -223,6 +223,21 @@ static void update_inode_entry(struct daxfs_branch_ctx *branch,
 	}
 }
 
+static void init_entry_from_base(struct daxfs_branch_ctx *branch,
+				 struct daxfs_delta_inode_entry *entry,
+				 u64 ino, struct rb_node **link)
+{
+	struct daxfs_info *info = branch->info;
+
+	if (link && entry->mode == 0 && info->base_inodes &&
+	    ino <= info->base_inode_count) {
+		struct daxfs_base_inode *raw = &info->base_inodes[ino - 1];
+		entry->mode = le32_to_cpu(raw->mode);
+		entry->uid = le32_to_cpu(raw->uid);
+		entry->gid = le32_to_cpu(raw->gid);
+	}
+}
+
 static int index_inode_create(struct daxfs_branch_ctx *branch, u64 ino,
 			      struct daxfs_delta_hdr *hdr, u64 size,
 			      u32 mode, u32 uid, u32 gid, char *symlink_target)
@@ -270,6 +285,7 @@ static int index_inode_unlink(struct daxfs_branch_ctx *branch, u64 ino,
 
 	entry->hdr = hdr;
 	entry->nlink_delta--;
+	init_entry_from_base(branch, entry, ino, link);
 
 	update_inode_entry(branch, entry, parent, link);
 	spin_unlock_irqrestore(&branch->index_lock, flags);
@@ -294,6 +310,7 @@ static int index_inode_set_size(struct daxfs_branch_ctx *branch, u64 ino,
 
 	entry->hdr = hdr;
 	entry->size = size;
+	init_entry_from_base(branch, entry, ino, link);
 
 	update_inode_entry(branch, entry, parent, link);
 	spin_unlock_irqrestore(&branch->index_lock, flags);
@@ -305,6 +322,7 @@ static int index_inode_setattr(struct daxfs_branch_ctx *branch, u64 ino,
 			       u64 size, u32 mode, u32 uid, u32 gid)
 {
 	struct daxfs_delta_inode_entry *entry;
+	struct daxfs_info *info = branch->info;
 	struct rb_node *parent = NULL;
 	struct rb_node **link = NULL;
 	unsigned long flags;
@@ -315,6 +333,14 @@ static int index_inode_setattr(struct daxfs_branch_ctx *branch, u64 ino,
 	if (!entry) {
 		spin_unlock_irqrestore(&branch->index_lock, flags);
 		return -ENOMEM;
+	}
+
+	init_entry_from_base(branch, entry, ino, link);
+	/* Size needs special handling since 0 is a valid size */
+	if (link && size == (u64)-1 && info->base_inodes &&
+	    ino <= info->base_inode_count) {
+		struct daxfs_base_inode *raw = &info->base_inodes[ino - 1];
+		entry->size = le64_to_cpu(raw->size);
 	}
 
 	entry->hdr = hdr;
