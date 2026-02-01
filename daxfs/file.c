@@ -12,6 +12,7 @@
 #include <linux/dma-buf.h>
 #include <linux/iomap.h>
 #include <linux/dax.h>
+#include <linux/splice.h>
 #include <asm/pgtable.h>
 #include "daxfs.h"
 
@@ -778,7 +779,7 @@ const struct file_operations daxfs_file_ops = {
 	.llseek		= generic_file_llseek,
 	.read_iter	= daxfs_read_iter,
 	.write_iter	= daxfs_write_iter,
-	.splice_read	= filemap_splice_read,
+	.splice_read	= copy_splice_read,
 	.open		= daxfs_file_open,
 	.release	= daxfs_file_release,
 	.mmap		= daxfs_file_mmap,
@@ -858,39 +859,61 @@ static ssize_t daxfs_read_iter_ro(struct kiocb *iocb, struct iov_iter *to)
 	return chunk;
 }
 
-static int daxfs_read_folio_ro(struct file *file, struct folio *folio)
+static vm_fault_t daxfs_dax_fault_ro(struct vm_fault *vmf)
 {
-	struct inode *inode = folio->mapping->host;
+	struct vm_area_struct *vma = vmf->vma;
+	struct inode *inode = file_inode(vma->vm_file);
 	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
-	loff_t pos = folio_pos(folio);
-	size_t len = folio_size(folio);
-	size_t chunk;
-	void *src;
+	loff_t pos = (loff_t)vmf->pgoff << PAGE_SHIFT;
+	bool is_shared = vma->vm_flags & VM_SHARED;
+	void *data;
+	size_t len;
+	unsigned long pfn;
 
-	if (pos >= inode->i_size) {
-		folio_zero_range(folio, 0, len);
-		goto out;
+	if (pos >= inode->i_size)
+		return VM_FAULT_SIGBUS;
+
+	data = daxfs_base_file_data(info, inode->i_ino, pos, PAGE_SIZE, &len);
+
+	/*
+	 * MAP_SHARED with page-aligned data: use direct PFN mapping.
+	 * This gives true DAX benefits - no page cache, no copy.
+	 */
+	if (is_shared && data && IS_ALIGNED((unsigned long)data, PAGE_SIZE)) {
+		pfn = daxfs_data_to_pfn(info, data);
+		if (pfn)
+			return vmf_insert_pfn_prot(vma, vmf->address, pfn,
+						   vma->vm_page_prot);
 	}
 
-	src = daxfs_base_file_data(info, inode->i_ino, pos, len, &chunk);
-	if (src && chunk > 0)
-		memcpy_to_folio(folio, 0, src, chunk);
-	else
-		chunk = 0;
+	/*
+	 * Fall back to anonymous pages for:
+	 * - MAP_PRIVATE (COW requires struct pages)
+	 * - Non-page-aligned base image data
+	 * - Data beyond file size (zero fill)
+	 */
+	{
+		struct page *page;
+		void *dst;
 
-	if (chunk < len)
-		folio_zero_range(folio, chunk, len - chunk);
+		page = alloc_page(GFP_HIGHUSER_MOVABLE);
+		if (!page)
+			return VM_FAULT_OOM;
 
-out:
-	folio_mark_uptodate(folio);
-	folio_unlock(folio);
-	return 0;
+		dst = kmap_local_page(page);
+		daxfs_copy_page(dst, data, len);
+		kunmap_local(dst);
+
+		__SetPageUptodate(page);
+		lock_page(page);
+		vmf->page = page;
+		return VM_FAULT_LOCKED;
+	}
 }
 
-static const struct vm_operations_struct daxfs_vm_ops_ro = {
-	.fault		= filemap_fault,
-	.map_pages	= filemap_map_pages,
-	/* No page_mkwrite - read-only */
+static const struct vm_operations_struct daxfs_dax_vm_ops_ro = {
+	.fault		= daxfs_dax_fault_ro,
+	/* No pfn_mkwrite - read-only */
 };
 
 static int daxfs_file_mmap_ro(struct file *file, struct vm_area_struct *vma)
@@ -899,19 +922,30 @@ static int daxfs_file_mmap_ro(struct file *file, struct vm_area_struct *vma)
 		return -EACCES;
 
 	file_accessed(file);
-	vma->vm_ops = &daxfs_vm_ops_ro;
+
+	/*
+	 * Shared mappings use VM_PFNMAP for direct DAX access when possible.
+	 * Private mappings use anonymous pages for proper COW semantics.
+	 */
+	if (vma->vm_flags & VM_SHARED)
+		vm_flags_set(vma, VM_PFNMAP);
+
+	vma->vm_ops = &daxfs_dax_vm_ops_ro;
 	return 0;
 }
 
+/*
+ * For DAX, we don't use the page cache, so address_space_operations
+ * are minimal. This is still needed because the VFS expects a_ops.
+ */
 const struct address_space_operations daxfs_aops_ro = {
-	.read_folio	= daxfs_read_folio_ro,
-	/* No writepages - read-only */
+	/* Empty - DAX bypasses page cache */
 };
 
 const struct file_operations daxfs_file_ops_ro = {
 	.llseek		= generic_file_llseek,
 	.read_iter	= daxfs_read_iter_ro,
-	.splice_read	= filemap_splice_read,
+	.splice_read	= copy_splice_read,
 	.mmap		= daxfs_file_mmap_ro,
 	.fsync		= noop_fsync,
 	.unlocked_ioctl	= daxfs_ioctl,
