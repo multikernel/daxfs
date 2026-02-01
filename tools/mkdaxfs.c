@@ -672,7 +672,7 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  -H, --heap PATH        Allocate from DMA heap (e.g., /dev/dma_heap/multikernel)\n");
 	fprintf(stderr, "  -m, --mountpoint DIR   Mount after creating (required with -H)\n");
 	fprintf(stderr, "  -p, --phys ADDR        Write to physical address via /dev/mem\n");
-	fprintf(stderr, "  -s, --size SIZE        Size to allocate (required with -H or -p)\n");
+	fprintf(stderr, "  -s, --size SIZE        Override allocation size (default: auto-calculated)\n");
 	fprintf(stderr, "  -b, --branching        Enable branching support (adds branch table and delta region)\n");
 	fprintf(stderr, "  -V, --validate         Validate image on mount\n");
 	fprintf(stderr, "  -D, --delta SIZE       Delta region size (default: 64M, only with -b)\n");
@@ -681,9 +681,9 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "Use -b to enable branching (adds branch table and delta region).\n");
 	fprintf(stderr, "\nExamples:\n");
 	fprintf(stderr, "  %s -d /path/to/rootfs -o image.daxfs\n", prog);
-	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/system -s 64M -m /mnt\n", prog);
-	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/system -s 256M -m /mnt -b\n", prog);
-	fprintf(stderr, "  %s -d /path/to/rootfs -p 0x100000000 -s 256M\n", prog);
+	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/system -m /mnt\n", prog);
+	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/system -m /mnt -b -D 64M\n", prog);
+	fprintf(stderr, "  %s -d /path/to/rootfs -p 0x100000000\n", prog);
 }
 
 int main(int argc, char *argv[])
@@ -774,11 +774,6 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	if ((phys_addr || heap_path) && !max_size) {
-		fprintf(stderr, "Error: -s/--size is required with -p/--phys or -H/--heap\n");
-		print_usage(argv[0]);
-		return 1;
-	}
 
 	if (heap_path && !mountpoint) {
 		fprintf(stderr, "Error: -m/--mountpoint is required with -H/--heap\n");
@@ -811,6 +806,15 @@ int main(int argc, char *argv[])
 	       (double)total_size / (1024 * 1024));
 	printf("Mode: %s\n", branching ? "branching" : "static (read-only)");
 
+	/* Use calculated size if -s not specified, otherwise validate */
+	if (!max_size) {
+		max_size = total_size;
+	} else if (total_size > max_size) {
+		fprintf(stderr, "Error: image size %zu exceeds requested size %zu\n",
+			total_size, max_size);
+		return 1;
+	}
+
 	if (heap_path) {
 		/* Allocate from DMA heap and write */
 		int heap_fd;
@@ -818,12 +822,6 @@ int main(int argc, char *argv[])
 			.len = max_size,
 			.fd_flags = O_RDWR | O_CLOEXEC,
 		};
-
-		if (total_size > max_size) {
-			fprintf(stderr, "Error: image size %zu exceeds requested size %zu\n",
-				total_size, max_size);
-			return 1;
-		}
 
 		heap_fd = open(heap_path, O_RDWR);
 		if (heap_fd < 0) {
@@ -882,12 +880,6 @@ int main(int argc, char *argv[])
 		ret = 0;
 	} else if (phys_addr) {
 		int fd;
-
-		if (total_size > max_size) {
-			fprintf(stderr, "Error: image size %zu exceeds max size %zu\n",
-				total_size, max_size);
-			return 1;
-		}
 
 		fd = open("/dev/mem", O_RDWR | O_SYNC);
 		if (fd < 0) {
