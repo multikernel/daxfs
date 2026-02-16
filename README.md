@@ -47,7 +47,7 @@ pointer chasing required.
 |------------|------------------------------|
 | **tmpfs/ramfs** | Per-instance, N containers = N copies in memory |
 | **overlayfs** | No nested branching, copy-up on write, page cache overhead |
-| **erofs** | Read-only by design, no write path, adding branching negates its benefits |
+| **erofs** | Read-only, no branching; fscache is per-kernel so N kernels = N cache copies |
 | **famfs** | Per-file allocation complexity, no self-contained images |
 | **cramfs** | Block I/O + page cache, no direct memory mapping |
 
