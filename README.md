@@ -17,10 +17,11 @@ and synchronization with `cmpxchg`.
 - **Security by simplicity** - Flat directory format, bounded validation, no pointer chasing
 - **N-level speculative branches** - Nested speculation with commit-to-root/abort semantics
 - **Flexible backing** - Physical address, DAX device, or dma-buf
+- **Backing store mode** - Split metadata (DAX) from file data (backing file) with shared page cache
 
 ## Security
 
-DAXFS v4 uses a flat directory format designed for safe handling of untrusted images:
+DAXFS v5 uses a flat directory format designed for safe handling of untrusted images:
 
 | Property | Benefit |
 |----------|---------|
@@ -63,17 +64,22 @@ Requires `CONFIG_FS_DAX` enabled in the target kernel.
 
 ```bash
 # Create and mount from DMA heap (typical workflow)
-mkdaxfs -d /path/to/rootfs -H /dev/dma_heap/system -s 256M -m /mnt -w
+mkdaxfs -d /path/to/rootfs -H /dev/dma_heap/system -s 256M -m /mnt -b
 
 # Create at physical address, then mount separately
-mkdaxfs -d /path/to/rootfs -p 0x100000000 -s 256M -w
+mkdaxfs -d /path/to/rootfs -p 0x100000000 -s 256M -b
 mount -t daxfs -o phys=0x100000000,size=0x10000000 none /mnt
 
 # Create format blob (copy to DAX memory to mount)
-mkdaxfs -d /path/to/rootfs -o image.daxfs -w
+mkdaxfs -d /path/to/rootfs -o image.daxfs -b
+
+# Split mode: metadata+cache in DAX, file data in backing file
+mkdaxfs -d /path/to/rootfs -H /dev/dma_heap/mk -m /mnt -o /data/rootfs.img -b
+mount -t daxfs -o phys=ADDR,size=SIZE,backing=/data/rootfs.img none /mnt
 ```
 
-Mount options: `phys=ADDR`, `size=SIZE`, `validate` (check untrusted data).
+Mount options: `phys=ADDR`, `size=SIZE`, `validate` (check untrusted data),
+`backing=PATH` (backing file for split mode).
 
 For dma-buf backing, use the new mount API (`fsopen`/`fsconfig`/`fsmount`) with
 `FSCONFIG_SET_FD` to pass the dma-buf fd.
@@ -168,16 +174,23 @@ Defined in `include/daxfs_format.h`. Layout:
 | Superblock | Magic, version, offsets, global coordination (4KB) |
 | Branch table | 128-byte entries, up to 256 branches |
 | Base image | Read-only snapshot (inode table + data) |
+| Page cache | Shared cache slots for backing store mode (optional) |
 | Delta region | Branch delta logs |
 
 **Global coordination** (in superblock): commit sequence counter and spinlock for
 cross-kernel synchronization. Uses `cmpxchg` on DAX memory - works across kernel
 instances without distributed locking protocols.
 
-**Base image** (v4 flat format):
+**Base image** (v5 flat format):
 - Inode table: fixed 64-byte entries
 - Data area: file contents + directory entry arrays
 - Directories store `daxfs_dirent` arrays (271 bytes each, 255-char max name)
+
+**Page cache** (backing store mode): Direct-mapped cache in DAX memory for split-mode
+images where metadata stays in DAX and file data lives in an external backing file.
+Uses a 3-state machine (FREE/PENDING/VALID) with atomic `cmpxchg` transitions for
+lock-free cross-kernel sharing. The host kernel fills cache misses from the backing
+file; spawn kernels mark slots PENDING and wait for the host to fill them.
 
 **Delta log** entries: write, create, delete, truncate, mkdir, rename, setattr, symlink.
 
