@@ -1166,16 +1166,7 @@ int daxfs_resolve_inode(struct super_block *sb, u64 ino,
 		}
 	}
 
-	/* Check base image */
-	if (info->base_inodes && ino <= info->base_inode_count) {
-		struct daxfs_base_inode *raw = &info->base_inodes[ino - 1];
-		*mode = le32_to_cpu(raw->mode);
-		*size = le64_to_cpu(raw->size);
-		*uid = le32_to_cpu(raw->uid);
-		*gid = le32_to_cpu(raw->gid);
-		return 0;
-	}
-
+	/* Not found in any delta — let caller fall through to base image */
 	return -ENOENT;
 }
 
@@ -1259,7 +1250,6 @@ void *daxfs_resolve_file_data_ex(struct super_block *sb, u64 ino,
 		struct daxfs_base_inode *raw = &info->base_inodes[ino - 1];
 		u64 data_offset = le64_to_cpu(raw->data_offset);
 		loff_t file_size = le64_to_cpu(raw->size);
-		u64 abs_offset;
 
 		if (pos >= file_size) {
 			*out_len = 0;
@@ -1267,11 +1257,41 @@ void *daxfs_resolve_file_data_ex(struct super_block *sb, u64 ino,
 		}
 
 		*out_len = min(len, (size_t)(file_size - pos));
-		abs_offset = le64_to_cpu(info->super->base_offset) +
-			     data_offset + pos;
-		if (from_base)
-			*from_base = true;
-		return daxfs_mem_ptr((struct daxfs_info *)info, abs_offset);
+
+		/*
+		 * External data mode: regular file data is in the backing
+		 * file, accessed through the page cache. Dirs and symlinks
+		 * remain in the base image.
+		 */
+		if (info->pcache && S_ISREG(le32_to_cpu(raw->mode))) {
+			u64 page_start = (data_offset + pos) &
+					 ~(u64)(PAGE_SIZE - 1);
+			void *page;
+			u32 intra;
+
+			page = daxfs_pcache_get_page(info, page_start);
+			if (IS_ERR(page)) {
+				*out_len = 0;
+				return NULL;
+			}
+			intra = (data_offset + pos) & (PAGE_SIZE - 1);
+			*out_len = min(*out_len, (size_t)(PAGE_SIZE - intra));
+			if (from_base)
+				*from_base = true;
+			return page + intra;
+		}
+
+		/* Direct DAX path (no backing store) */
+		{
+			u64 abs_offset;
+
+			abs_offset = le64_to_cpu(info->super->base_offset) +
+				     data_offset + pos;
+			if (from_base)
+				*from_base = true;
+			return daxfs_mem_ptr((struct daxfs_info *)info,
+					    abs_offset);
+		}
 	}
 
 	*out_len = 0;

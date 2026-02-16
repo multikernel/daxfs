@@ -15,8 +15,8 @@
 /* ioctl commands */
 #define DAXFS_IOC_GET_DMABUF	_IO('D', 1)	/* Get dma-buf fd for this mount */
 
-#define DAXFS_SUPER_MAGIC	0x64617834	/* "dax4" */
-#define DAXFS_VERSION		4
+#define DAXFS_SUPER_MAGIC	0x64617835	/* "dax5" */
+#define DAXFS_VERSION		5
 #define DAXFS_BLOCK_SIZE	4096
 #define DAXFS_INODE_SIZE	64
 #define DAXFS_NAME_MAX		255
@@ -86,7 +86,15 @@ struct daxfs_super {
 	/* Global coordination - at offset 152 (64 bytes) */
 	struct daxfs_global_coord coord;
 
-	__u8   reserved[3880];		/* Pad to 4KB (3944 - 64) */
+	/* Page cache for backing store mode */
+	__le64 pcache_offset;		/* Offset to page cache region (0 = no cache) */
+	__le64 pcache_size;		/* Total size of page cache region */
+	__le32 pcache_slot_count;	/* Number of cache slots */
+	__le32 pcache_hash_shift;	/* log2(slot_count) for masking */
+	__le32 pcache_pending;		/* Atomic: count of PENDING slots */
+	__le32 pcache_reserved;
+
+	__u8   reserved[3848];		/* Pad to 4KB (3880 - 32) */
 };
 
 /*
@@ -214,7 +222,10 @@ struct daxfs_delta_symlink {
  * string table - names are stored directly in directory entries.
  */
 
-#define DAXFS_BASE_MAGIC	0x64646134	/* "dda4" - version 4 */
+#define DAXFS_BASE_MAGIC	0x64646135	/* "dda5" - version 5 */
+
+/* Base image flags */
+#define DAXFS_BASE_FLAG_EXTERNAL_DATA	(1 << 0)  /* Regular file data in external backing file */
 
 /*
  * Base image superblock - always at base_offset, padded to DAXFS_BLOCK_SIZE
@@ -264,6 +275,53 @@ struct daxfs_dirent {
 	__le16 name_len;		/* Actual name length */
 	__u8   reserved[6];		/* Padding */
 	char   name[DAXFS_NAME_MAX];	/* Name (not null-terminated, use name_len) */
+};
+
+/*
+ * ============================================================================
+ * Page Cache (shared across kernel instances via DAX memory)
+ * ============================================================================
+ *
+ * Direct-mapped cache for backing store mode. Each backing file page maps
+ * to exactly one cache slot via hash. 3-state machine with all transitions
+ * via cmpxchg on DAX memory (no IPIs needed).
+ *
+ * Region layout:
+ *   [pcache_header (4KB)]
+ *   [slot_metadata (slot_count * 16B, padded to 4KB)]
+ *   [slot_data (slot_count * 4KB)]
+ */
+
+#define DAXFS_PCACHE_MAGIC	0x70636163	/* "pcac" */
+#define DAXFS_PCACHE_VERSION	1
+
+/* Cache slot states (stored in bits[1:0] of state_tag) */
+#define PCACHE_STATE_FREE	0	/* Slot empty, available */
+#define PCACHE_STATE_PENDING	1	/* Claimed, needs host to fill */
+#define PCACHE_STATE_VALID	2	/* Data ready */
+
+/* Helpers for packed state_tag field */
+#define PCACHE_STATE(v)		((v) & 3)
+#define PCACHE_TAG(v)		((v) >> 2)
+#define PCACHE_MAKE(state, tag)	(((tag) << 2) | (state))
+
+struct daxfs_pcache_header {		/* 4KB, at pcache_offset */
+	__le32 magic;			/* DAXFS_PCACHE_MAGIC */
+	__le32 version;			/* DAXFS_PCACHE_VERSION */
+	__le32 slot_count;
+	__le32 hash_shift;
+	__le64 slot_meta_offset;	/* From pcache_offset */
+	__le64 slot_data_offset;	/* From pcache_offset */
+	__le32 evict_hand;		/* Clock sweep position (atomic) */
+	__le32 pending_count;		/* Atomic: PENDING slots outstanding */
+	__u8   reserved[4096 - 40];
+};
+
+struct daxfs_pcache_slot {		/* 16 bytes per slot */
+	__le64 state_tag;		/* bits[1:0] = state, bits[63:2] = tag */
+					/* Packed so cmpxchg atomically sets both */
+	__le32 ref_bit;			/* Clock algorithm: recently accessed */
+	__le32 reserved;
 };
 
 #endif /* _DAXFS_FORMAT_H */

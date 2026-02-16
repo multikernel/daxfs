@@ -24,6 +24,7 @@ static inline unsigned int inode_state_read_once(struct inode *inode)
 #endif
 
 struct daxfs_branch_ctx;
+struct daxfs_pcache;
 
 /*
  * Write extent entry - tracks a single write to an inode
@@ -99,6 +100,19 @@ struct daxfs_branch_ctx {
 };
 
 /*
+ * Page cache runtime state
+ */
+struct daxfs_pcache {
+	struct daxfs_pcache_header *header;  /* On-DAX header */
+	struct daxfs_pcache_slot *slots;     /* On-DAX slot metadata */
+	void *data;                          /* On-DAX slot data area */
+	u32 slot_count;
+	u32 hash_mask;                       /* slot_count - 1 */
+	struct file *backing_file;           /* NULL for spawn kernels */
+	struct task_struct *fill_thread;     /* Host kthread, NULL for spawn */
+};
+
+/*
  * Filesystem info - runtime state
  */
 struct daxfs_info {
@@ -126,6 +140,9 @@ struct daxfs_info {
 	struct daxfs_base_inode *base_inodes;
 	u64 base_data_offset;		/* Absolute offset to data region */
 	u32 base_inode_count;
+
+	/* Page cache for backing store mode */
+	struct daxfs_pcache *pcache;
 
 	/* Static image mode (no branching) */
 	bool static_image;
@@ -333,6 +350,13 @@ static inline bool daxfs_valid_base_offset(struct daxfs_info *info,
 		return false;
 	return offset + len <= base_size;
 }
+
+/* pcache.c - shared page cache for backing store mode */
+extern int daxfs_pcache_init(struct daxfs_info *info, const char *backing_path);
+extern void daxfs_pcache_exit(struct daxfs_info *info);
+extern void *daxfs_pcache_get_page(struct daxfs_info *info,
+				   u64 backing_page_offset);
+extern bool daxfs_is_pcache_data(struct daxfs_info *info, void *ptr);
 
 /* validate.c - image validation for untrusted images */
 extern int daxfs_validate_super(struct daxfs_info *info);

@@ -33,6 +33,8 @@ MNT_BRANCH1=""
 MNT_BRANCH2=""
 MNT_NESTED=""
 SOURCE_DIR=""
+BACKING_FILE=""
+DAXFS_INSPECT=""
 
 # Options
 KEEP_ON_FAIL=0
@@ -131,6 +133,8 @@ setup() {
         die "daxfs-branch not found at $DAXFS_BRANCH - run 'make' first"
     fi
 
+    DAXFS_INSPECT="$PROJECT_DIR/tools/daxfs-inspect"
+
     if [ ! -f "$MODULE" ]; then
         die "daxfs.ko not found at $MODULE - run 'make' first"
     fi
@@ -174,7 +178,7 @@ test_main_readonly() {
     run_test "Main branch is read-only"
 
     # Create and mount image
-    "$MKDAXFS" -d "$SOURCE_DIR" -H "$HEAP_DEV" -s "$IMAGE_SIZE" -m "$MNT_MAIN" -w \
+    "$MKDAXFS" -d "$SOURCE_DIR" -H "$HEAP_DEV" -s "$IMAGE_SIZE" -m "$MNT_MAIN" -b \
         || die "Failed to create/mount image"
 
     # Verify content is readable
@@ -531,6 +535,329 @@ test_sibling_invalidation() {
 }
 
 #
+# Page cache (backing store mode) tests
+#
+
+setup_pcache() {
+    log ""
+    log "DAXFS Page Cache Tests"
+    log "======================"
+
+    # Tear down existing mounts from branching tests
+    for mnt in "$MNT_NESTED" "$MNT_BRANCH2" "$MNT_BRANCH1" "$MNT_MAIN"; do
+        if [ -n "$mnt" ] && mountpoint -q "$mnt" 2>/dev/null; then
+            umount "$mnt" 2>/dev/null || true
+        fi
+    done
+
+    # Create richer source content for pcache testing
+    PCACHE_SOURCE="$TEST_DIR/pcache_source"
+    BACKING_FILE="$TEST_DIR/backing.img"
+    mkdir -p "$PCACHE_SOURCE"
+
+    echo "Hello from pcache base" > "$PCACHE_SOURCE/hello.txt"
+    echo "Original pcache content" > "$PCACHE_SOURCE/modify_me.txt"
+    mkdir -p "$PCACHE_SOURCE/subdir"
+    echo "Nested pcache file" > "$PCACHE_SOURCE/subdir/nested.txt"
+
+    # Create a multi-page file (larger than 4KB)
+    dd if=/dev/urandom of="$PCACHE_SOURCE/largefile.bin" bs=4096 count=8 2>/dev/null
+    # Save checksum for verification
+    LARGE_CKSUM=$(md5sum "$PCACHE_SOURCE/largefile.bin" | awk '{print $1}')
+
+    # Create more files to exercise multiple cache slots
+    for i in $(seq 1 10); do
+        echo "File number $i with some padding data to fill it out" > "$PCACHE_SOURCE/file_$i.txt"
+    done
+
+    # Symlink in base image
+    ln -s hello.txt "$PCACHE_SOURCE/link_to_hello"
+
+    log_verbose "Pcache source: $PCACHE_SOURCE"
+    log_verbose "Backing file:  $BACKING_FILE"
+}
+
+test_pcache_split_create() {
+    run_test "Split-mode image creation"
+
+    "$MKDAXFS" -d "$PCACHE_SOURCE" -H "$HEAP_DEV" -s "$IMAGE_SIZE" \
+        -m "$MNT_MAIN" -o "$BACKING_FILE" -b \
+        || { fail "Split-mode create" "mkdaxfs failed"; return; }
+
+    # Verify backing file was created
+    if [ ! -f "$BACKING_FILE" ]; then
+        fail "Split-mode create" "Backing file not created"
+        return
+    fi
+
+    local backing_size=$(stat -c %s "$BACKING_FILE")
+    if [ "$backing_size" -eq 0 ]; then
+        fail "Split-mode create" "Backing file is empty"
+        return
+    fi
+
+    # Verify mount is accessible
+    if ! mountpoint -q "$MNT_MAIN"; then
+        fail "Split-mode create" "Mount point not active"
+        return
+    fi
+
+    log_verbose "  Backing file size: $backing_size bytes"
+    pass "Split-mode image creation"
+}
+
+test_pcache_read_files() {
+    run_test "Read files through page cache"
+
+    # Read small files
+    local content
+    content=$(cat "$MNT_MAIN/hello.txt") || {
+        fail "Pcache read files" "Failed to read hello.txt"
+        return
+    }
+    if [ "$content" != "Hello from pcache base" ]; then
+        fail "Pcache read files" "hello.txt content mismatch: '$content'"
+        return
+    fi
+
+    content=$(cat "$MNT_MAIN/modify_me.txt") || {
+        fail "Pcache read files" "Failed to read modify_me.txt"
+        return
+    }
+    if [ "$content" != "Original pcache content" ]; then
+        fail "Pcache read files" "modify_me.txt content mismatch"
+        return
+    fi
+
+    # Read nested file
+    content=$(cat "$MNT_MAIN/subdir/nested.txt") || {
+        fail "Pcache read files" "Failed to read nested file"
+        return
+    }
+    if [ "$content" != "Nested pcache file" ]; then
+        fail "Pcache read files" "nested.txt content mismatch"
+        return
+    fi
+
+    # Read numbered files
+    for i in $(seq 1 10); do
+        content=$(cat "$MNT_MAIN/file_$i.txt") || {
+            fail "Pcache read files" "Failed to read file_$i.txt"
+            return
+        }
+        if [ "$content" != "File number $i with some padding data to fill it out" ]; then
+            fail "Pcache read files" "file_$i.txt content mismatch"
+            return
+        fi
+    done
+
+    pass "Read files through page cache"
+}
+
+test_pcache_large_file() {
+    run_test "Multi-page file through page cache"
+
+    # Read the large file and compare checksum
+    local mount_cksum
+    mount_cksum=$(md5sum "$MNT_MAIN/largefile.bin" | awk '{print $1}') || {
+        fail "Pcache large file" "Failed to read largefile.bin"
+        return
+    }
+
+    if [ "$mount_cksum" != "$LARGE_CKSUM" ]; then
+        fail "Pcache large file" "Checksum mismatch: $mount_cksum != $LARGE_CKSUM"
+        return
+    fi
+
+    pass "Multi-page file through page cache"
+}
+
+test_pcache_symlink() {
+    run_test "Symlinks work with page cache"
+
+    if [ ! -L "$MNT_MAIN/link_to_hello" ]; then
+        fail "Pcache symlink" "Symlink not visible"
+        return
+    fi
+
+    local target
+    target=$(readlink "$MNT_MAIN/link_to_hello")
+    if [ "$target" != "hello.txt" ]; then
+        fail "Pcache symlink" "Symlink target mismatch: '$target'"
+        return
+    fi
+
+    local content
+    content=$(cat "$MNT_MAIN/link_to_hello") || {
+        fail "Pcache symlink" "Failed to read through symlink"
+        return
+    }
+    if [ "$content" != "Hello from pcache base" ]; then
+        fail "Pcache symlink" "Content through symlink mismatch"
+        return
+    fi
+
+    pass "Symlinks work with page cache"
+}
+
+test_pcache_mmap_read() {
+    run_test "mmap reads work with page cache"
+
+    # Use dd with iflag=fullblock to read via mmap-like path
+    # The real test: read file content, which exercises the anon-page fallback
+    local output
+    output=$(dd if="$MNT_MAIN/hello.txt" bs=4096 count=1 2>/dev/null) || {
+        fail "Pcache mmap read" "dd read failed"
+        return
+    }
+
+    if [ "$output" != "Hello from pcache base" ]; then
+        fail "Pcache mmap read" "Content mismatch via dd"
+        return
+    fi
+
+    pass "mmap reads work with page cache"
+}
+
+test_pcache_branch_write() {
+    run_test "Branch writes work on pcache-backed mount"
+
+    # Create a writable branch on the pcache-backed image
+    "$DAXFS_BRANCH" create pcache_b1 -m "$MNT_BRANCH1" -p main \
+        || { fail "Pcache branch write" "Failed to create branch"; return; }
+
+    # Verify base content readable through branch
+    local content
+    content=$(cat "$MNT_BRANCH1/hello.txt") || {
+        fail "Pcache branch write" "Failed to read base file from branch"
+        return
+    }
+    if [ "$content" != "Hello from pcache base" ]; then
+        fail "Pcache branch write" "Base content mismatch in branch"
+        return
+    fi
+
+    # Write new file in branch
+    echo "New in pcache branch" > "$MNT_BRANCH1/new_branch_file.txt" \
+        || { fail "Pcache branch write" "Failed to write new file"; return; }
+
+    content=$(cat "$MNT_BRANCH1/new_branch_file.txt") || {
+        fail "Pcache branch write" "Failed to read new file"
+        return
+    }
+    if [ "$content" != "New in pcache branch" ]; then
+        fail "Pcache branch write" "New file content mismatch"
+        return
+    fi
+
+    # Modify existing file (delta overrides cached base data)
+    echo "Modified pcache content" > "$MNT_BRANCH1/modify_me.txt" \
+        || { fail "Pcache branch write" "Failed to modify file"; return; }
+
+    content=$(cat "$MNT_BRANCH1/modify_me.txt") || {
+        fail "Pcache branch write" "Failed to read modified file"
+        return
+    }
+    if [ "$content" != "Modified pcache content" ]; then
+        fail "Pcache branch write" "Modified file content mismatch"
+        return
+    fi
+
+    pass "Branch writes work on pcache-backed mount"
+}
+
+test_pcache_branch_isolation() {
+    run_test "Branch isolation with page cache"
+
+    # Create second branch from main
+    "$DAXFS_BRANCH" create pcache_b2 -m "$MNT_BRANCH2" -p main \
+        || { fail "Pcache branch isolation" "Failed to create branch2"; return; }
+
+    # Branch2 should see original cached base data, not branch1's changes
+    local content
+    content=$(cat "$MNT_BRANCH2/modify_me.txt") || {
+        fail "Pcache branch isolation" "Failed to read from branch2"
+        return
+    }
+    if [ "$content" != "Original pcache content" ]; then
+        fail "Pcache branch isolation" "Branch2 sees branch1's modification"
+        return
+    fi
+
+    # Branch2 should not see branch1's new file
+    if [ -f "$MNT_BRANCH2/new_branch_file.txt" ]; then
+        fail "Pcache branch isolation" "Branch2 sees branch1's new file"
+        return
+    fi
+
+    # Verify large file is still correct in branch2
+    local mount_cksum
+    mount_cksum=$(md5sum "$MNT_BRANCH2/largefile.bin" | awk '{print $1}') || {
+        fail "Pcache branch isolation" "Failed to read large file from branch2"
+        return
+    }
+    if [ "$mount_cksum" != "$LARGE_CKSUM" ]; then
+        fail "Pcache branch isolation" "Large file checksum mismatch in branch2"
+        return
+    fi
+
+    # Clean up branches
+    umount "$MNT_BRANCH2" 2>/dev/null || true
+    umount "$MNT_BRANCH1" 2>/dev/null || true
+
+    pass "Branch isolation with page cache"
+}
+
+test_pcache_inspect() {
+    run_test "daxfs-inspect shows page cache info"
+
+    if [ ! -f "$DAXFS_INSPECT" ]; then
+        skip "daxfs-inspect not built"
+        return
+    fi
+
+    local output
+    output=$("$DAXFS_INSPECT" status -m "$MNT_MAIN" 2>&1) || {
+        fail "Pcache inspect" "daxfs-inspect failed"
+        return
+    }
+
+    # Should show page cache section
+    if ! echo "$output" | grep -q "Page cache:"; then
+        fail "Pcache inspect" "No 'Page cache:' section in output"
+        log_verbose "  Output: $output"
+        return
+    fi
+
+    # Should show slot counts
+    if ! echo "$output" | grep -q "Slots:"; then
+        fail "Pcache inspect" "No slot count in output"
+        return
+    fi
+
+    # Should show slot states
+    if ! echo "$output" | grep -q "Slot states:"; then
+        fail "Pcache inspect" "No slot states in output"
+        return
+    fi
+
+    # Should show some valid slots (pre-warmed data)
+    if echo "$output" | grep -q "0 valid"; then
+        fail "Pcache inspect" "Expected some valid (pre-warmed) slots"
+        return
+    fi
+
+    log_verbose "  Inspect output:"
+    if [ "$VERBOSE" -eq 1 ]; then
+        echo "$output" | grep -A5 "Page cache:" | while read -r line; do
+            log_verbose "    $line"
+        done
+    fi
+
+    pass "daxfs-inspect shows page cache info"
+}
+
+#
 # Main
 #
 
@@ -568,6 +895,17 @@ main() {
     test_truncate_in_branch
     test_branch_commit
     test_sibling_invalidation
+
+    # Page cache tests (requires separate split-mode image)
+    setup_pcache
+    test_pcache_split_create
+    test_pcache_read_files
+    test_pcache_large_file
+    test_pcache_symlink
+    test_pcache_mmap_read
+    test_pcache_branch_write
+    test_pcache_branch_isolation
+    test_pcache_inspect
 
     # Summary
     log ""

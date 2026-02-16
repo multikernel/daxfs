@@ -25,6 +25,7 @@ enum daxfs_param {
 	Opt_commit,
 	Opt_abort,
 	Opt_validate,
+	Opt_backing,
 };
 
 static const struct fs_parameter_spec daxfs_fs_parameters[] = {
@@ -37,6 +38,7 @@ static const struct fs_parameter_spec daxfs_fs_parameters[] = {
 	fsparam_flag("commit", Opt_commit),
 	fsparam_flag("abort", Opt_abort),
 	fsparam_flag("validate", Opt_validate),
+	fsparam_string("backing", Opt_backing),
 	{}
 };
 
@@ -47,6 +49,7 @@ struct daxfs_fs_context {
 	struct file *dmabuf_file;	/* dma-buf file from FSCONFIG_SET_FD */
 	char *branch_name;		/* branch name */
 	char *parent_name;		/* parent branch name */
+	char *backing_path;		/* backing file path for pcache */
 	bool commit;			/* remount commit flag */
 	bool do_abort;			/* remount abort flag */
 	bool validate;			/* validate image on mount */
@@ -100,6 +103,12 @@ static int daxfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_validate:
 		ctx->validate = true;
+		break;
+	case Opt_backing:
+		kfree(ctx->backing_path);
+		ctx->backing_path = kstrdup(param->string, GFP_KERNEL);
+		if (!ctx->backing_path)
+			return -ENOMEM;
 		break;
 	default:
 		return -EINVAL;
@@ -202,6 +211,13 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 			if (ret)
 				goto err_unmap;
 		}
+	}
+
+	/* Initialize page cache if present */
+	if (le64_to_cpu(info->super->pcache_offset)) {
+		ret = daxfs_pcache_init(info, ctx->backing_path);
+		if (ret)
+			goto err_unmap;
 	}
 
 	sb->s_op = &daxfs_super_ops;
@@ -310,6 +326,7 @@ err_branch:
 			atomic_dec(&branch->refcount);
 	}
 err_unmap:
+	daxfs_pcache_exit(info);
 	daxfs_mem_exit(info);
 	kfree(info->name);
 err_free:
@@ -333,6 +350,7 @@ static void daxfs_free_fc(struct fs_context *fc)
 		kfree(ctx->name);
 		kfree(ctx->branch_name);
 		kfree(ctx->parent_name);
+		kfree(ctx->backing_path);
 		kfree(ctx);
 	}
 }
@@ -463,6 +481,7 @@ static void daxfs_kill_sb(struct super_block *sb)
 	kill_anon_super(sb);
 
 	if (info) {
+		daxfs_pcache_exit(info);
 		daxfs_mem_exit(info);
 		kfree(info->name);
 		kfree(info);
@@ -516,6 +535,8 @@ static int daxfs_show_options(struct seq_file *m, struct dentry *root)
 	else
 		seq_printf(m, ",phys=0x%llx", (unsigned long long)info->phys_addr);
 	seq_printf(m, ",size=%zu", info->size);
+	if (info->pcache && info->pcache->backing_file)
+		seq_puts(m, ",backing=<path>");
 	if (info->static_image) {
 		seq_puts(m, ",static");
 	} else if (info->current_branch) {

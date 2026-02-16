@@ -75,6 +75,7 @@ static struct file_entry *files_tail;
 static uint32_t file_count;
 static uint32_t next_ino = 1;
 static struct hardlink_entry *hardlink_map;
+static uint64_t backing_file_size;  /* Total backing file data size (split mode) */
 
 static struct file_entry *find_by_path(const char *path)
 {
@@ -435,7 +436,441 @@ static size_t calculate_base_size(void)
 	return total;
 }
 
+/*
+ * ============================================================================
+ * Split mode: metadata+cache to DAX, file data to backing file
+ * ============================================================================
+ */
+
+/*
+ * In split mode, regular file data goes to the backing file (page-aligned).
+ * Dir/symlink data remains in the base image.
+ */
+static void calculate_offsets_split(void)
+{
+	struct file_entry *e;
+	struct hardlink_entry *hl;
+	uint64_t inode_offset = DAXFS_BLOCK_SIZE;
+	/* Base image data area: only dirs and symlinks */
+	uint64_t base_data_offset = ALIGN(inode_offset + file_count * DAXFS_INODE_SIZE,
+					  DAXFS_BLOCK_SIZE);
+	uint64_t back_offset = 0;  /* Offset in backing file */
+
+	for (e = files_head; e; e = e->next) {
+		if (S_ISREG(e->st.st_mode)) {
+			if (e->is_hardlink) {
+				hl = find_hardlink(e->st.st_dev, e->st.st_ino);
+				if (hl)
+					e->data_offset = hl->data_offset;
+			} else {
+				e->data_offset = back_offset;
+				back_offset += ALIGN(e->st.st_size, DAXFS_BLOCK_SIZE);
+				hl = find_hardlink(e->st.st_dev, e->st.st_ino);
+				if (hl)
+					hl->data_offset = e->data_offset;
+			}
+		} else if (S_ISLNK(e->st.st_mode)) {
+			e->data_offset = base_data_offset;
+			base_data_offset += ALIGN(e->st.st_size + 1, DAXFS_BLOCK_SIZE);
+		} else if (S_ISDIR(e->st.st_mode) && e->child_count > 0) {
+			e->data_offset = base_data_offset;
+			base_data_offset += ALIGN(e->child_count * DAXFS_DIRENT_SIZE,
+						  DAXFS_BLOCK_SIZE);
+		}
+	}
+
+	backing_file_size = back_offset;
+}
+
+/*
+ * Base image size in split mode: only metadata (no regular file data)
+ */
+static size_t calculate_base_size_split(void)
+{
+	struct file_entry *e;
+	uint64_t inode_offset = DAXFS_BLOCK_SIZE;
+	uint64_t data_offset = ALIGN(inode_offset + file_count * DAXFS_INODE_SIZE,
+				     DAXFS_BLOCK_SIZE);
+	size_t total = data_offset;
+
+	for (e = files_head; e; e = e->next) {
+		if (S_ISLNK(e->st.st_mode))
+			total += ALIGN(e->st.st_size + 1, DAXFS_BLOCK_SIZE);
+		else if (S_ISDIR(e->st.st_mode) && e->child_count > 0)
+			total += ALIGN(e->child_count * DAXFS_DIRENT_SIZE,
+				       DAXFS_BLOCK_SIZE);
+	}
+
+	return total;
+}
+
+static uint32_t prev_power_of_2(uint32_t v)
+{
+	v |= v >> 1;
+	v |= v >> 2;
+	v |= v >> 4;
+	v |= v >> 8;
+	v |= v >> 16;
+	return v - (v >> 1);
+}
+
+static uint32_t calc_ilog2(uint32_t v)
+{
+	uint32_t r = 0;
+
+	while (v >>= 1)
+		r++;
+	return r;
+}
+
+/*
+ * Calculate pcache region size for a given slot count.
+ * Layout: [header 4KB] [slot metadata, padded to 4KB] [slot data]
+ */
+static size_t calculate_pcache_region_size(uint32_t slot_count)
+{
+	uint64_t meta_size = ALIGN((uint64_t)slot_count * sizeof(struct daxfs_pcache_slot),
+				   DAXFS_BLOCK_SIZE);
+	uint64_t data_size = (uint64_t)slot_count * DAXFS_BLOCK_SIZE;
+
+	return DAXFS_BLOCK_SIZE + meta_size + data_size;
+}
+
+/*
+ * Write base image for split mode (metadata only, no regular file data).
+ * Regular file data_offset values point into the backing file.
+ */
+static int write_base_image_split(void *mem, size_t mem_size, const char *src_dir)
+{
+	struct file_entry *e, *child;
+	struct daxfs_base_super *base_super = mem;
+	struct daxfs_base_inode *inodes;
+	uint64_t inode_offset = DAXFS_BLOCK_SIZE;
+	uint64_t data_offset = ALIGN(inode_offset + file_count * DAXFS_INODE_SIZE,
+				     DAXFS_BLOCK_SIZE);
+
+	memset(mem, 0, mem_size);
+
+	base_super->magic = htole32(DAXFS_BASE_MAGIC);
+	base_super->version = htole32(DAXFS_VERSION);
+	base_super->flags = htole32(DAXFS_BASE_FLAG_EXTERNAL_DATA);
+	base_super->block_size = htole32(DAXFS_BLOCK_SIZE);
+	base_super->inode_count = htole32(file_count);
+	base_super->root_inode = htole32(DAXFS_ROOT_INO);
+	base_super->inode_offset = htole64(inode_offset);
+	base_super->data_offset = htole64(data_offset);
+
+	inodes = mem + inode_offset;
+
+	for (e = files_head; e; e = e->next) {
+		struct daxfs_base_inode *di = &inodes[e->ino - 1];
+
+		di->ino = htole32(e->ino);
+		di->mode = htole32(e->st.st_mode);
+		di->uid = htole32(e->st.st_uid);
+		di->gid = htole32(e->st.st_gid);
+		di->nlink = htole32(e->st.st_nlink);
+
+		if (S_ISREG(e->st.st_mode)) {
+			/* data_offset = backing file offset (set by calculate_offsets_split) */
+			di->size = htole64(e->st.st_size);
+			di->data_offset = htole64(e->data_offset);
+			/* No file data written to base image */
+		} else if (S_ISLNK(e->st.st_mode)) {
+			char fullpath[PATH_MAX * 2];
+			ssize_t n;
+
+			di->size = htole64(e->st.st_size);
+			di->data_offset = htole64(e->data_offset);
+
+			snprintf(fullpath, sizeof(fullpath), "%s/%s", src_dir, e->path);
+			n = readlink(fullpath, mem + e->data_offset, e->st.st_size);
+			if (n < 0)
+				perror(fullpath);
+			else
+				((char *)(mem + e->data_offset))[n] = '\0';
+		} else if (S_ISDIR(e->st.st_mode)) {
+			struct daxfs_dirent *dirents;
+			uint32_t dirent_idx = 0;
+
+			di->size = htole64((uint64_t)e->child_count * DAXFS_DIRENT_SIZE);
+			di->data_offset = htole64(e->data_offset);
+
+			if (e->child_count > 0) {
+				dirents = mem + e->data_offset;
+				for (child = files_head; child; child = child->next) {
+					if (child->parent_ino == e->ino) {
+						struct daxfs_dirent *de = &dirents[dirent_idx++];
+						size_t name_len = strlen(child->name);
+
+						de->ino = htole32(child->ino);
+						de->mode = htole32(child->st.st_mode);
+						de->name_len = htole16(name_len);
+						memcpy(de->name, child->name, name_len);
+					}
+				}
+			}
+		}
+	}
+
+	base_super->total_size = htole64(mem_size);
+	return 0;
+}
+
+/*
+ * Write regular file data to the backing file.
+ */
+static int write_backing_file(const char *backing_path, const char *src_dir)
+{
+	struct file_entry *e;
+	int fd;
+	void *mem;
+
+	if (backing_file_size == 0) {
+		printf("No regular file data to write to backing file\n");
+		return 0;
+	}
+
+	fd = open(backing_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		perror(backing_path);
+		return -1;
+	}
+
+	if (ftruncate(fd, backing_file_size) < 0) {
+		perror("ftruncate backing file");
+		close(fd);
+		return -1;
+	}
+
+	mem = mmap(NULL, backing_file_size, PROT_READ | PROT_WRITE,
+		   MAP_SHARED, fd, 0);
+	close(fd);
+
+	if (mem == MAP_FAILED) {
+		perror("mmap backing file");
+		return -1;
+	}
+
+	memset(mem, 0, backing_file_size);
+
+	for (e = files_head; e; e = e->next) {
+		if (S_ISREG(e->st.st_mode) && !e->is_hardlink && e->st.st_size > 0) {
+			char fullpath[PATH_MAX * 2];
+			int src_fd;
+			ssize_t n;
+
+			snprintf(fullpath, sizeof(fullpath), "%s/%s", src_dir, e->path);
+			src_fd = open(fullpath, O_RDONLY);
+			if (src_fd < 0) {
+				perror(fullpath);
+				continue;
+			}
+			n = read(src_fd, (char *)mem + e->data_offset, e->st.st_size);
+			if (n < 0)
+				perror(fullpath);
+			close(src_fd);
+		}
+	}
+
+	munmap(mem, backing_file_size);
+	return 0;
+}
+
+/*
+ * Write pcache region and pre-warm from backing file data.
+ *
+ * @pcache_mem: pointer to start of pcache region in DAX
+ * @slot_count: number of cache slots (power of 2)
+ * @backing_path: path to backing file (for pre-warming)
+ */
+static int write_pcache_region(void *pcache_mem, uint32_t slot_count,
+			       const char *backing_path)
+{
+	struct daxfs_pcache_header *hdr = pcache_mem;
+	uint64_t meta_size = ALIGN((uint64_t)slot_count * sizeof(struct daxfs_pcache_slot),
+				   DAXFS_BLOCK_SIZE);
+	uint64_t slot_meta_offset = DAXFS_BLOCK_SIZE;
+	uint64_t slot_data_offset = DAXFS_BLOCK_SIZE + meta_size;
+	struct daxfs_pcache_slot *slots = pcache_mem + slot_meta_offset;
+	void *data_area = pcache_mem + slot_data_offset;
+	uint32_t hash_mask = slot_count - 1;
+	uint32_t pre_warmed = 0;
+
+	/* Write header */
+	memset(hdr, 0, DAXFS_BLOCK_SIZE);
+	hdr->magic = htole32(DAXFS_PCACHE_MAGIC);
+	hdr->version = htole32(DAXFS_PCACHE_VERSION);
+	hdr->slot_count = htole32(slot_count);
+	hdr->hash_shift = htole32(calc_ilog2(slot_count));
+	hdr->slot_meta_offset = htole64(slot_meta_offset);
+	hdr->slot_data_offset = htole64(slot_data_offset);
+	hdr->evict_hand = htole32(0);
+	hdr->pending_count = htole32(0);
+
+	/* Zero slot metadata */
+	memset(slots, 0, (uint64_t)slot_count * sizeof(struct daxfs_pcache_slot));
+
+	/* Pre-warm: read backing file data into cache slots */
+	if (backing_path && backing_file_size > 0) {
+		int backing_fd;
+		void *backing_mem;
+		uint64_t offset;
+
+		backing_fd = open(backing_path, O_RDONLY);
+		if (backing_fd < 0) {
+			perror("open backing file for pre-warm");
+			return 0;  /* Non-fatal: cache just won't be pre-warmed */
+		}
+
+		backing_mem = mmap(NULL, backing_file_size, PROT_READ,
+				   MAP_SHARED, backing_fd, 0);
+		close(backing_fd);
+
+		if (backing_mem == MAP_FAILED) {
+			perror("mmap backing file for pre-warm");
+			return 0;
+		}
+
+		for (offset = 0; offset < backing_file_size; offset += DAXFS_BLOCK_SIZE) {
+			uint32_t page_index = offset / DAXFS_BLOCK_SIZE;
+			uint32_t slot_idx = page_index & hash_mask;
+			uint64_t tag = page_index;
+			struct daxfs_pcache_slot *slot = &slots[slot_idx];
+
+			/* Only fill empty slots (first page wins for conflicts) */
+			if (slot->state_tag != 0)
+				continue;
+
+			/* Copy page data */
+			{
+				size_t copy_size = DAXFS_BLOCK_SIZE;
+
+				if (offset + copy_size > backing_file_size)
+					copy_size = backing_file_size - offset;
+				memcpy((char *)data_area + (uint64_t)slot_idx * DAXFS_BLOCK_SIZE,
+				       (char *)backing_mem + offset, copy_size);
+				if (copy_size < DAXFS_BLOCK_SIZE)
+					memset((char *)data_area + (uint64_t)slot_idx * DAXFS_BLOCK_SIZE + copy_size,
+					       0, DAXFS_BLOCK_SIZE - copy_size);
+			}
+
+			/* Mark slot as VALID with correct tag */
+			slot->state_tag = htole64(PCACHE_MAKE(PCACHE_STATE_VALID, tag));
+			slot->ref_bit = htole32(1);
+			pre_warmed++;
+		}
+
+		munmap(backing_mem, backing_file_size);
+		printf("Pre-warmed %u of %u cache slots (%.1f%%)\n",
+		       pre_warmed, slot_count,
+		       slot_count ? (double)pre_warmed / slot_count * 100 : 0);
+	}
+
+	return 0;
+}
+
+/*
+ * Write split-mode daxfs image to DAX memory.
+ * Layout: [Superblock] [Branch Table] [Base Image (meta only)] [PCache] [Delta]
+ */
+static int write_split_image(void *mem, size_t mem_size, const char *src_dir,
+			     size_t base_size, uint32_t pcache_slots,
+			     size_t delta_size, const char *backing_path)
+{
+	struct daxfs_super *super = mem;
+	uint64_t branch_table_offset = DAXFS_BLOCK_SIZE;
+	uint64_t base_offset = ALIGN(branch_table_offset + DAXFS_BRANCH_TABLE_SIZE,
+				     DAXFS_BLOCK_SIZE);
+	uint64_t pcache_offset = ALIGN(base_offset + base_size, DAXFS_BLOCK_SIZE);
+	size_t pcache_region_size = calculate_pcache_region_size(pcache_slots);
+	uint64_t delta_region_offset = ALIGN(pcache_offset + pcache_region_size,
+					     DAXFS_BLOCK_SIZE);
+
+	if (delta_region_offset + delta_size > mem_size) {
+		fprintf(stderr, "Error: split image too large for allocated space "
+			"(%llu > %zu)\n",
+			(unsigned long long)(delta_region_offset + delta_size),
+			mem_size);
+		return -1;
+	}
+
+	memset(mem, 0, mem_size);
+
+	/* Write superblock */
+	super->magic = htole32(DAXFS_SUPER_MAGIC);
+	super->version = htole32(DAXFS_VERSION);
+	super->flags = htole32(0);
+	super->block_size = htole32(DAXFS_BLOCK_SIZE);
+	super->total_size = htole64(delta_region_offset + delta_size);
+
+	super->base_offset = htole64(base_offset);
+	super->base_size = htole64(base_size);
+
+	super->branch_table_offset = htole64(branch_table_offset);
+	super->branch_table_entries = htole32(DAXFS_MAX_BRANCHES);
+	super->active_branches = htole32(0);
+	super->next_branch_id = htole64(1);
+	super->next_inode_id = htole64(file_count + 1);
+
+	super->delta_region_offset = htole64(delta_region_offset);
+	super->delta_region_size = htole64(delta_size);
+	super->delta_alloc_offset = htole64(delta_region_offset);
+
+	/* Page cache fields */
+	super->pcache_offset = htole64(pcache_offset);
+	super->pcache_size = htole64(pcache_region_size);
+	super->pcache_slot_count = htole32(pcache_slots);
+	super->pcache_hash_shift = htole32(calc_ilog2(pcache_slots));
+
+	/* Write base image (metadata only) */
+	write_base_image_split(mem + base_offset, base_size, src_dir);
+
+	/* Write pcache region with pre-warming */
+	write_pcache_region(mem + pcache_offset, pcache_slots, backing_path);
+
+	printf("Image layout (split mode with pcache):\n");
+	printf("  Superblock:    0x%x - 0x%x\n", 0, DAXFS_BLOCK_SIZE);
+	printf("  Branch table:  0x%lx - 0x%lx (%u entries)\n",
+	       (unsigned long)branch_table_offset,
+	       (unsigned long)(branch_table_offset + DAXFS_BRANCH_TABLE_SIZE),
+	       DAXFS_MAX_BRANCHES);
+	printf("  Base image:    0x%lx - 0x%lx (%zu bytes, metadata only)\n",
+	       (unsigned long)base_offset,
+	       (unsigned long)(base_offset + base_size),
+	       base_size);
+	printf("  Page cache:    0x%lx - 0x%lx (%zu bytes, %u slots)\n",
+	       (unsigned long)pcache_offset,
+	       (unsigned long)(pcache_offset + pcache_region_size),
+	       pcache_region_size, pcache_slots);
+	printf("  Delta region:  0x%lx - 0x%lx (%zu bytes)\n",
+	       (unsigned long)delta_region_offset,
+	       (unsigned long)(delta_region_offset + delta_size),
+	       delta_size);
+	printf("  Backing file:  %s (%llu bytes)\n",
+	       backing_path, (unsigned long long)backing_file_size);
+
+	return 0;
+}
+
+static size_t calculate_split_dax_size(size_t base_size, uint32_t pcache_slots,
+				       size_t delta_size)
+{
+	uint64_t branch_table_offset = DAXFS_BLOCK_SIZE;
+	uint64_t base_offset = ALIGN(branch_table_offset + DAXFS_BRANCH_TABLE_SIZE,
+				     DAXFS_BLOCK_SIZE);
+	uint64_t pcache_offset = ALIGN(base_offset + base_size, DAXFS_BLOCK_SIZE);
+	size_t pcache_region_size = calculate_pcache_region_size(pcache_slots);
+	uint64_t delta_region_offset = ALIGN(pcache_offset + pcache_region_size,
+					     DAXFS_BLOCK_SIZE);
+
+	return delta_region_offset + delta_size;
+}
+
 /* New mount API constants (may not be in older headers) */
+#ifndef FSCONFIG_SET_STRING
+#define FSCONFIG_SET_STRING	1
+#endif
 #ifndef FSCONFIG_SET_FD
 #define FSCONFIG_SET_FD		5
 #endif
@@ -480,7 +915,8 @@ static inline int sys_move_mount(int from_dfd, const char *from_path,
  * Mount a daxfs filesystem backed by a dma-buf fd using the new mount API.
  */
 static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint,
-			      bool branching, bool validate)
+			      bool branching, bool validate,
+			      const char *backing_path)
 {
 	int fs_fd, mnt_fd;
 
@@ -497,6 +933,15 @@ static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint,
 	}
 
 	/* Main branch is always read-only; create child branches to write */
+
+	if (backing_path) {
+		if (sys_fsconfig(fs_fd, FSCONFIG_SET_STRING, "backing",
+				 backing_path, 0) < 0) {
+			perror("fsconfig(FSCONFIG_SET_STRING, backing)");
+			close(fs_fd);
+			return -1;
+		}
+	}
 
 	if (validate) {
 		if (sys_fsconfig(fs_fd, FSCONFIG_SET_FLAG, "validate", NULL, 0) < 0) {
@@ -676,13 +1121,17 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  -b, --branching        Enable branching support (adds branch table and delta region)\n");
 	fprintf(stderr, "  -V, --validate         Validate image on mount\n");
 	fprintf(stderr, "  -D, --delta SIZE       Delta region size (default: 64M, only with -b)\n");
+	fprintf(stderr, "  -C, --pcache-slots N   Page cache slot count (default: auto, power of 2)\n");
 	fprintf(stderr, "  -h, --help             Show this help\n");
 	fprintf(stderr, "\nBy default, creates a static read-only image without branching support.\n");
 	fprintf(stderr, "Use -b to enable branching (adds branch table and delta region).\n");
+	fprintf(stderr, "\nSplit mode: when both -H/-p AND -o are given with -b, metadata+cache go to DAX\n");
+	fprintf(stderr, "and file data goes to the backing file (-o). This enables shared page caching.\n");
 	fprintf(stderr, "\nExamples:\n");
 	fprintf(stderr, "  %s -d /path/to/rootfs -o image.daxfs\n", prog);
 	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/system -m /mnt\n", prog);
 	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/system -m /mnt -b -D 64M\n", prog);
+	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/mk -m /mnt -o /data/rootfs.img -b\n", prog);
 	fprintf(stderr, "  %s -d /path/to/rootfs -p 0x100000000\n", prog);
 }
 
@@ -698,6 +1147,7 @@ int main(int argc, char *argv[])
 		{"delta", required_argument, 0, 'D'},
 		{"branching", no_argument, 0, 'b'},
 		{"validate", no_argument, 0, 'V'},
+		{"pcache-slots", required_argument, 0, 'C'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
@@ -717,8 +1167,10 @@ int main(int argc, char *argv[])
 	size_t delta_size = DAXFS_DEFAULT_DELTA_SIZE;
 	bool branching = false;
 	bool validate = false;
+	bool split_mode = false;
+	uint32_t pcache_slots = 0;  /* 0 = auto-calculate */
 
-	while ((opt = getopt_long(argc, argv, "d:o:H:m:p:s:D:bVh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:H:m:p:s:D:C:bVh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			src_dir = optarg;
@@ -755,6 +1207,9 @@ int main(int argc, char *argv[])
 		case 'V':
 			validate = true;
 			break;
+		case 'C':
+			pcache_slots = strtoul(optarg, NULL, 0);
+			break;
 		case 'h':
 		default:
 			print_usage(argv[0]);
@@ -781,6 +1236,10 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	/* Detect split mode: DAX target + output file + branching */
+	if ((heap_path || phys_addr) && output_file && branching)
+		split_mode = true;
+
 	printf("Scanning %s...\n", src_dir);
 	if (scan_directory(src_dir) < 0)
 		return 1;
@@ -788,23 +1247,59 @@ int main(int argc, char *argv[])
 	printf("Found %u files\n", file_count);
 
 	build_tree();
-	calculate_offsets();
 
-	base_size = calculate_base_size();
-	if (branching)
-		total_size = calculate_total_size(base_size, delta_size);
-	else
-		total_size = calculate_static_size(base_size);
+	if (split_mode) {
+		calculate_offsets_split();
+		base_size = calculate_base_size_split();
 
-	printf("Base image size: %zu bytes (%.2f MB)\n", base_size,
-	       (double)base_size / (1024 * 1024));
-	if (branching) {
+		/* Auto-calculate pcache slots if not specified */
+		if (pcache_slots == 0) {
+			uint32_t backing_pages = (backing_file_size + DAXFS_BLOCK_SIZE - 1) /
+						 DAXFS_BLOCK_SIZE;
+			pcache_slots = backing_pages > 0 ? prev_power_of_2(backing_pages) : 16;
+			if (pcache_slots < 16)
+				pcache_slots = 16;
+		}
+
+		/* Validate pcache_slots is power of 2 */
+		if (pcache_slots & (pcache_slots - 1)) {
+			fprintf(stderr, "Error: --pcache-slots must be a power of 2\n");
+			return 1;
+		}
+
+		total_size = calculate_split_dax_size(base_size, pcache_slots, delta_size);
+
+		printf("Split mode: metadata+cache → DAX, file data → %s\n", output_file);
+		printf("Base image size: %zu bytes (%.2f MB, metadata only)\n", base_size,
+		       (double)base_size / (1024 * 1024));
+		printf("Backing file size: %llu bytes (%.2f MB)\n",
+		       (unsigned long long)backing_file_size,
+		       (double)backing_file_size / (1024 * 1024));
+		printf("Page cache: %u slots (%zu bytes)\n",
+		       pcache_slots, calculate_pcache_region_size(pcache_slots));
 		printf("Delta region size: %zu bytes (%.2f MB)\n", delta_size,
 		       (double)delta_size / (1024 * 1024));
+		printf("Total DAX size: %zu bytes (%.2f MB)\n", total_size,
+		       (double)total_size / (1024 * 1024));
+	} else {
+		calculate_offsets();
+		base_size = calculate_base_size();
+
+		if (branching)
+			total_size = calculate_total_size(base_size, delta_size);
+		else
+			total_size = calculate_static_size(base_size);
+
+		printf("Base image size: %zu bytes (%.2f MB)\n", base_size,
+		       (double)base_size / (1024 * 1024));
+		if (branching) {
+			printf("Delta region size: %zu bytes (%.2f MB)\n", delta_size,
+			       (double)delta_size / (1024 * 1024));
+		}
+		printf("Total image size: %zu bytes (%.2f MB)\n", total_size,
+		       (double)total_size / (1024 * 1024));
+		printf("Mode: %s\n", branching ? "branching" : "static (read-only)");
 	}
-	printf("Total image size: %zu bytes (%.2f MB)\n", total_size,
-	       (double)total_size / (1024 * 1024));
-	printf("Mode: %s\n", branching ? "branching" : "static (read-only)");
 
 	/* Use calculated size if -s not specified, otherwise validate */
 	if (!max_size) {
@@ -850,7 +1345,24 @@ int main(int argc, char *argv[])
 		}
 
 		printf("Writing daxfs image...\n");
-		if (branching) {
+		if (split_mode) {
+			/* Write backing file first */
+			printf("Writing backing file to %s...\n", output_file);
+			if (write_backing_file(output_file, src_dir) < 0) {
+				munmap(mem, max_size);
+				close(dmabuf_fd);
+				return 1;
+			}
+
+			/* Write split DAX image with pcache */
+			if (write_split_image(mem, max_size, src_dir, base_size,
+					      pcache_slots, delta_size,
+					      output_file) < 0) {
+				munmap(mem, max_size);
+				close(dmabuf_fd);
+				return 1;
+			}
+		} else if (branching) {
 			if (write_image(mem, max_size, src_dir, base_size, delta_size) < 0) {
 				munmap(mem, max_size);
 				close(dmabuf_fd);
@@ -867,10 +1379,12 @@ int main(int argc, char *argv[])
 		munmap(mem, max_size);
 
 		/* Mount using the dma-buf fd via the new mount API */
-		printf("Mounting on %s (%s%s)...\n", mountpoint,
+		printf("Mounting on %s (%s%s%s)...\n", mountpoint,
 		       branching ? "branching" : "read-only",
-		       validate ? ", validating" : "");
-		if (mount_daxfs_dmabuf(dmabuf_fd, mountpoint, branching, validate) < 0) {
+		       validate ? ", validating" : "",
+		       split_mode ? ", backing-store" : "");
+		if (mount_daxfs_dmabuf(dmabuf_fd, mountpoint, branching, validate,
+				       split_mode ? output_file : NULL) < 0) {
 			close(dmabuf_fd);
 			return 1;
 		}
@@ -897,7 +1411,20 @@ int main(int argc, char *argv[])
 		}
 
 		printf("Writing to physical address 0x%llx...\n", phys_addr);
-		if (branching) {
+		if (split_mode) {
+			printf("Writing backing file to %s...\n", output_file);
+			if (write_backing_file(output_file, src_dir) < 0) {
+				munmap(mem, max_size);
+				return 1;
+			}
+
+			if (write_split_image(mem, max_size, src_dir, base_size,
+					      pcache_slots, delta_size,
+					      output_file) < 0) {
+				munmap(mem, max_size);
+				return 1;
+			}
+		} else if (branching) {
 			if (write_image(mem, max_size, src_dir, base_size, delta_size) < 0) {
 				munmap(mem, max_size);
 				return 1;

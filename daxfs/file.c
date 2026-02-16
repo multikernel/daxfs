@@ -622,6 +622,28 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 		}
 	}
 
+	/*
+	 * Cache slot data can be evicted/reused at any time, so never
+	 * use PFN mapping for pcache data. Fall back to anonymous page.
+	 */
+	if (data && daxfs_is_pcache_data(info, data)) {
+		struct page *page;
+		void *dst;
+
+		page = alloc_page(GFP_HIGHUSER_MOVABLE);
+		if (!page)
+			return VM_FAULT_OOM;
+
+		dst = kmap_local_page(page);
+		daxfs_copy_page(dst, data, len);
+		kunmap_local(dst);
+
+		__SetPageUptodate(page);
+		lock_page(page);
+		vmf->page = page;
+		return VM_FAULT_LOCKED;
+	}
+
 	pfn = daxfs_data_to_pfn(info, data);
 	if (!pfn)
 		return VM_FAULT_SIGBUS;
@@ -828,6 +850,21 @@ static void *daxfs_base_file_data(struct daxfs_info *info, u64 ino,
 	if (out_len)
 		*out_len = len;
 
+	/* External data mode: regular file data via pcache */
+	if (info->pcache && S_ISREG(le32_to_cpu(raw->mode))) {
+		u64 page_start = (data_offset + pos) & ~(u64)(PAGE_SIZE - 1);
+		void *page;
+		u32 intra;
+
+		page = daxfs_pcache_get_page(info, page_start);
+		if (IS_ERR(page))
+			return NULL;
+		intra = (data_offset + pos) & (PAGE_SIZE - 1);
+		if (out_len)
+			*out_len = min(len, (size_t)(PAGE_SIZE - intra));
+		return page + intra;
+	}
+
 	return daxfs_mem_ptr(info,
 			     le64_to_cpu(info->super->base_offset) +
 			     data_offset + pos);
@@ -878,8 +915,10 @@ static vm_fault_t daxfs_dax_fault_ro(struct vm_fault *vmf)
 	/*
 	 * MAP_SHARED with page-aligned data: use direct PFN mapping.
 	 * This gives true DAX benefits - no page cache, no copy.
+	 * Never use PFN mapping for pcache data (can be evicted).
 	 */
-	if (is_shared && data && IS_ALIGNED((unsigned long)data, PAGE_SIZE)) {
+	if (is_shared && data && IS_ALIGNED((unsigned long)data, PAGE_SIZE) &&
+	    !daxfs_is_pcache_data(info, data)) {
 		pfn = daxfs_data_to_pfn(info, data);
 		if (pfn)
 			return vmf_insert_pfn_prot(vma, vmf->address, pfn,

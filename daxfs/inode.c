@@ -77,21 +77,23 @@ struct inode *daxfs_iget(struct super_block *sb, u64 ino)
 
 	di = DAXFS_I(inode);
 
-	/* First check delta logs */
+	/* Base image pointer — always set when inode exists there */
+	if (info->base_inodes && ino <= info->base_inode_count) {
+		di->raw = &info->base_inodes[ino - 1];
+		di->data_offset = le64_to_cpu(di->raw->data_offset);
+	}
+
+	/* Delta metadata overrides */
 	ret = daxfs_resolve_inode(sb, ino, &mode, &size, &uid, &gid, &deleted);
 	if (ret == 0 && !deleted) {
-		/* Found in delta or base */
 		di->from_delta = true;
 		di->delta_size = size;
-	} else if (info->base_inodes && ino <= info->base_inode_count) {
-		/* Fall back to base image */
-		struct daxfs_base_inode *raw = &info->base_inodes[ino - 1];
-		di->raw = raw;
-		di->data_offset = le64_to_cpu(raw->data_offset);
-		mode = le32_to_cpu(raw->mode);
-		size = le64_to_cpu(raw->size);
-		uid = le32_to_cpu(raw->uid);
-		gid = le32_to_cpu(raw->gid);
+	} else if (di->raw) {
+		/* Pure base image inode */
+		mode = le32_to_cpu(di->raw->mode);
+		size = le64_to_cpu(di->raw->size);
+		uid = le32_to_cpu(di->raw->uid);
+		gid = le32_to_cpu(di->raw->gid);
 		di->from_delta = false;
 	} else {
 		/* Not found */
@@ -157,7 +159,7 @@ struct inode *daxfs_iget(struct super_block *sb, u64 ino)
 		case S_IFLNK:
 			inode->i_op = &simple_symlink_inode_operations;
 			if (di->from_delta) {
-				/* Symlink created in delta - get target from index */
+				/* Try delta first (symlink created in branch) */
 				struct daxfs_branch_ctx *b;
 				for (b = info->current_branch; b; b = b->parent) {
 					char *target = daxfs_delta_get_symlink(b, ino);
@@ -166,8 +168,9 @@ struct inode *daxfs_iget(struct super_block *sb, u64 ino)
 						break;
 					}
 				}
-			} else if (di->raw) {
-				/* Symlink from base image */
+			}
+			if (!inode->i_link && di->raw) {
+				/* Fall back to base image symlink target */
 				u64 symlink_offset = le64_to_cpu(info->super->base_offset) +
 						     di->data_offset;
 				inode->i_link = daxfs_mem_ptr(info, symlink_offset);

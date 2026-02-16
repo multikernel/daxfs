@@ -353,6 +353,8 @@ int daxfs_validate_super(struct daxfs_info *info)
 				sizeof(struct daxfs_branch);
 	u64 delta_offset = le64_to_cpu(info->super->delta_region_offset);
 	u64 delta_size = le64_to_cpu(info->super->delta_region_size);
+	u64 pcache_offset = le64_to_cpu(info->super->pcache_offset);
+	u64 pcache_size = le64_to_cpu(info->super->pcache_size);
 	u64 super_size = sizeof(struct daxfs_super);
 
 	/* Validate base image region bounds */
@@ -379,6 +381,37 @@ int daxfs_validate_super(struct daxfs_info *info)
 		}
 	}
 
+	/* Validate page cache region bounds */
+	if (pcache_offset != 0) {
+		u32 slot_count = le32_to_cpu(info->super->pcache_slot_count);
+
+		if (!daxfs_valid_offset(info, pcache_offset, pcache_size)) {
+			pr_err("daxfs: pcache region exceeds image bounds\n");
+			return -EINVAL;
+		}
+
+		/* Slot count must be a power of 2 */
+		if (slot_count == 0 || (slot_count & (slot_count - 1)) != 0) {
+			pr_err("daxfs: pcache slot_count %u not power of 2\n",
+			       slot_count);
+			return -EINVAL;
+		}
+
+		/* Validate pcache_size is large enough for header + slots + data */
+		{
+			u64 meta_size = ALIGN((u64)slot_count * sizeof(struct daxfs_pcache_slot),
+					      DAXFS_BLOCK_SIZE);
+			u64 data_size = (u64)slot_count * DAXFS_BLOCK_SIZE;
+			u64 min_size = DAXFS_BLOCK_SIZE + meta_size + data_size;
+
+			if (pcache_size < min_size) {
+				pr_err("daxfs: pcache region too small (%llu < %llu)\n",
+				       pcache_size, min_size);
+				return -EINVAL;
+			}
+		}
+	}
+
 	/*
 	 * Validate regions don't overlap with each other or the superblock.
 	 * Superblock is at offset 0.
@@ -401,6 +434,12 @@ int daxfs_validate_super(struct daxfs_info *info)
 		return -EINVAL;
 	}
 
+	if (pcache_size > 0 && regions_overlap(0, super_size,
+					       pcache_offset, pcache_size)) {
+		pr_err("daxfs: pcache region overlaps superblock\n");
+		return -EINVAL;
+	}
+
 	if (base_size > 0 && branch_table_size > 0 &&
 	    regions_overlap(base_offset, base_size,
 			    branch_table_offset, branch_table_size)) {
@@ -414,10 +453,31 @@ int daxfs_validate_super(struct daxfs_info *info)
 		return -EINVAL;
 	}
 
+	if (base_size > 0 && pcache_size > 0 &&
+	    regions_overlap(base_offset, base_size,
+			    pcache_offset, pcache_size)) {
+		pr_err("daxfs: base image overlaps pcache region\n");
+		return -EINVAL;
+	}
+
 	if (branch_table_size > 0 && delta_size > 0 &&
 	    regions_overlap(branch_table_offset, branch_table_size,
 			    delta_offset, delta_size)) {
 		pr_err("daxfs: branch table overlaps delta region\n");
+		return -EINVAL;
+	}
+
+	if (branch_table_size > 0 && pcache_size > 0 &&
+	    regions_overlap(branch_table_offset, branch_table_size,
+			    pcache_offset, pcache_size)) {
+		pr_err("daxfs: branch table overlaps pcache region\n");
+		return -EINVAL;
+	}
+
+	if (delta_size > 0 && pcache_size > 0 &&
+	    regions_overlap(delta_offset, delta_size,
+			    pcache_offset, pcache_size)) {
+		pr_err("daxfs: delta region overlaps pcache region\n");
 		return -EINVAL;
 	}
 

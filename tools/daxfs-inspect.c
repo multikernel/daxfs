@@ -467,6 +467,65 @@ static int cmd_status(void)
 	printf("\nInodes:\n");
 	printf("  Next inode ID:   %lu\n", next_inode);
 
+	/* Page cache (backing store mode) */
+	uint64_t pcache_offset = le64_to_cpu(super->pcache_offset);
+	if (pcache_offset) {
+		uint64_t pcache_size = le64_to_cpu(super->pcache_size);
+		uint32_t pcache_slots = le32_to_cpu(super->pcache_slot_count);
+
+		printf("\nPage cache:\n");
+		printf("  Offset:          0x%lx\n", pcache_offset);
+		printf("  Size:            %lu bytes (%.2f MB)\n",
+		       pcache_size, (double)pcache_size / (1024 * 1024));
+		printf("  Slots:           %u\n", pcache_slots);
+		printf("  Hash shift:      %u\n",
+		       le32_to_cpu(super->pcache_hash_shift));
+
+		/* Read on-DAX pcache header for live stats */
+		if (pcache_offset + sizeof(struct daxfs_pcache_header) <= mem_size) {
+			struct daxfs_pcache_header *phdr = mem + pcache_offset;
+
+			if (le32_to_cpu(phdr->magic) == DAXFS_PCACHE_MAGIC) {
+				uint32_t pending = le32_to_cpu(phdr->pending_count);
+				uint32_t hdr_slots = le32_to_cpu(phdr->slot_count);
+				uint64_t meta_off = le64_to_cpu(phdr->slot_meta_offset);
+
+				printf("  Pending:         %u\n", pending);
+
+				/* Scan slot metadata for utilization */
+				void *slot_base = mem + pcache_offset + meta_off;
+				if (pcache_offset + meta_off +
+				    (uint64_t)hdr_slots * sizeof(struct daxfs_pcache_slot) <= mem_size) {
+					uint32_t free_count = 0, valid_count = 0, pending_count = 0;
+
+					for (uint32_t i = 0; i < hdr_slots; i++) {
+						struct daxfs_pcache_slot *s = slot_base +
+							i * sizeof(struct daxfs_pcache_slot);
+						uint64_t st = le64_to_cpu(s->state_tag);
+
+						switch (PCACHE_STATE(st)) {
+						case PCACHE_STATE_FREE:
+							free_count++;
+							break;
+						case PCACHE_STATE_PENDING:
+							pending_count++;
+							break;
+						case PCACHE_STATE_VALID:
+							valid_count++;
+							break;
+						}
+					}
+
+					printf("  Slot states:     %u valid, %u free, %u pending\n",
+					       valid_count, free_count, pending_count);
+					if (hdr_slots > 0)
+						printf("  Occupancy:       %.1f%%\n",
+						       (double)valid_count * 100 / hdr_slots);
+				}
+			}
+		}
+	}
+
 	return 0;
 }
 
