@@ -9,7 +9,12 @@
 #include <linux/version.h>
 #include <linux/types.h>
 #include <linux/dma-buf.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
 #include <linux/iosys-map.h>
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+#include <linux/dma-buf-map.h>
+#define iosys_map dma_buf_map
+#endif
 #include <linux/rbtree.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
