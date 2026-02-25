@@ -58,7 +58,7 @@ make              # build kernel module + tools
 make clean
 ```
 
-Requires `CONFIG_FS_DAX` enabled in the target kernel.
+Requires Linux 5.11+ and `CONFIG_FS_DAX` enabled in the target kernel.
 
 ## Usage
 
