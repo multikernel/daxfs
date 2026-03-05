@@ -6,15 +6,9 @@
  * memory is physically shared across kernel instances, the cache is
  * automatically visible to all kernels with no coherency protocol.
  *
- * Direct-mapped: each backing file page maps to exactly one cache slot
- * via hash(page_offset) & (slot_count - 1). 3-state machine with all
- * transitions via cmpxchg on DAX memory.
- *
- * Host kernel: has backing file access, fills cache misses inline or
- * via a background kthread that polls for PENDING slots.
- *
- * Spawn kernels: no backing file, mark slots PENDING and busy-poll
- * until the host fills them.
+ * Multi-file support: tags encode (ino << 20 | pgoff), so each cache
+ * slot is associated with a specific file and page offset. Multiple
+ * backing files can be registered, each associated with an inode number.
  *
  * Copyright (C) 2026 Multikernel Technologies, Inc. All rights reserved.
  */
@@ -25,16 +19,11 @@
 #include <linux/delay.h>
 #include "daxfs.h"
 
-static u32 pcache_hash(struct daxfs_pcache *pc, u64 backing_offset)
+static u32 pcache_hash(struct daxfs_pcache *pc, u64 tag)
 {
-	return (u32)((backing_offset >> PAGE_SHIFT) & pc->hash_mask);
+	return (u32)(tag & pc->hash_mask);
 }
 
-/*
- * Atomic cmpxchg on the state_tag field.
- * state_tag is __le64 on DAX memory; on little-endian x86-64 this is
- * the same layout as u64, so cmpxchg works directly.
- */
 static u64 slot_cmpxchg(struct daxfs_pcache_slot *slot, u64 old_val, u64 new_val)
 {
 	return cmpxchg((u64 *)&slot->state_tag, old_val, new_val);
@@ -69,25 +58,45 @@ static void pcache_dec_pending(struct daxfs_pcache_header *hdr)
 			 old_val, new_val) != old_val);
 }
 
-static int pcache_fill_slot(struct daxfs_pcache *pc, u32 slot_idx,
-			    u64 tag)
+/*
+ * Find a backing file for the given inode number.
+ */
+static struct file *pcache_find_backing(struct daxfs_pcache *pc, u64 ino)
 {
-	u64 backing_offset = tag << PAGE_SHIFT;
-	loff_t pos = backing_offset;
+	struct daxfs_pcache_backing *b;
+
+	list_for_each_entry(b, &pc->backing_files, list) {
+		if (b->ino == ino)
+			return b->file;
+	}
+	return NULL;
+}
+
+static int pcache_fill_slot(struct daxfs_pcache *pc, u32 slot_idx, u64 tag)
+{
+	u64 ino = PCACHE_TAG_INO(tag);
+	u64 pgoff = PCACHE_TAG_PGOFF(tag);
+	loff_t pos = (loff_t)pgoff << PAGE_SHIFT;
 	void *dst = pc->data + (u64)slot_idx * PAGE_SIZE;
+	struct file *backing;
 	ssize_t n;
 	u64 old_val, new_val;
 
-	n = kernel_read(pc->backing_file, dst, PAGE_SIZE, &pos);
+	backing = pcache_find_backing(pc, ino);
+	if (!backing) {
+		/* No backing file for this inode — skip */
+		return -ENOENT;
+	}
+
+	n = kernel_read(backing, dst, PAGE_SIZE, &pos);
 	if (n < 0) {
-		pr_err_ratelimited("daxfs: pcache read error at offset %llu: %zd\n",
-				   backing_offset, n);
+		pr_err_ratelimited("daxfs: pcache read error ino=%llu pgoff=%llu: %zd\n",
+				   ino, pgoff, n);
 		memset(dst, 0, PAGE_SIZE);
 	} else if (n < PAGE_SIZE) {
 		memset(dst + n, 0, PAGE_SIZE - n);
 	}
 
-	/* Memory barrier before making data visible */
 	smp_wmb();
 
 	/* Transition PENDING → VALID */
@@ -129,29 +138,28 @@ static inline void pcache_touch(struct daxfs_pcache_slot *slot)
 		WRITE_ONCE(slot->ref_bit, cpu_to_le32(1));
 }
 
-/* Slow path for cache miss/eviction/pending — never inlined. */
 static noinline void *pcache_slow_path(struct daxfs_pcache *pc,
 				       u32 slot_idx, u64 desired_tag,
 				       u64 val);
 
 /*
- * Core cache lookup.
+ * Core cache lookup — multi-file version.
  *
- * Hot path (cache hit) is: hash → load state_tag → compare → return.
- * One load from DAX, one compare, one conditional store (ref_bit, only
- * when transitioning from 0→1). smp_rmb() is a compiler barrier on x86.
+ * @info: filesystem info
+ * @ino: inode number of the file
+ * @pgoff: page offset within the file's backing data
  */
-void *daxfs_pcache_get_page(struct daxfs_info *info, u64 backing_page_offset)
+void *daxfs_pcache_get_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 {
 	struct daxfs_pcache *pc = info->pcache;
+	u64 desired_tag = PCACHE_TAG_MAKE(ino, pgoff);
 	u32 slot_idx;
-	u64 desired_tag, val;
+	u64 val;
 
 	if (unlikely(!pc))
 		return ERR_PTR(-ENOENT);
 
-	slot_idx = pcache_hash(pc, backing_page_offset);
-	desired_tag = backing_page_offset >> PAGE_SHIFT;
+	slot_idx = pcache_hash(pc, desired_tag);
 
 	val = slot_read(&pc->slots[slot_idx]);
 
@@ -178,7 +186,7 @@ retry:
 
 	switch (PCACHE_STATE(val)) {
 	case PCACHE_STATE_VALID:
-		/* Tag mismatch (hit case handled in fast path): evict */
+		/* Tag mismatch: evict */
 		new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
 		if (slot_cmpxchg(&pc->slots[slot_idx], val, new_val) != val) {
 			val = slot_read(&pc->slots[slot_idx]);
@@ -197,7 +205,7 @@ retry:
 
 		pcache_inc_pending(pc->header);
 
-		if (pc->backing_file) {
+		if (!list_empty(&pc->backing_files)) {
 			/* Host kernel: fill inline */
 			pcache_fill_slot(pc, slot_idx, desired_tag);
 			pcache_touch(&pc->slots[slot_idx]);
@@ -211,7 +219,6 @@ retry:
 		if (PCACHE_TAG(val) == desired_tag)
 			goto wait_valid;
 
-		/* PENDING with different tag: wait for state change */
 		goto wait_state_change;
 	}
 
@@ -219,7 +226,7 @@ retry:
 
 wait_valid:
 	{
-		int timeout_us = 10000;  /* 10ms */
+		int timeout_us = 10000;
 
 		while (timeout_us > 0) {
 			val = slot_read(&pc->slots[slot_idx]);
@@ -253,7 +260,6 @@ wait_state_change:
 			udelay(1);
 			timeout_us--;
 		}
-		/* Timeout: try to evict the stale PENDING slot */
 		new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
 		slot_cmpxchg(&pc->slots[slot_idx], orig_val, new_val);
 		val = slot_read(&pc->slots[slot_idx]);
@@ -261,10 +267,6 @@ wait_state_change:
 	}
 }
 
-/*
- * Check if a pointer falls within the pcache data region.
- * Used to prevent PFN mapping for cached data (must use anon pages).
- */
 bool daxfs_is_pcache_data(struct daxfs_info *info, void *ptr)
 {
 	struct daxfs_pcache *pc = info->pcache;
@@ -276,11 +278,173 @@ bool daxfs_is_pcache_data(struct daxfs_info *info, void *ptr)
 }
 
 /*
- * Initialize page cache from on-DAX header.
- *
- * @info: filesystem info (DAX memory already mapped)
- * @backing_path: path to backing file (NULL for spawn kernels)
+ * Add a backing file for a specific inode, sharing an already-open file.
  */
+static int pcache_add_backing_file(struct daxfs_pcache *pc, u64 ino,
+				   struct file *f)
+{
+	struct daxfs_pcache_backing *b;
+
+	b = kzalloc(sizeof(*b), GFP_KERNEL);
+	if (!b)
+		return -ENOMEM;
+
+	b->ino = ino;
+	b->file = get_file(f);
+	list_add(&b->list, &pc->backing_files);
+	return 0;
+}
+
+/*
+ * Recursively walk a directory in the base image and register export files.
+ */
+static int pcache_register_export_dir(struct daxfs_info *info,
+				      struct daxfs_pcache *pc,
+				      u32 dir_ino, const char *dir_path)
+{
+	struct daxfs_base_inode *dir_raw;
+	struct daxfs_dirent *dirents;
+	u64 base_offset = le64_to_cpu(info->super->base_offset);
+	u32 num_entries, i;
+
+	if (dir_ino < 1 || dir_ino > info->base_inode_count)
+		return 0;
+
+	dir_raw = &info->base_inodes[dir_ino - 1];
+	if (!S_ISDIR(le32_to_cpu(dir_raw->mode)))
+		return 0;
+
+	if (le64_to_cpu(dir_raw->size) == 0)
+		return 0;
+
+	num_entries = le64_to_cpu(dir_raw->size) / DAXFS_DIRENT_SIZE;
+	dirents = daxfs_mem_ptr(info,
+				base_offset + le64_to_cpu(dir_raw->data_offset));
+
+	for (i = 0; i < num_entries; i++) {
+		struct daxfs_dirent *de = &dirents[i];
+		u32 child_ino = le32_to_cpu(de->ino);
+		u16 name_len = le16_to_cpu(de->name_len);
+		u32 mode = le32_to_cpu(de->mode);
+		char *child_path;
+
+		child_path = kasprintf(GFP_KERNEL, "%s/%.*s",
+				       dir_path, name_len, de->name);
+		if (!child_path)
+			return -ENOMEM;
+
+		if (S_ISREG(mode)) {
+			struct file *f;
+
+			f = filp_open(child_path, O_RDONLY, 0);
+			if (IS_ERR(f)) {
+				pr_warn("daxfs: export: cannot open '%s': %ld\n",
+					child_path, PTR_ERR(f));
+				kfree(child_path);
+				continue;
+			}
+			pcache_add_backing_file(pc, child_ino, f);
+			fput(f);
+		} else if (S_ISDIR(mode)) {
+			int ret;
+
+			ret = pcache_register_export_dir(info, pc,
+							 child_ino, child_path);
+			if (ret) {
+				kfree(child_path);
+				return ret;
+			}
+		}
+		/* Symlinks: skip (data stored inline in base image) */
+
+		kfree(child_path);
+	}
+
+	return 0;
+}
+
+/*
+ * Initialize pcache for export mode: walk the base image tree and
+ * register each regular file from the export directory.
+ */
+int daxfs_pcache_init_export(struct daxfs_info *info, const char *export_path)
+{
+	struct daxfs_pcache *pc = info->pcache;
+	u32 root_ino = le32_to_cpu(info->super->root_inode);
+	int ret;
+
+	if (!pc)
+		return -EINVAL;
+
+	ret = pcache_register_export_dir(info, pc, root_ino, export_path);
+	if (ret)
+		return ret;
+
+	/* Start fill kthread (not started by daxfs_pcache_init with NULL) */
+	pc->fill_thread = kthread_run(daxfs_pcache_fill_thread, pc,
+				      "daxfs-pcache");
+	if (IS_ERR(pc->fill_thread)) {
+		int err = PTR_ERR(pc->fill_thread);
+
+		pr_err("daxfs: failed to start pcache fill thread: %d\n", err);
+		pc->fill_thread = NULL;
+		return err;
+	}
+
+	pr_info("daxfs: pcache initialized with %u slots, export=%s\n",
+		pc->slot_count, export_path);
+
+	return 0;
+}
+
+/*
+ * Add a backing file for a specific inode (opens the path).
+ */
+int daxfs_pcache_add_backing(struct daxfs_info *info, u64 ino,
+			     const char *path)
+{
+	struct daxfs_pcache *pc = info->pcache;
+	struct file *f;
+	int ret;
+
+	if (!pc)
+		return -EINVAL;
+
+	f = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(f)) {
+		pr_err("daxfs: failed to open backing file '%s': %ld\n",
+		       path, PTR_ERR(f));
+		return PTR_ERR(f);
+	}
+
+	ret = pcache_add_backing_file(pc, ino, f);
+	fput(f);
+	return ret;
+}
+
+/*
+ * Register all regular-file base inodes against a single backing file.
+ */
+static int pcache_register_base_inodes(struct daxfs_info *info, struct file *f)
+{
+	struct daxfs_pcache *pc = info->pcache;
+	u32 i, count = info->base_inode_count;
+	int ret;
+
+	for (i = 0; i < count; i++) {
+		struct daxfs_base_inode *raw = &info->base_inodes[i];
+		u32 mode = le32_to_cpu(raw->mode);
+
+		if (!S_ISREG(mode))
+			continue;
+
+		ret = pcache_add_backing_file(pc, i + 1, f);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 int daxfs_pcache_init(struct daxfs_info *info, const char *backing_path)
 {
 	struct daxfs_pcache *pc;
@@ -288,11 +452,13 @@ int daxfs_pcache_init(struct daxfs_info *info, const char *backing_path)
 	struct daxfs_pcache_header *hdr;
 
 	if (!pcache_offset)
-		return 0;  /* No page cache configured */
+		return 0;
 
 	pc = kzalloc(sizeof(*pc), GFP_KERNEL);
 	if (!pc)
 		return -ENOMEM;
+
+	INIT_LIST_HEAD(&pc->backing_files);
 
 	hdr = daxfs_mem_ptr(info, pcache_offset);
 	if (le32_to_cpu(hdr->magic) != DAXFS_PCACHE_MAGIC) {
@@ -303,26 +469,44 @@ int daxfs_pcache_init(struct daxfs_info *info, const char *backing_path)
 	}
 
 	pc->header = hdr;
-	pc->slot_count = le32_to_cpu(hdr->slot_count);
+	/* Read layout from main superblock */
+	pc->slot_count = le32_to_cpu(info->super->pcache_slot_count);
 	pc->hash_mask = pc->slot_count - 1;
 	pc->slots = daxfs_mem_ptr(info,
 		pcache_offset + le64_to_cpu(hdr->slot_meta_offset));
 	pc->data = daxfs_mem_ptr(info,
 		pcache_offset + le64_to_cpu(hdr->slot_data_offset));
 
+	info->pcache = pc;
+
+	/*
+	 * Split mode: register each regular-file base inode against
+	 * the single backing file so pcache_find_backing() can look
+	 * up the file by real inode number.
+	 */
 	if (backing_path) {
-		pc->backing_file = filp_open(backing_path, O_RDONLY, 0);
-		if (IS_ERR(pc->backing_file)) {
-			int err = PTR_ERR(pc->backing_file);
+		struct file *f;
+		int ret;
+
+		f = filp_open(backing_path, O_RDONLY, 0);
+		if (IS_ERR(f)) {
+			int err = PTR_ERR(f);
 
 			pr_err("daxfs: failed to open backing file '%s': %d\n",
 			       backing_path, err);
-			pc->backing_file = NULL;
+			info->pcache = NULL;
 			kfree(pc);
 			return err;
 		}
 
-		/* Start fill kthread for host kernel */
+		ret = pcache_register_base_inodes(info, f);
+		fput(f);
+		if (ret) {
+			daxfs_pcache_exit(info);
+			return ret;
+		}
+
+		/* Start fill kthread */
 		pc->fill_thread = kthread_run(daxfs_pcache_fill_thread, pc,
 					      "daxfs-pcache");
 		if (IS_ERR(pc->fill_thread)) {
@@ -331,9 +515,7 @@ int daxfs_pcache_init(struct daxfs_info *info, const char *backing_path)
 			pr_err("daxfs: failed to start pcache fill thread: %d\n",
 			       err);
 			pc->fill_thread = NULL;
-			filp_close(pc->backing_file, NULL);
-			pc->backing_file = NULL;
-			kfree(pc);
+			daxfs_pcache_exit(info);
 			return err;
 		}
 
@@ -344,16 +526,13 @@ int daxfs_pcache_init(struct daxfs_info *info, const char *backing_path)
 			pc->slot_count);
 	}
 
-	info->pcache = pc;
 	return 0;
 }
 
-/*
- * Tear down page cache.
- */
 void daxfs_pcache_exit(struct daxfs_info *info)
 {
 	struct daxfs_pcache *pc = info->pcache;
+	struct daxfs_pcache_backing *b, *tmp;
 
 	if (!pc)
 		return;
@@ -363,9 +542,11 @@ void daxfs_pcache_exit(struct daxfs_info *info)
 		pc->fill_thread = NULL;
 	}
 
-	if (pc->backing_file) {
-		filp_close(pc->backing_file, NULL);
-		pc->backing_file = NULL;
+	list_for_each_entry_safe(b, tmp, &pc->backing_files, list) {
+		if (b->file)
+			fput(b->file);
+		list_del(&b->list);
+		kfree(b);
 	}
 
 	info->pcache = NULL;

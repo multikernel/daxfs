@@ -4,14 +4,11 @@ CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra
 CFLAGS += -I../include
 
-TARGETS = mkdaxfs daxfs-branch daxfs-inspect
+TARGETS = mkdaxfs daxfs-inspect
 
 all: $(TARGETS)
 
 mkdaxfs: mkdaxfs.c
-	$(CC) $(CFLAGS) -o $@ $<
-
-daxfs-branch: daxfs-branch.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 daxfs-inspect: daxfs-inspect.c

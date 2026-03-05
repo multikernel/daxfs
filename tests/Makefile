@@ -13,11 +13,16 @@ test_mmap: test_mmap.c
 clean:
 	rm -f $(TESTS)
 
-# Run tests (requires DAXFS mounted at /mnt/daxfs or specify MOUNTPOINT)
+# Run mmap tests (requires DAXFS mounted at /mnt/daxfs or specify MOUNTPOINT)
 MOUNTPOINT ?= /mnt/daxfs
 
-test: $(TESTS)
-	@echo "Running tests on $(MOUNTPOINT)..."
+test-mmap: $(TESTS)
+	@echo "Running mmap tests on $(MOUNTPOINT)..."
 	@for t in $(TESTS); do ./$$t $(MOUNTPOINT) || exit 1; done
 
-.PHONY: all clean test
+# Run full test suite (requires root, DMA heap)
+test: $(TESTS)
+	@echo "Running overlay & pcache tests (requires root)..."
+	@sudo ./test_overlay.sh -v
+
+.PHONY: all clean test test-mmap
