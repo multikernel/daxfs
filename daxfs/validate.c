@@ -175,9 +175,32 @@ int daxfs_validate_super(struct daxfs_info *info)
 
 	/* Validate overlay region bounds */
 	if (overlay_offset != 0) {
+		u32 bucket_count = le32_to_cpu(info->super->overlay_bucket_count);
+
 		if (!daxfs_valid_offset(info, overlay_offset, overlay_size)) {
 			pr_err("daxfs: overlay region exceeds image bounds\n");
 			return -EINVAL;
+		}
+
+		if (bucket_count == 0 ||
+		    (bucket_count & (bucket_count - 1)) != 0) {
+			pr_err("daxfs: overlay bucket_count %u not power of 2\n",
+			       bucket_count);
+			return -EINVAL;
+		}
+
+		{
+			u64 bucket_array_size = ALIGN(
+				(u64)bucket_count *
+				sizeof(struct daxfs_overlay_bucket),
+				DAXFS_BLOCK_SIZE);
+			u64 min_size = DAXFS_BLOCK_SIZE + bucket_array_size;
+
+			if (overlay_size < min_size) {
+				pr_err("daxfs: overlay region too small (%llu < %llu)\n",
+				       overlay_size, min_size);
+				return -EINVAL;
+			}
 		}
 	}
 

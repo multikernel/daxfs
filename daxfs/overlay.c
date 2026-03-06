@@ -104,10 +104,15 @@ static void *overlay_lookup(struct daxfs_overlay *ovl, struct daxfs_info *info,
  * If old_value is non-NULL and the key already exists, the previous
  * pool offset is written there so the caller can recycle it.
  *
- * Returns 0 on success, -ENOSPC if table full.
+ * If replace is true and key exists, CAS-update the value field
+ * (atomically capturing old value). If replace is false and key
+ * exists, leave the value untouched and return -EEXIST.
+ *
+ * Returns 0 on success, -ENOSPC if table full, -EEXIST if key
+ * exists and replace is false.
  */
 static int overlay_insert(struct daxfs_overlay *ovl, u64 key, u64 pool_offset,
-			  u64 *old_value)
+			  u64 *old_value, bool replace)
 {
 	u32 idx = (u32)(key & ovl->bucket_mask);
 	u32 i;
@@ -137,12 +142,27 @@ static int overlay_insert(struct daxfs_overlay *ovl, u64 key, u64 pool_offset,
 		}
 
 		if (DAXFS_OVL_KEY(sk) == key) {
-			/* Key already exists — capture old value, update */
-			if (old_value) {
-				smp_rmb();
-				*old_value = le64_to_cpu(READ_ONCE(b->value));
+			u64 cur_val;
+
+			smp_rmb();
+			cur_val = le64_to_cpu(READ_ONCE(b->value));
+
+			if (!replace) {
+				if (old_value)
+					*old_value = cur_val;
+				return -EEXIST;
 			}
-			WRITE_ONCE(b->value, cpu_to_le64(pool_offset));
+
+			/* CAS-update value to avoid double-free races */
+			while (cmpxchg((u64 *)&b->value,
+				       cpu_to_le64(cur_val),
+				       cpu_to_le64(pool_offset)) !=
+			       cpu_to_le64(cur_val)) {
+				cur_val = le64_to_cpu(READ_ONCE(b->value));
+			}
+
+			if (old_value)
+				*old_value = cur_val;
 			smp_wmb();
 			return 0;
 		}
@@ -366,7 +386,7 @@ int daxfs_overlay_set_inode(struct daxfs_info *info, u64 ino,
 	*dst = *ie;
 	smp_wmb();
 
-	ret = overlay_insert(ovl, key, pool_off, &old_off);
+	ret = overlay_insert(ovl, key, pool_off, &old_off, true);
 	if (ret)
 		return ret;
 
@@ -390,6 +410,9 @@ void *daxfs_overlay_get_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 	if (!ovl)
 		return NULL;
 
+	if (pgoff > DAXFS_OVL_MAX_PGOFF)
+		return NULL;
+
 	key = DAXFS_OVL_KEY_DATA(ino, pgoff);
 	de = overlay_lookup(ovl, info, key);
 	if (!de)
@@ -405,13 +428,18 @@ void *daxfs_overlay_get_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 void *daxfs_overlay_alloc_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 {
 	struct daxfs_overlay *ovl = info->overlay;
-	u64 key = DAXFS_OVL_KEY_DATA(ino, pgoff);
-	u64 pool_off;
+	u64 key;
+	u64 pool_off, old_off;
 	struct daxfs_ovl_data_entry *de;
 	int ret;
 
 	if (!ovl)
 		return NULL;
+
+	if (pgoff > DAXFS_OVL_MAX_PGOFF)
+		return NULL;
+
+	key = DAXFS_OVL_KEY_DATA(ino, pgoff);
 
 	pool_off = overlay_pool_alloc(ovl, sizeof(*de), DAXFS_OVL_DATA);
 	if (pool_off == (u64)-1)
@@ -422,9 +450,13 @@ void *daxfs_overlay_alloc_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 	de->reserved = 0;
 	memset(de->data, 0, PAGE_SIZE);
 
-	ret = overlay_insert(ovl, key, pool_off, NULL);
+	ret = overlay_insert(ovl, key, pool_off, &old_off, true);
 	if (ret)
 		return NULL;
+
+	/* Recycle old entry if we replaced a concurrent allocation */
+	if (old_off != (u64)-1 && old_off != pool_off)
+		overlay_pool_free(ovl, old_off, DAXFS_OVL_DATA);
 
 	return de->data;
 }
@@ -567,6 +599,7 @@ static struct daxfs_ovl_dirlist_entry *overlay_get_dirlist(
 	/* Create a new dirlist head */
 	{
 		u64 pool_off;
+		int ret;
 
 		pool_off = overlay_pool_alloc(ovl,
 			sizeof(struct daxfs_ovl_dirlist_entry),
@@ -580,13 +613,16 @@ static struct daxfs_ovl_dirlist_entry *overlay_get_dirlist(
 		dl->first = cpu_to_le64(DAXFS_OVL_NO_NEXT);
 		smp_wmb();
 
-		if (overlay_insert(ovl, key, pool_off, NULL) != 0) {
+		ret = overlay_insert(ovl, key, pool_off, NULL, false);
+		if (ret == -EEXIST) {
 			/*
 			 * Another host created it concurrently.
-			 * The insert updated the bucket to our entry, but
-			 * re-lookup to get the canonical one.
+			 * Use theirs — our empty entry is harmlessly leaked
+			 * (no free list for DIRLIST type).
 			 */
 			dl = overlay_lookup(ovl, info, key);
+		} else if (ret != 0) {
+			return NULL;
 		}
 	}
 	return dl;
@@ -686,7 +722,9 @@ int daxfs_overlay_create_dirent(struct daxfs_info *info,
 	dirent_init(de, parent_ino, child_ino, child_mode,
 		    name, name_len, 0);
 
-	ret = overlay_insert(ovl, key, pool_off, NULL);
+	ret = overlay_insert(ovl, key, pool_off, NULL, true);
+	if (ret == -ENOSPC)
+		return ret;
 	if (ret != 0) {
 		/*
 		 * Insert failed because another host inserted the same key
@@ -754,7 +792,9 @@ int daxfs_overlay_delete_dirent(struct daxfs_info *info,
 		/* Key exists (hash collision) — append to chain */
 		ret = dirent_chain_append(ovl, head, pool_off);
 	} else {
-		ret = overlay_insert(ovl, key, pool_off, NULL);
+		ret = overlay_insert(ovl, key, pool_off, NULL, true);
+		if (ret == -ENOSPC)
+			return ret;
 		if (ret != 0) {
 			/* Concurrent insert — retry as chain append */
 			head = overlay_lookup(ovl, info, key);

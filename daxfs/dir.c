@@ -96,22 +96,14 @@ static struct dentry *daxfs_lookup(struct inode *dir, struct dentry *dentry,
 		}
 	}
 
-	/* Check base image */
+	/*
+	 * Check base image. No need to re-check overlay for tombstones here:
+	 * if overlay had a tombstone for this name, we would have found it
+	 * in the overlay check above and returned NULL already.
+	 */
 	if (daxfs_name_exists_base(info, dir->i_ino,
 				   dentry->d_name.name, dentry->d_name.len,
 				   &ino)) {
-		/* Check if deleted in overlay */
-		if (info->overlay) {
-			struct daxfs_ovl_dirent_entry *de;
-
-			de = daxfs_overlay_lookup_dirent(info, dir->i_ino,
-							 dentry->d_name.name,
-							 dentry->d_name.len);
-			if (de && (le32_to_cpu(de->flags) &
-				   DAXFS_OVL_DIRENT_TOMBSTONE))
-				return d_splice_alias(NULL, dentry);
-		}
-
 		inode = daxfs_iget(dir->i_sb, ino);
 		if (IS_ERR(inode))
 			return ERR_CAST(inode);

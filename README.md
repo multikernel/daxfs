@@ -173,7 +173,7 @@ visible to all participants with no coherency protocol.
 
 ## On-Disk Format
 
-Defined in `include/daxfs_format.h` (version 6).
+Defined in `include/daxfs_format.h` (version 7).
 
 | Region | Content |
 |--------|---------|
@@ -212,6 +212,6 @@ DAXFS uses a flat directory format designed for safe handling of untrusted image
 
 - No mknod support (device nodes, FIFOs, sockets not supported)
 - Filename max 255 characters (matches VFS NAME_MAX)
-- Overlay pool is bump-allocated (no free/reuse of deleted entries)
+- Overlay pool entries are recycled via per-type free lists, but the pool itself is not compacted
 - Multi-file pcache tag supports up to ~1M pages per file (4GB with 4KB pages)
 - Overlay hash table size is fixed at creation time

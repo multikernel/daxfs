@@ -721,9 +721,48 @@ static int write_empty_image(void *mem, size_t mem_size,
 		super->pcache_hash_shift = htole32(calc_ilog2(pcache_slots));
 	}
 
-	/* Write overlay (next_ino starts at 2: root=1 is implicit) */
+	/* Write overlay (next_ino starts at 2: root=1 is reserved) */
 	write_overlay_region(mem + overlay_offset, overlay_buckets,
 			     overlay_pool_size, DAXFS_ROOT_INO + 1);
+
+	/*
+	 * Create root directory inode in the overlay so daxfs_iget(ROOT_INO)
+	 * can find it during mount (there's no base image in empty mode).
+	 */
+	{
+		struct daxfs_overlay_header *ohdr = mem + overlay_offset;
+		uint64_t bucket_array_size = ALIGN(
+			(uint64_t)overlay_buckets *
+			sizeof(struct daxfs_overlay_bucket),
+			DAXFS_BLOCK_SIZE);
+		void *pool_base = mem + overlay_offset +
+			DAXFS_BLOCK_SIZE + bucket_array_size;
+		struct daxfs_ovl_inode_entry *ie;
+		struct daxfs_overlay_bucket *buckets;
+		uint64_t key, pool_off;
+		uint32_t idx;
+
+		/* Bump-allocate inode entry from pool */
+		pool_off = 0;
+		ie = pool_base + pool_off;
+		ie->type = htole32(DAXFS_OVL_INODE);
+		ie->mode = htole32(S_IFDIR | 0755);
+		ie->uid = htole32(0);
+		ie->gid = htole32(0);
+		ie->size = htole64(0);
+		ie->nlink = htole32(2);
+		ie->flags = 0;
+		ohdr->pool_alloc = htole64(
+			ALIGN(sizeof(struct daxfs_ovl_inode_entry), 8));
+
+		/* Insert into hash table */
+		key = DAXFS_OVL_KEY_INODE(DAXFS_ROOT_INO);
+		buckets = mem + overlay_offset + DAXFS_BLOCK_SIZE;
+		idx = (uint32_t)(key & (overlay_buckets - 1));
+		buckets[idx].state_key = htole64(DAXFS_OVL_MAKE(
+			DAXFS_OVL_USED, key));
+		buckets[idx].value = htole64(pool_off);
+	}
 
 	if (pcache_slots)
 		write_pcache_region(mem + pcache_offset, pcache_slots);

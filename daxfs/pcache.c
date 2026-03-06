@@ -84,7 +84,12 @@ static int pcache_fill_slot(struct daxfs_pcache *pc, u32 slot_idx, u64 tag)
 
 	backing = pcache_find_backing(pc, ino);
 	if (!backing) {
-		/* No backing file for this inode — skip */
+		/* No backing file — revert slot to FREE so it can be reused */
+		old_val = PCACHE_MAKE(PCACHE_STATE_PENDING, tag);
+		new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
+		if (slot_cmpxchg(&pc->slots[slot_idx], old_val, new_val) ==
+		    old_val)
+			pcache_dec_pending(pc->header);
 		return -ENOENT;
 	}
 
@@ -220,8 +225,11 @@ static void *pcache_wait_valid(struct daxfs_pcache *pc, u32 target_idx,
 
 		if (PCACHE_STATE(val) == PCACHE_STATE_VALID &&
 		    PCACHE_TAG(val) == desired_tag) {
-			if (!pcache_pin_slot(&pc->slots[target_idx], val))
+			if (!pcache_pin_slot(&pc->slots[target_idx], val)) {
+				cpu_relax();
+				timeout_us--;
 				continue;
+			}
 			smp_rmb();
 			pcache_touch(&pc->slots[target_idx]);
 			if (pinned_slot)

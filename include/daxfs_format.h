@@ -160,11 +160,12 @@ struct daxfs_overlay_bucket {
 
 /*
  * Key encoding (63 bits):
- *   DATA:    (ino << 20) | (pgoff & 0xFFFFF)
- *   INODE:   (ino << 20) | 0xFFFFF
- *   DIRLIST: (ino << 20) | 0xFFFFE    — per-directory dirent list head
- *   DIRENT:  hash(parent_ino, name)   — 63-bit FNV-1a variant
+ *   DATA:    (ino << 20) | (pgoff & 0xFFFFF)   — pgoff must be < 0xFFFFE
+ *   INODE:   (ino << 20) | 0xFFFFF             — sentinel
+ *   DIRLIST: (ino << 20) | 0xFFFFE             — sentinel
+ *   DIRENT:  hash(parent_ino, name)            — 63-bit FNV-1a variant
  */
+#define DAXFS_OVL_MAX_PGOFF			0xFFFFDULL	/* Max valid pgoff for DATA keys */
 #define DAXFS_OVL_KEY_DATA(ino, pgoff)		((((__u64)(ino)) << 20) | ((pgoff) & 0xFFFFF))
 #define DAXFS_OVL_KEY_INODE(ino)		((((__u64)(ino)) << 20) | 0xFFFFF)
 #define DAXFS_OVL_KEY_DIRLIST(ino)		((((__u64)(ino)) << 20) | 0xFFFFE)

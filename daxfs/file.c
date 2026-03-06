@@ -200,11 +200,15 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	/* Update inode size if extending */
 	if (pos > inode->i_size) {
 		struct daxfs_ovl_inode_entry *oie;
+		struct daxfs_ovl_inode_entry ie;
 
 		inode->i_size = pos;
 		oie = daxfs_overlay_get_inode(info, inode->i_ino);
-		if (oie)
-			oie->size = cpu_to_le64(pos);
+		if (oie) {
+			ie = *oie;
+			ie.size = cpu_to_le64(pos);
+			daxfs_overlay_set_inode(info, inode->i_ino, &ie);
+		}
 	}
 
 	iocb->ki_pos = pos;
