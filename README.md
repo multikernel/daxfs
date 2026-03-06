@@ -35,8 +35,29 @@ and synchronization with `cmpxchg`.
 | **tmpfs/ramfs** | Per-instance, N containers = N copies in memory |
 | **overlayfs** | No multi-kernel/multi-host support, copy-up on write, page cache overhead |
 | **erofs** | Read-only, fscache is per-kernel so N kernels = N cache copies |
-| **famfs** | Per-file allocation complexity, no self-contained images |
+| **famfs** | Single-writer metadata, no shared caching, no CAS coordination (see below) |
 | **cramfs** | Block I/O + page cache, no direct memory mapping |
+
+### DAXFS vs FamFS
+
+Both DAXFS and [FamFS](https://github.com/cxl-micron-reskit/famfs) target
+CXL shared memory, but they differ fundamentally in architecture:
+
+| | DAXFS | FamFS |
+|---|---|---|
+| **Coordination model** | Peer-to-peer via `cmpxchg` | Single master, clients replay metadata log |
+| **Writes** | Lock-free CAS overlay, any host can write concurrently | Master creates files; clients default read-only, user manages coherency if writable |
+| **Shared caching** | Cooperative page cache (pcache) across all hosts, clock-based eviction | None; each node manages its own access |
+| **Allocation** | Self-contained image with internal bump allocator | Per-file extent lists allocated by master |
+| **File operations** | Create, read, write (COW), delete (tombstone) | Pre-allocate only (no append, truncate, or delete) |
+| **Image model** | Self-contained: superblock + base image + overlay + pcache in one region | No images; files are individually mapped extents |
+| **CXL multi-host atomics** | Core design primitive: all metadata and cache transitions use `cmpxchg` on shared memory | Not used; relies on single-writer log for metadata consistency |
+| **Layered storage** | Base image + overlay (shared base with per-instance COW) | No layering concept |
+
+FamFS is a thin mapping layer that exposes pre-allocated files on shared memory.
+DAXFS is a general-purpose shared in-memory filesystem that uses CXL shared memory
+atomics for lock-free multi-host coordination: concurrent writes, cooperative
+caching, and layered storage without a central coordinator.
 
 ## Building
 
@@ -132,9 +153,9 @@ no locks.
 - **Entry types**: inode metadata, data pages (4KB COW), directory entries with tombstone deletion
 
 Key encoding (63 bits):
-- **Data**: `(ino << 20) | pgoff` -- up to 1M pages per file
-- **Inode**: `(ino << 20) | 0xFFFFF` -- sentinel pgoff
-- **Dirent**: `FNV-1a(parent_ino, name)` -- 63-bit hash
+- **Data**: `(ino << 20) | pgoff` (up to 1M pages per file)
+- **Inode**: `(ino << 20) | 0xFFFFF` (sentinel pgoff)
+- **Dirent**: `FNV-1a(parent_ino, name)` (63-bit hash)
 
 Read path: overlay → base image → pcache (backing store).
 Write path: COW from base image into overlay data page.
@@ -146,7 +167,7 @@ physically shared across kernel instances and CXL hosts, the cache is automatica
 visible to all participants with no coherency protocol.
 
 - **3-state machine**: FREE → PENDING → VALID, all transitions via `cmpxchg`
-- **Multi-file tags**: `tag = (ino << 20) | pgoff` -- multiple backing files share one cache
+- **Multi-file tags**: `tag = (ino << 20) | pgoff`, multiple backing files share one cache
 - **Host fills, spawns wait**: host kernel reads backing file into PENDING slots; spawn kernels busy-poll until VALID
 - **Pre-warming**: `mkdaxfs` pre-populates cache slots at image creation time
 
