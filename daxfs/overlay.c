@@ -68,8 +68,10 @@ static u64 bucket_cmpxchg(struct daxfs_overlay_bucket *b, u64 old_val,
  * Lookup a key in the hash table.
  * Returns pointer to pool entry, or NULL if not found.
  *
- * Fix: smp_rmb() after reading USED state ensures we see the value
- * written by the inserter's smp_wmb() after the CAS.
+ * The smp_rmb() after matching a key pairs with the smp_wmb() in
+ * overlay_insert() that precedes the CAS publishing the key.
+ * This ensures we see the value that was written before the key
+ * became visible.
  */
 static void *overlay_lookup(struct daxfs_overlay *ovl, struct daxfs_info *info,
 			    u64 key)
@@ -129,15 +131,29 @@ static int overlay_insert(struct daxfs_overlay *ovl, u64 key, u64 pool_offset,
 			u64 new_sk = DAXFS_OVL_MAKE(DAXFS_OVL_USED, key);
 			u64 old;
 
+			/*
+			 * Write value BEFORE publishing the key via CAS.
+			 * This is safe on a FREE bucket: no reader ever
+			 * examines the value of a FREE slot. If our CAS
+			 * fails (another CPU claimed this slot), the
+			 * spurious value write is harmless — the winner
+			 * will overwrite it with their own value before
+			 * their CAS, and readers only access value after
+			 * seeing USED state with a matching key.
+			 *
+			 * The smp_wmb() ensures the value store is visible
+			 * to all CPUs before the CAS publishes the key.
+			 * Paired with smp_rmb() in overlay_lookup().
+			 */
+			WRITE_ONCE(b->value, cpu_to_le64(pool_offset));
+			smp_wmb();
+
 			old = bucket_cmpxchg(b, sk, new_sk);
 			if (old != sk) {
 				/* Raced — re-check this slot */
 				i--;
 				continue;
 			}
-			/* Won the CAS — write value */
-			WRITE_ONCE(b->value, cpu_to_le64(pool_offset));
-			smp_wmb();
 			return 0;
 		}
 

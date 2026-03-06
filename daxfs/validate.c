@@ -95,7 +95,15 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 			return -EINVAL;
 		}
 
-		if (file_size > 0 && !S_ISREG(mode)) {
+		if (file_size > 0) {
+			/*
+			 * Validate data bounds for all file types with
+			 * inline data. Regular files in pcache/export mode
+			 * fetch data from backing store at runtime, but
+			 * their base image data_offset still must be valid
+			 * if non-zero (it's used to compute pcache tags in
+			 * split mode).
+			 */
 			if (!daxfs_valid_base_offset(info, file_data_offset, file_size)) {
 				pr_err("daxfs: inode %u has invalid data offset\n", i + 1);
 				return -EINVAL;
@@ -140,8 +148,18 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 					return -EINVAL;
 				}
 
-				if (name_len > DAXFS_NAME_MAX) {
-					pr_err("daxfs: dir %u entry %u name too long\n",
+				if (name_len == 0 || name_len > DAXFS_NAME_MAX) {
+					pr_err("daxfs: dir %u entry %u has invalid name length\n",
+					       i + 1, j);
+					return -EINVAL;
+				}
+
+				/* Reject path separators and "."/"..". */
+				if (memchr(de->name, '/', name_len) ||
+				    (name_len == 1 && de->name[0] == '.') ||
+				    (name_len == 2 && de->name[0] == '.' &&
+				     de->name[1] == '.')) {
+					pr_err("daxfs: dir %u entry %u has unsafe name\n",
 					       i + 1, j);
 					return -EINVAL;
 				}
