@@ -65,6 +65,20 @@ static u64 bucket_cmpxchg(struct daxfs_overlay_bucket *b, u64 old_val,
 }
 
 /*
+ * Validate a pool offset is within the pool region.
+ * Returns pointer, or NULL if out of bounds.
+ */
+static void *overlay_pool_ptr(struct daxfs_overlay *ovl, u64 pool_off,
+			      size_t entry_size)
+{
+	u64 pool_size = le64_to_cpu(ovl->header->pool_size);
+
+	if (pool_off >= pool_size || entry_size > pool_size - pool_off)
+		return NULL;
+	return ovl->pool + pool_off;
+}
+
+/*
  * Lookup a key in the hash table.
  * Returns pointer to pool entry, or NULL if not found.
  *
@@ -92,7 +106,7 @@ static void *overlay_lookup(struct daxfs_overlay *ovl, struct daxfs_info *info,
 
 			smp_rmb(); /* Pair with smp_wmb() in overlay_insert */
 			pool_off = le64_to_cpu(READ_ONCE(b->value));
-			return ovl->pool + pool_off;
+			return overlay_pool_ptr(ovl, pool_off, 1);
 		}
 	}
 
@@ -564,7 +578,8 @@ static struct daxfs_ovl_dirent_entry *dirent_chain_walk(
 			return NULL;
 
 		smp_rmb(); /* Ensure we see the full next entry */
-		de = ovl->pool + le64_to_cpu(de->next);
+		de = overlay_pool_ptr(ovl, le64_to_cpu(de->next),
+				      sizeof(*de));
 	}
 
 	return NULL;
@@ -600,7 +615,9 @@ static int dirent_chain_append(struct daxfs_overlay *ovl,
 		}
 
 		smp_rmb();
-		de = ovl->pool + next;
+		de = overlay_pool_ptr(ovl, next, sizeof(*de));
+		if (!de)
+			return -EIO;
 	}
 
 	return -ELOOP;
@@ -976,7 +993,9 @@ bool daxfs_overlay_dir_has_entries(struct daxfs_info *info, u64 parent_ino)
 		struct daxfs_ovl_dirent_entry *de;
 
 		smp_rmb();
-		de = ovl->pool + off;
+		de = overlay_pool_ptr(ovl, off, sizeof(*de));
+		if (!de)
+			return false;
 
 		if (le64_to_cpu(de->parent_ino) == parent_ino &&
 		    !(le32_to_cpu(de->flags) & DAXFS_OVL_DIRENT_TOMBSTONE))
@@ -1019,7 +1038,9 @@ int daxfs_overlay_iterate_dir(struct daxfs_info *info,
 		struct daxfs_ovl_dirent_entry *de;
 
 		smp_rmb();
-		de = ovl->pool + off;
+		de = overlay_pool_ptr(ovl, off, sizeof(*de));
+		if (!de)
+			return -EIO;
 
 		if (!overlay_emit_dirent(de, parent_ino, ctx, pos))
 			return 0;

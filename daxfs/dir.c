@@ -35,6 +35,13 @@ static struct daxfs_dirent *daxfs_get_base_dirents(struct daxfs_info *info,
 
 	/* data_offset is relative to base image start */
 	base_offset = le64_to_cpu(info->super->base_offset);
+
+	/* Validate dirent array fits in mapped region */
+	if (!daxfs_valid_offset(info, base_offset + data_offset, size)) {
+		*count = 0;
+		return NULL;
+	}
+
 	*count = size / DAXFS_DIRENT_SIZE;
 	return daxfs_mem_ptr(info, base_offset + data_offset);
 }

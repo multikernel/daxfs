@@ -129,10 +129,26 @@ found:
 			}
 		}
 		/* Fall back to base image */
-		if (di->raw) {
+		if (di->raw && size > 0) {
 			u64 symlink_offset = le64_to_cpu(info->super->base_offset) +
 					     di->data_offset;
-			inode->i_link = daxfs_mem_ptr(info, symlink_offset);
+			char *target;
+
+			/*
+			 * Validate: symlink target must fit within the
+			 * mapped region (size+1 for null terminator).
+			 */
+			if (!daxfs_valid_offset(info, symlink_offset,
+						size + 1)) {
+				iget_failed(inode);
+				return ERR_PTR(-EIO);
+			}
+			target = daxfs_mem_ptr(info, symlink_offset);
+			if (target[size] != '\0') {
+				iget_failed(inode);
+				return ERR_PTR(-EIO);
+			}
+			inode->i_link = target;
 		}
 		break;
 	default:
