@@ -429,7 +429,7 @@ void *daxfs_overlay_alloc_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 {
 	struct daxfs_overlay *ovl = info->overlay;
 	u64 key;
-	u64 pool_off, old_off;
+	u64 pool_off;
 	struct daxfs_ovl_data_entry *de;
 	int ret;
 
@@ -450,13 +450,23 @@ void *daxfs_overlay_alloc_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 	de->reserved = 0;
 	memset(de->data, 0, PAGE_SIZE);
 
-	ret = overlay_insert(ovl, key, pool_off, &old_off, true);
+	ret = overlay_insert(ovl, key, pool_off, NULL, false);
+	if (ret == -EEXIST) {
+		/*
+		 * Another host allocated this page concurrently.
+		 * Recycle our unused entry and return the existing page
+		 * so both hosts write into the same shared page.
+		 */
+		struct daxfs_ovl_data_entry *existing;
+
+		overlay_pool_free(ovl, pool_off, DAXFS_OVL_DATA);
+		existing = overlay_lookup(ovl, info, key);
+		if (!existing)
+			return NULL;
+		return existing->data;
+	}
 	if (ret)
 		return NULL;
-
-	/* Recycle old entry if we replaced a concurrent allocation */
-	if (old_off != (u64)-1 && old_off != pool_off)
-		overlay_pool_free(ovl, old_off, DAXFS_OVL_DATA);
 
 	return de->data;
 }
@@ -722,17 +732,19 @@ int daxfs_overlay_create_dirent(struct daxfs_info *info,
 	dirent_init(de, parent_ino, child_ino, child_mode,
 		    name, name_len, 0);
 
-	ret = overlay_insert(ovl, key, pool_off, NULL, true);
+	ret = overlay_insert(ovl, key, pool_off, NULL, false);
 	if (ret == -ENOSPC)
 		return ret;
-	if (ret != 0) {
+	if (ret == -EEXIST) {
 		/*
-		 * Insert failed because another host inserted the same key
-		 * concurrently. Retry as a chain append.
+		 * Another host inserted the same key concurrently.
+		 * Append to their chain instead of overwriting.
 		 */
 		head = overlay_lookup(ovl, info, key);
 		if (head)
 			ret = dirent_chain_append(ovl, head, pool_off);
+		else
+			ret = -EIO; /* Shouldn't happen */
 	}
 
 	if (ret == 0)
@@ -792,14 +804,16 @@ int daxfs_overlay_delete_dirent(struct daxfs_info *info,
 		/* Key exists (hash collision) — append to chain */
 		ret = dirent_chain_append(ovl, head, pool_off);
 	} else {
-		ret = overlay_insert(ovl, key, pool_off, NULL, true);
+		ret = overlay_insert(ovl, key, pool_off, NULL, false);
 		if (ret == -ENOSPC)
 			return ret;
-		if (ret != 0) {
-			/* Concurrent insert — retry as chain append */
+		if (ret == -EEXIST) {
+			/* Concurrent insert — append to their chain */
 			head = overlay_lookup(ovl, info, key);
 			if (head)
 				ret = dirent_chain_append(ovl, head, pool_off);
+			else
+				ret = -EIO;
 		}
 	}
 
