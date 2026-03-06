@@ -15,6 +15,27 @@
 #include "daxfs.h"
 
 /*
+ * Re-read i_size from the overlay inode (shared DAX memory) so that
+ * cross-host writes that extend a file become visible immediately.
+ * This is cheap — one pointer dereference into DAX memory.
+ */
+static void daxfs_refresh_isize(struct inode *inode, struct daxfs_info *info)
+{
+	struct daxfs_ovl_inode_entry *oie;
+
+	if (!info->overlay)
+		return;
+
+	oie = daxfs_overlay_get_inode(info, inode->i_ino);
+	if (oie) {
+		loff_t ovl_size = le64_to_cpu(READ_ONCE(oie->size));
+
+		if (ovl_size != inode->i_size)
+			i_size_write(inode, ovl_size);
+	}
+}
+
+/*
  * ============================================================================
  * Base image data access
  * ============================================================================
@@ -109,6 +130,9 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	loff_t pos = iocb->ki_pos;
 	size_t count = iov_iter_count(to);
 	size_t total = 0;
+
+	/* Pick up size changes from other hosts */
+	daxfs_refresh_isize(inode, info);
 
 	if (pos >= inode->i_size)
 		return 0;
@@ -322,6 +346,9 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 	void *data;
 	size_t len;
 	unsigned long pfn;
+
+	/* Pick up size changes from other hosts */
+	daxfs_refresh_isize(inode, info);
 
 	if (!is_write && pos >= inode->i_size)
 		return VM_FAULT_SIGBUS;
