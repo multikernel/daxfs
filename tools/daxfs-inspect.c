@@ -305,6 +305,7 @@ static int cmd_status(void)
 				if (pcache_offset + meta_off +
 				    (uint64_t)pcache_slots * sizeof(struct daxfs_pcache_slot) <= mem_size) {
 					uint32_t free_count = 0, valid_count = 0, pending_count = 0;
+					uint32_t ref_set_count = 0;
 
 					for (uint32_t i = 0; i < pcache_slots; i++) {
 						struct daxfs_pcache_slot *s = slot_base +
@@ -320,6 +321,8 @@ static int cmd_status(void)
 							break;
 						case PCACHE_STATE_VALID:
 							valid_count++;
+							if (le32_to_cpu(s->ref_bit))
+								ref_set_count++;
 							break;
 						}
 					}
@@ -329,6 +332,15 @@ static int cmd_status(void)
 					if (pcache_slots > 0)
 						printf("  Occupancy:       %.1f%%\n",
 						       (double)valid_count * 100 / pcache_slots);
+
+					printf("  Evict hand:      %u\n",
+					       le32_to_cpu(phdr->evict_hand));
+					if (valid_count > 0)
+						printf("  Ref bits set:    %u / %u valid (%.1f%% hot)\n",
+						       ref_set_count, valid_count,
+						       (double)ref_set_count * 100 / valid_count);
+					else
+						printf("  Ref bits set:    0 / 0 valid\n");
 				}
 			}
 		}

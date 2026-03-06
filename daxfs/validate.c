@@ -196,6 +196,12 @@ int daxfs_validate_super(struct daxfs_info *info)
 			return -EINVAL;
 		}
 
+		if (slot_count < PCACHE_PROBE_LEN) {
+			pr_err("daxfs: pcache slot_count %u < probe length %u\n",
+			       slot_count, PCACHE_PROBE_LEN);
+			return -EINVAL;
+		}
+
 		{
 			u64 meta_size = ALIGN((u64)slot_count * sizeof(struct daxfs_pcache_slot),
 					      DAXFS_BLOCK_SIZE);

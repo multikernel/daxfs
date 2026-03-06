@@ -108,6 +108,8 @@ static int pcache_fill_slot(struct daxfs_pcache *pc, u32 slot_idx, u64 tag)
 	return 0;
 }
 
+static void pcache_clock_sweep(struct daxfs_pcache *pc);
+
 static int daxfs_pcache_fill_thread(void *data)
 {
 	struct daxfs_pcache *pc = data;
@@ -117,6 +119,7 @@ static int daxfs_pcache_fill_thread(void *data)
 		u32 pending = le32_to_cpu(READ_ONCE(pc->header->pending_count));
 
 		if (pending == 0) {
+			pcache_clock_sweep(pc);
 			usleep_range(1000, 2000);
 			continue;
 		}
@@ -127,6 +130,8 @@ static int daxfs_pcache_fill_thread(void *data)
 			if (PCACHE_STATE(val) == PCACHE_STATE_PENDING)
 				pcache_fill_slot(pc, i, PCACHE_TAG(val));
 		}
+
+		pcache_clock_sweep(pc);
 	}
 
 	return 0;
@@ -136,6 +141,61 @@ static inline void pcache_touch(struct daxfs_pcache_slot *slot)
 {
 	if (!READ_ONCE(slot->ref_bit))
 		WRITE_ONCE(slot->ref_bit, cpu_to_le32(1));
+}
+
+/*
+ * Clock sweep: advance evict_hand by PCACHE_SWEEP_BATCH slots
+ * and clear ref_bit on VALID slots in that range.
+ */
+static void pcache_clock_sweep(struct daxfs_pcache *pc)
+{
+	u32 old_hand, new_hand, i;
+
+	old_hand = le32_to_cpu(READ_ONCE(pc->header->evict_hand));
+	new_hand = (old_hand + PCACHE_SWEEP_BATCH) & pc->hash_mask;
+
+	/* Atomically advance the hand; if another kernel won the race, skip */
+	if (cmpxchg((u32 *)&pc->header->evict_hand,
+		    old_hand, new_hand) != old_hand)
+		return;
+
+	for (i = 0; i < PCACHE_SWEEP_BATCH; i++) {
+		u32 idx = (old_hand + i) & pc->hash_mask;
+		u64 val = slot_read(&pc->slots[idx]);
+
+		if (PCACHE_STATE(val) == PCACHE_STATE_VALID)
+			WRITE_ONCE(pc->slots[idx].ref_bit, cpu_to_le32(0));
+	}
+}
+
+/*
+ * Wait for a PENDING slot to become VALID with matching tag.
+ * Returns data pointer, ERR_PTR(-EAGAIN) if slot went FREE (caller retries),
+ * or ERR_PTR(-EIO) on timeout.
+ */
+static void *pcache_wait_valid(struct daxfs_pcache *pc, u32 target_idx,
+			       u64 desired_tag)
+{
+	int timeout_us = 10000;
+
+	while (timeout_us > 0) {
+		u64 val = slot_read(&pc->slots[target_idx]);
+
+		if (PCACHE_STATE(val) == PCACHE_STATE_VALID &&
+		    PCACHE_TAG(val) == desired_tag) {
+			smp_rmb();
+			pcache_touch(&pc->slots[target_idx]);
+			return pc->data + (u64)target_idx * PAGE_SIZE;
+		}
+		if (PCACHE_STATE(val) == PCACHE_STATE_FREE)
+			return ERR_PTR(-EAGAIN);
+		cpu_relax();
+		udelay(1);
+		timeout_us--;
+	}
+	pr_err_ratelimited("daxfs: pcache timeout waiting for slot %u\n",
+			   target_idx);
+	return ERR_PTR(-EIO);
 }
 
 static noinline void *pcache_slow_path(struct daxfs_pcache *pc,
@@ -179,92 +239,144 @@ static noinline void *pcache_slow_path(struct daxfs_pcache *pc,
 {
 	u64 new_val;
 	int retries = 0;
+	u32 i;
 
-retry:
+restart:
 	if (retries++ > 100)
 		return ERR_PTR(-EIO);
 
-	switch (PCACHE_STATE(val)) {
-	case PCACHE_STATE_VALID:
-		/* Tag mismatch: evict */
-		new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
-		if (slot_cmpxchg(&pc->slots[slot_idx], val, new_val) != val) {
-			val = slot_read(&pc->slots[slot_idx]);
-			goto retry;
-		}
-		val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
-		goto retry;
-
-	case PCACHE_STATE_FREE:
-		/* Claim the slot */
-		new_val = PCACHE_MAKE(PCACHE_STATE_PENDING, desired_tag);
-		if (slot_cmpxchg(&pc->slots[slot_idx], val, new_val) != val) {
-			val = slot_read(&pc->slots[slot_idx]);
-			goto retry;
-		}
-
-		pcache_inc_pending(pc->header);
-
-		if (!list_empty(&pc->backing_files)) {
-			/* Host kernel: fill inline */
-			pcache_fill_slot(pc, slot_idx, desired_tag);
-			pcache_touch(&pc->slots[slot_idx]);
-			return pc->data + (u64)slot_idx * PAGE_SIZE;
-		}
-
-		/* Spawn kernel: busy-poll until host fills */
-		goto wait_valid;
-
-	case PCACHE_STATE_PENDING:
-		if (PCACHE_TAG(val) == desired_tag)
-			goto wait_valid;
-
-		goto wait_state_change;
-	}
-
-	return ERR_PTR(-EIO);
-
-wait_valid:
+	/*
+	 * Phase 1 — Linear probe: scan PCACHE_PROBE_LEN slots from primary
+	 * index. On hit return, track first FREE slot, wait on matching PENDING.
+	 */
 	{
-		int timeout_us = 10000;
+		s32 first_free = -1;
 
-		while (timeout_us > 0) {
-			val = slot_read(&pc->slots[slot_idx]);
-			if (PCACHE_STATE(val) == PCACHE_STATE_VALID &&
-			    PCACHE_TAG(val) == desired_tag) {
-				smp_rmb();
-				pcache_touch(&pc->slots[slot_idx]);
-				return pc->data + (u64)slot_idx * PAGE_SIZE;
+		for (i = 0; i < PCACHE_PROBE_LEN; i++) {
+			u32 idx = (slot_idx + i) & pc->hash_mask;
+
+			val = slot_read(&pc->slots[idx]);
+
+			switch (PCACHE_STATE(val)) {
+			case PCACHE_STATE_VALID:
+				if (PCACHE_TAG(val) == desired_tag) {
+					smp_rmb();
+					pcache_touch(&pc->slots[idx]);
+					return pc->data + (u64)idx * PAGE_SIZE;
+				}
+				break;
+
+			case PCACHE_STATE_FREE:
+				if (first_free < 0)
+					first_free = (s32)idx;
+				break;
+
+			case PCACHE_STATE_PENDING:
+				if (PCACHE_TAG(val) == desired_tag) {
+					void *ret = pcache_wait_valid(pc, idx,
+								      desired_tag);
+					if (ret == ERR_PTR(-EAGAIN))
+						goto restart;
+					return ret;
+				}
+				break;
 			}
-			if (PCACHE_STATE(val) == PCACHE_STATE_FREE)
-				goto retry;
-			cpu_relax();
-			udelay(1);
-			timeout_us--;
 		}
-		pr_err_ratelimited("daxfs: pcache timeout waiting for slot %u\n",
-				   slot_idx);
-		return ERR_PTR(-EIO);
+
+		/*
+		 * Phase 2 — Claim FREE slot: if one was found during probe,
+		 * attempt to claim it.
+		 */
+		if (first_free >= 0) {
+			u32 free_idx = (u32)first_free;
+
+			val = slot_read(&pc->slots[free_idx]);
+			if (PCACHE_STATE(val) != PCACHE_STATE_FREE)
+				goto restart;
+
+			new_val = PCACHE_MAKE(PCACHE_STATE_PENDING, desired_tag);
+			if (slot_cmpxchg(&pc->slots[free_idx], val, new_val) != val)
+				goto restart;
+
+			pcache_inc_pending(pc->header);
+
+			if (!list_empty(&pc->backing_files)) {
+				pcache_fill_slot(pc, free_idx, desired_tag);
+				pcache_touch(&pc->slots[free_idx]);
+				return pc->data + (u64)free_idx * PAGE_SIZE;
+			}
+
+			/* Spawn kernel: wait for host to fill */
+			{
+				void *ret = pcache_wait_valid(pc, free_idx,
+							      desired_tag);
+				if (ret == ERR_PTR(-EAGAIN))
+					goto restart;
+				return ret;
+			}
+		}
 	}
 
-wait_state_change:
-	{
-		int timeout_us = 10000;
-		u64 orig_val = val;
+	/*
+	 * Phase 3 — Clock-based victim selection: all probe slots occupied.
+	 *
+	 * Pass 1: find a VALID slot with ref_bit=0 (cold victim).
+	 */
+	for (i = 0; i < PCACHE_PROBE_LEN; i++) {
+		u32 idx = (slot_idx + i) & pc->hash_mask;
 
-		while (timeout_us > 0) {
-			val = slot_read(&pc->slots[slot_idx]);
-			if (val != orig_val)
-				goto retry;
-			cpu_relax();
-			udelay(1);
-			timeout_us--;
+		val = slot_read(&pc->slots[idx]);
+		if (PCACHE_STATE(val) == PCACHE_STATE_VALID &&
+		    !le32_to_cpu(READ_ONCE(pc->slots[idx].ref_bit))) {
+			new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
+			if (slot_cmpxchg(&pc->slots[idx], val, new_val) == val)
+				goto restart;
 		}
-		new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
-		slot_cmpxchg(&pc->slots[slot_idx], orig_val, new_val);
-		val = slot_read(&pc->slots[slot_idx]);
-		goto retry;
 	}
+
+	/*
+	 * All-hot case: all probe slots have ref_bit=1. Clear ref_bits in the
+	 * probe window, then briefly yield so other hosts can re-touch their
+	 * genuinely hot entries. Re-scan for a cold victim.
+	 */
+	for (i = 0; i < PCACHE_PROBE_LEN; i++) {
+		u32 idx = (slot_idx + i) & pc->hash_mask;
+
+		WRITE_ONCE(pc->slots[idx].ref_bit, cpu_to_le32(0));
+	}
+
+	cpu_relax();
+
+	/* Re-scan: entries re-touched by active hosts will have ref_bit=1 */
+	for (i = 0; i < PCACHE_PROBE_LEN; i++) {
+		u32 idx = (slot_idx + i) & pc->hash_mask;
+
+		val = slot_read(&pc->slots[idx]);
+		if (PCACHE_STATE(val) == PCACHE_STATE_VALID &&
+		    !le32_to_cpu(READ_ONCE(pc->slots[idx].ref_bit))) {
+			new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
+			if (slot_cmpxchg(&pc->slots[idx], val, new_val) == val)
+				goto restart;
+		}
+	}
+
+	/*
+	 * Final fallback: extreme contention, all still hot.
+	 * Evict the first VALID slot unconditionally.
+	 */
+	for (i = 0; i < PCACHE_PROBE_LEN; i++) {
+		u32 idx = (slot_idx + i) & pc->hash_mask;
+
+		val = slot_read(&pc->slots[idx]);
+		if (PCACHE_STATE(val) == PCACHE_STATE_VALID) {
+			new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
+			if (slot_cmpxchg(&pc->slots[idx], val, new_val) == val)
+				goto restart;
+		}
+	}
+
+	/* All cmpxchg attempts failed — retry from scratch */
+	goto restart;
 }
 
 bool daxfs_is_pcache_data(struct daxfs_info *info, void *ptr)

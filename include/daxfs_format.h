@@ -245,6 +245,9 @@ struct daxfs_ovl_dirent_entry {
 #define PCACHE_TAG_INO(tag)		((tag) >> 20)
 #define PCACHE_TAG_PGOFF(tag)		((tag) & 0xFFFFF)
 
+#define PCACHE_PROBE_LEN	8
+#define PCACHE_SWEEP_BATCH	64
+
 /*
  * Page cache header — 4KB, at pcache_offset
  *
