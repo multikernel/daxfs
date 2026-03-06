@@ -135,6 +135,9 @@ struct daxfs_dirent {
 /* Dirent flags */
 #define DAXFS_OVL_DIRENT_TOMBSTONE	(1 << 0)
 
+/* Sentinel for end of dirent hash collision chain */
+#define DAXFS_OVL_NO_NEXT		(((__u64)-1))
+
 /*
  * Bucket: 16 bytes, open addressing with linear probing.
  * state_key: bit[0] = state (FREE=0, USED=1), bits[63:1] = key
@@ -207,6 +210,8 @@ struct daxfs_ovl_dirent_entry {
 	__le32 child_mode;
 	__le16 name_len;
 	__u8   reserved[2];
+	__le64 next;		/* Pool offset of next entry in hash chain,
+				 * DAXFS_OVL_NO_NEXT = end of chain */
 	char   name[DAXFS_NAME_MAX + 1]; /* Null-terminated */
 };
 

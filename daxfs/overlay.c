@@ -67,6 +67,9 @@ static u64 bucket_cmpxchg(struct daxfs_overlay_bucket *b, u64 old_val,
 /*
  * Lookup a key in the hash table.
  * Returns pointer to pool entry, or NULL if not found.
+ *
+ * Fix: smp_rmb() after reading USED state ensures we see the value
+ * written by the inserter's smp_wmb() after the CAS.
  */
 static void *overlay_lookup(struct daxfs_overlay *ovl, struct daxfs_info *info,
 			    u64 key)
@@ -83,7 +86,10 @@ static void *overlay_lookup(struct daxfs_overlay *ovl, struct daxfs_info *info,
 			return NULL;	/* Empty slot — key doesn't exist */
 
 		if (DAXFS_OVL_KEY(sk) == key) {
-			u64 pool_off = le64_to_cpu(READ_ONCE(b->value));
+			u64 pool_off;
+
+			smp_rmb(); /* Pair with smp_wmb() in overlay_insert */
+			pool_off = le64_to_cpu(READ_ONCE(b->value));
 			return ovl->pool + pool_off;
 		}
 	}
@@ -228,26 +234,25 @@ struct daxfs_ovl_inode_entry *daxfs_overlay_get_inode(struct daxfs_info *info,
 
 /*
  * Set overlay inode metadata (insert or update).
+ *
+ * Always allocates a new pool entry and uses overlay_insert() which
+ * atomically handles the "key already exists" case via CAS. This avoids
+ * a TOCTOU race where two hosts both see the key as absent, both
+ * allocate, and one silently overwrites the other's in-place update.
+ *
+ * The cost is a leaked pool entry when updating an existing inode,
+ * which is acceptable for the bump allocator design.
  */
 int daxfs_overlay_set_inode(struct daxfs_info *info, u64 ino,
 			    const struct daxfs_ovl_inode_entry *ie)
 {
 	struct daxfs_overlay *ovl = info->overlay;
 	u64 key = DAXFS_OVL_KEY_INODE(ino);
-	struct daxfs_ovl_inode_entry *existing;
 	u64 pool_off;
 	struct daxfs_ovl_inode_entry *dst;
 
 	if (!ovl)
 		return -EROFS;
-
-	/* Check if inode already exists in overlay */
-	existing = overlay_lookup(ovl, info, key);
-	if (existing) {
-		*existing = *ie;
-		smp_wmb();
-		return 0;
-	}
 
 	/* Allocate new pool entry */
 	pool_off = overlay_pool_alloc(ovl, sizeof(*ie));
@@ -314,7 +319,79 @@ void *daxfs_overlay_alloc_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 }
 
 /*
- * Lookup a directory entry in overlay.
+ * Check if a dirent pool entry matches the given parent_ino + name.
+ */
+static bool dirent_matches(struct daxfs_ovl_dirent_entry *de,
+			   u64 parent_ino, const char *name, u16 name_len)
+{
+	return le64_to_cpu(de->parent_ino) == parent_ino &&
+	       le16_to_cpu(de->name_len) == name_len &&
+	       memcmp(de->name, name, name_len) == 0;
+}
+
+/*
+ * Walk the dirent hash collision chain starting from the head pool entry.
+ * Returns the exact-matching entry, or NULL if not found.
+ */
+static struct daxfs_ovl_dirent_entry *dirent_chain_walk(
+	struct daxfs_overlay *ovl, struct daxfs_ovl_dirent_entry *head,
+	u64 parent_ino, const char *name, u16 name_len)
+{
+	struct daxfs_ovl_dirent_entry *de = head;
+	int limit = 1024; /* Guard against corrupt chains */
+
+	while (de && limit-- > 0) {
+		if (dirent_matches(de, parent_ino, name, name_len))
+			return de;
+
+		if (le64_to_cpu(de->next) == DAXFS_OVL_NO_NEXT)
+			return NULL;
+
+		smp_rmb(); /* Ensure we see the full next entry */
+		de = ovl->pool + le64_to_cpu(de->next);
+	}
+
+	return NULL;
+}
+
+/*
+ * Append a new dirent entry to the end of a collision chain.
+ * Uses CAS on each entry's 'next' field to handle concurrent appends.
+ * Returns 0 on success.
+ */
+static int dirent_chain_append(struct daxfs_overlay *ovl,
+			       struct daxfs_ovl_dirent_entry *head,
+			       u64 new_pool_off)
+{
+	struct daxfs_ovl_dirent_entry *de = head;
+	int limit = 1024;
+
+	while (limit-- > 0) {
+		u64 next = le64_to_cpu(READ_ONCE(de->next));
+
+		if (next == DAXFS_OVL_NO_NEXT) {
+			u64 old;
+
+			old = cmpxchg((u64 *)&de->next,
+				      cpu_to_le64(DAXFS_OVL_NO_NEXT),
+				      cpu_to_le64(new_pool_off));
+			if (old == cpu_to_le64(DAXFS_OVL_NO_NEXT)) {
+				smp_wmb();
+				return 0;
+			}
+			/* Raced — another host appended; re-read */
+			continue;
+		}
+
+		smp_rmb();
+		de = ovl->pool + next;
+	}
+
+	return -ELOOP;
+}
+
+/*
+ * Lookup a directory entry in overlay, walking the collision chain.
  */
 struct daxfs_ovl_dirent_entry *daxfs_overlay_lookup_dirent(
 	struct daxfs_info *info, u64 parent_ino,
@@ -322,27 +399,45 @@ struct daxfs_ovl_dirent_entry *daxfs_overlay_lookup_dirent(
 {
 	struct daxfs_overlay *ovl = info->overlay;
 	u64 key;
-	struct daxfs_ovl_dirent_entry *de;
+	struct daxfs_ovl_dirent_entry *head;
 
 	if (!ovl)
 		return NULL;
 
 	key = fnv1a_hash(parent_ino, name, name_len);
-	de = overlay_lookup(ovl, info, key);
-	if (!de)
+	head = overlay_lookup(ovl, info, key);
+	if (!head)
 		return NULL;
 
-	/* Verify exact match (hash collision check) */
-	if (le64_to_cpu(de->parent_ino) != parent_ino ||
-	    le16_to_cpu(de->name_len) != name_len ||
-	    memcmp(de->name, name, name_len) != 0)
-		return NULL;
+	return dirent_chain_walk(ovl, head, parent_ino, name, name_len);
+}
 
-	return de;
+/*
+ * Initialize a new dirent pool entry.
+ */
+static void dirent_init(struct daxfs_ovl_dirent_entry *de,
+			u64 parent_ino, u64 child_ino, u32 child_mode,
+			const char *name, u16 name_len, u32 flags)
+{
+	de->type = cpu_to_le32(DAXFS_OVL_DIRENT);
+	de->flags = cpu_to_le32(flags);
+	de->parent_ino = cpu_to_le64(parent_ino);
+	de->child_ino = cpu_to_le64(child_ino);
+	de->child_mode = cpu_to_le32(child_mode);
+	de->name_len = cpu_to_le16(name_len);
+	memset(de->reserved, 0, sizeof(de->reserved));
+	de->next = cpu_to_le64(DAXFS_OVL_NO_NEXT);
+	memcpy(de->name, name, name_len);
+	de->name[name_len] = '\0';
+	smp_wmb();
 }
 
 /*
  * Create a directory entry in overlay.
+ *
+ * Handles hash collisions: if the key already exists in the hash table
+ * but belongs to a different dirent, the new entry is appended to the
+ * collision chain in the pool rather than overwriting the bucket value.
  */
 int daxfs_overlay_create_dirent(struct daxfs_info *info,
 				u64 parent_ino, u64 child_ino,
@@ -352,7 +447,7 @@ int daxfs_overlay_create_dirent(struct daxfs_info *info,
 	struct daxfs_overlay *ovl = info->overlay;
 	u64 key;
 	u64 pool_off;
-	struct daxfs_ovl_dirent_entry *de;
+	struct daxfs_ovl_dirent_entry *de, *head;
 	int ret;
 
 	if (!ovl)
@@ -360,41 +455,65 @@ int daxfs_overlay_create_dirent(struct daxfs_info *info,
 
 	key = fnv1a_hash(parent_ino, name, name_len);
 
-	/* Check if dirent already exists (possibly as tombstone) */
-	de = overlay_lookup(ovl, info, key);
-	if (de && le64_to_cpu(de->parent_ino) == parent_ino &&
-	    le16_to_cpu(de->name_len) == name_len &&
-	    memcmp(de->name, name, name_len) == 0) {
-		/* Reuse existing entry (e.g., un-delete) */
-		de->flags = 0;
-		de->child_ino = cpu_to_le64(child_ino);
-		de->child_mode = cpu_to_le32(child_mode);
-		smp_wmb();
-		return 0;
+	/* Check if key already exists in hash table */
+	head = overlay_lookup(ovl, info, key);
+	if (head) {
+		/* Walk chain for exact match (possibly tombstoned) */
+		de = dirent_chain_walk(ovl, head, parent_ino, name, name_len);
+		if (de) {
+			/* Reuse existing entry (e.g., un-delete) */
+			WRITE_ONCE(de->child_ino, cpu_to_le64(child_ino));
+			WRITE_ONCE(de->child_mode, cpu_to_le32(child_mode));
+			smp_wmb();
+			WRITE_ONCE(de->flags, 0);
+			return 0;
+		}
+
+		/*
+		 * Hash collision: key exists but belongs to a different
+		 * dirent. Allocate new entry and append to chain.
+		 */
+		pool_off = overlay_pool_alloc(ovl, sizeof(*de));
+		if (pool_off == (u64)-1)
+			return -ENOSPC;
+
+		de = ovl->pool + pool_off;
+		dirent_init(de, parent_ino, child_ino, child_mode,
+			    name, name_len, 0);
+
+		return dirent_chain_append(ovl, head, pool_off);
 	}
 
+	/* Key doesn't exist — allocate and insert as new bucket entry */
 	pool_off = overlay_pool_alloc(ovl, sizeof(*de));
 	if (pool_off == (u64)-1)
 		return -ENOSPC;
 
 	de = ovl->pool + pool_off;
-	de->type = cpu_to_le32(DAXFS_OVL_DIRENT);
-	de->flags = 0;
-	de->parent_ino = cpu_to_le64(parent_ino);
-	de->child_ino = cpu_to_le64(child_ino);
-	de->child_mode = cpu_to_le32(child_mode);
-	de->name_len = cpu_to_le16(name_len);
-	memset(de->reserved, 0, sizeof(de->reserved));
-	memcpy(de->name, name, name_len);
-	de->name[name_len] = '\0';
-	smp_wmb();
+	dirent_init(de, parent_ino, child_ino, child_mode,
+		    name, name_len, 0);
 
 	ret = overlay_insert(ovl, key, pool_off);
+	if (ret == 0)
+		return 0;
+
+	/*
+	 * Insert failed because another host inserted the same key
+	 * concurrently. Retry as a chain append.
+	 */
+	head = overlay_lookup(ovl, info, key);
+	if (head)
+		return dirent_chain_append(ovl, head, pool_off);
+
 	return ret;
 }
 
 /*
  * Delete a directory entry (insert tombstone).
+ *
+ * Walks the collision chain to find the exact entry. If the entry
+ * doesn't exist in overlay (base image entry), creates a tombstone
+ * and inserts/appends it.
  */
 int daxfs_overlay_delete_dirent(struct daxfs_info *info,
 				u64 parent_ino,
@@ -402,49 +521,55 @@ int daxfs_overlay_delete_dirent(struct daxfs_info *info,
 {
 	struct daxfs_overlay *ovl = info->overlay;
 	u64 key;
-	struct daxfs_ovl_dirent_entry *de;
+	struct daxfs_ovl_dirent_entry *de, *head;
+	u64 pool_off;
+	int ret;
 
 	if (!ovl)
 		return -EROFS;
 
 	key = fnv1a_hash(parent_ino, name, name_len);
 
-	/* Check if dirent exists in overlay */
-	de = overlay_lookup(ovl, info, key);
-	if (de && le64_to_cpu(de->parent_ino) == parent_ino &&
-	    le16_to_cpu(de->name_len) == name_len &&
-	    memcmp(de->name, name, name_len) == 0) {
-		/* Mark as tombstone */
-		de->flags = cpu_to_le32(DAXFS_OVL_DIRENT_TOMBSTONE);
-		smp_wmb();
-		return 0;
+	/* Check if dirent exists in overlay (walking chain) */
+	head = overlay_lookup(ovl, info, key);
+	if (head) {
+		de = dirent_chain_walk(ovl, head, parent_ino, name, name_len);
+		if (de) {
+			/* Mark as tombstone */
+			WRITE_ONCE(de->flags,
+				   cpu_to_le32(DAXFS_OVL_DIRENT_TOMBSTONE));
+			smp_wmb();
+			return 0;
+		}
 	}
 
 	/*
 	 * Entry not in overlay — it's a base image entry.
 	 * Create a tombstone in overlay.
 	 */
-	{
-		u64 pool_off;
+	pool_off = overlay_pool_alloc(ovl, sizeof(*de));
+	if (pool_off == (u64)-1)
+		return -ENOSPC;
 
-		pool_off = overlay_pool_alloc(ovl, sizeof(*de));
-		if (pool_off == (u64)-1)
-			return -ENOSPC;
+	de = ovl->pool + pool_off;
+	dirent_init(de, parent_ino, 0, 0, name, name_len,
+		    DAXFS_OVL_DIRENT_TOMBSTONE);
 
-		de = ovl->pool + pool_off;
-		de->type = cpu_to_le32(DAXFS_OVL_DIRENT);
-		de->flags = cpu_to_le32(DAXFS_OVL_DIRENT_TOMBSTONE);
-		de->parent_ino = cpu_to_le64(parent_ino);
-		de->child_ino = 0;
-		de->child_mode = 0;
-		de->name_len = cpu_to_le16(name_len);
-		memset(de->reserved, 0, sizeof(de->reserved));
-		memcpy(de->name, name, name_len);
-		de->name[name_len] = '\0';
-		smp_wmb();
-
-		return overlay_insert(ovl, key, pool_off);
+	if (head) {
+		/* Key exists (hash collision) — append to chain */
+		return dirent_chain_append(ovl, head, pool_off);
 	}
+
+	ret = overlay_insert(ovl, key, pool_off);
+	if (ret == 0)
+		return 0;
+
+	/* Concurrent insert of same key — retry as chain append */
+	head = overlay_lookup(ovl, info, key);
+	if (head)
+		return dirent_chain_append(ovl, head, pool_off);
+
+	return ret;
 }
 
 /*
@@ -471,9 +596,50 @@ u64 daxfs_overlay_alloc_ino(struct daxfs_info *info)
 }
 
 /*
+ * Try to emit a single dirent entry for readdir.
+ * Returns false if dir_emit() signals buffer full (caller should stop).
+ */
+static bool overlay_emit_dirent(struct daxfs_ovl_dirent_entry *de,
+				u64 parent_ino, struct dir_context *ctx,
+				loff_t *pos)
+{
+	u32 mode;
+	u64 ino;
+	u16 name_len;
+	unsigned char dtype;
+
+	/* Only entries in this directory */
+	if (le64_to_cpu(de->parent_ino) != parent_ino)
+		return true;
+
+	/* Skip tombstones */
+	if (le32_to_cpu(de->flags) & DAXFS_OVL_DIRENT_TOMBSTONE)
+		return true;
+
+	if (*pos >= ctx->pos) {
+		mode = le32_to_cpu(de->child_mode);
+		ino = le64_to_cpu(de->child_ino);
+		name_len = le16_to_cpu(de->name_len);
+
+		switch (mode & S_IFMT) {
+		case S_IFREG: dtype = DT_REG; break;
+		case S_IFDIR: dtype = DT_DIR; break;
+		case S_IFLNK: dtype = DT_LNK; break;
+		default: dtype = DT_UNKNOWN; break;
+		}
+
+		if (!dir_emit(ctx, de->name, name_len, ino, dtype))
+			return false;
+		ctx->pos = *pos + 1;
+	}
+	(*pos)++;
+	return true;
+}
+
+/*
  * Iterate overlay directory entries for readdir.
- * Scans all buckets looking for dirent entries with matching parent_ino.
- * This is O(bucket_count) but readdir is inherently slow.
+ * Scans all buckets looking for dirent entries with matching parent_ino,
+ * walking collision chains for each bucket head.
  */
 int daxfs_overlay_iterate_dir(struct daxfs_info *info,
 			      u64 parent_ino,
@@ -491,43 +657,29 @@ int daxfs_overlay_iterate_dir(struct daxfs_info *info,
 		u64 sk = bucket_read(b);
 		u64 pool_off;
 		struct daxfs_ovl_dirent_entry *de;
-		unsigned char dtype;
+		int limit = 1024;
 
 		if (DAXFS_OVL_STATE(sk) != DAXFS_OVL_USED)
 			continue;
 
+		smp_rmb();
 		pool_off = le64_to_cpu(READ_ONCE(b->value));
 		de = ovl->pool + pool_off;
 
-		/* Only dirent entries */
+		/* Only dirent chain heads */
 		if (le32_to_cpu(de->type) != DAXFS_OVL_DIRENT)
 			continue;
 
-		/* Only entries in this directory */
-		if (le64_to_cpu(de->parent_ino) != parent_ino)
-			continue;
-
-		/* Skip tombstones */
-		if (le32_to_cpu(de->flags) & DAXFS_OVL_DIRENT_TOMBSTONE)
-			continue;
-
-		if (*pos >= ctx->pos) {
-			u32 mode = le32_to_cpu(de->child_mode);
-			u64 ino = le64_to_cpu(de->child_ino);
-			u16 name_len = le16_to_cpu(de->name_len);
-
-			switch (mode & S_IFMT) {
-			case S_IFREG: dtype = DT_REG; break;
-			case S_IFDIR: dtype = DT_DIR; break;
-			case S_IFLNK: dtype = DT_LNK; break;
-			default: dtype = DT_UNKNOWN; break;
-			}
-
-			if (!dir_emit(ctx, de->name, name_len, ino, dtype))
+		/* Walk the collision chain */
+		while (de && limit-- > 0) {
+			if (!overlay_emit_dirent(de, parent_ino, ctx, pos))
 				return 0;
-			ctx->pos = *pos + 1;
+
+			if (le64_to_cpu(de->next) == DAXFS_OVL_NO_NEXT)
+				break;
+			smp_rmb();
+			de = ovl->pool + le64_to_cpu(de->next);
 		}
-		(*pos)++;
 	}
 
 	return 0;

@@ -304,6 +304,13 @@ static int daxfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	return 0;
 }
 
+/*
+ * Rename: create new dirent FIRST, then delete old.
+ *
+ * Ordering matters for crash safety: if we crash between the two
+ * overlay operations, the file is visible in both locations (harmless
+ * duplication) rather than invisible in both (data loss).
+ */
 static int daxfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 			struct dentry *old_dentry, struct inode *new_dir,
 			struct dentry *new_dentry, unsigned int flags)
@@ -327,18 +334,18 @@ static int daxfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 			return ret;
 	}
 
-	/* Remove old dirent */
-	ret = daxfs_overlay_delete_dirent(info, old_dir->i_ino,
-					  old_dentry->d_name.name,
-					  old_dentry->d_name.len);
-	if (ret)
-		return ret;
-
-	/* Create new dirent */
+	/* Step 1: Create new dirent (file becomes visible in new location) */
 	ret = daxfs_overlay_create_dirent(info, new_dir->i_ino, inode->i_ino,
 					  inode->i_mode,
 					  new_dentry->d_name.name,
 					  new_dentry->d_name.len);
+	if (ret)
+		return ret;
+
+	/* Step 2: Remove old dirent (file disappears from old location) */
+	ret = daxfs_overlay_delete_dirent(info, old_dir->i_ino,
+					  old_dentry->d_name.name,
+					  old_dentry->d_name.len);
 	if (ret)
 		return ret;
 
