@@ -138,6 +138,9 @@ struct daxfs_dirent {
 /* Sentinel for end of dirent hash collision chain */
 #define DAXFS_OVL_NO_NEXT		(((__u64)-1))
 
+/* Sentinel for empty free list / end of free chain */
+#define DAXFS_OVL_FREE_END		(((__u64)-1))
+
 /*
  * Bucket: 16 bytes, open addressing with linear probing.
  * state_key: bit[0] = state (FREE=0, USED=1), bits[63:1] = key
@@ -180,7 +183,18 @@ struct daxfs_overlay_header {
 	__le64 pool_size;		/* Total pool capacity */
 	__le64 pool_alloc;		/* Atomic bump allocator (next free byte) */
 	__le64 next_ino;		/* Atomic inode counter */
-	__u8   reserved[4096 - 48];	/* Pad to 4KB */
+
+	/*
+	 * Per-size-class free lists for pool entry recycling.
+	 * Each is a CAS-based stack head (pool offset, or
+	 * DAXFS_OVL_FREE_END if empty). Freed entries reuse
+	 * their first 8 bytes as the next-free pointer.
+	 */
+	__le64 free_inode;		/* Free list: inode entries */
+	__le64 free_data;		/* Free list: data page entries */
+	__le64 free_dirent;		/* Free list: dirent entries */
+
+	__u8   reserved[4096 - 72];	/* Pad to 4KB */
 };
 
 /*

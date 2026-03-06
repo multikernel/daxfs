@@ -382,6 +382,9 @@ static int write_overlay_region(void *overlay_mem, uint32_t bucket_count,
 	hdr->pool_size = htole64(pool_size);
 	hdr->pool_alloc = htole64(0);
 	hdr->next_ino = htole64(next_ino_val);
+	hdr->free_inode = htole64(DAXFS_OVL_FREE_END);
+	hdr->free_data = htole64(DAXFS_OVL_FREE_END);
+	hdr->free_dirent = htole64(DAXFS_OVL_FREE_END);
 
 	return 0;
 }

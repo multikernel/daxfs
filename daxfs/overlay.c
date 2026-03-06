@@ -100,12 +100,20 @@ static void *overlay_lookup(struct daxfs_overlay *ovl, struct daxfs_info *info,
 /*
  * Insert a key into the hash table.
  * CAS FREE→USED on the first empty bucket in the probe chain.
- * Returns 0 on success, -ENOSPC if table full, -EEXIST if key exists.
+ *
+ * If old_value is non-NULL and the key already exists, the previous
+ * pool offset is written there so the caller can recycle it.
+ *
+ * Returns 0 on success, -ENOSPC if table full.
  */
-static int overlay_insert(struct daxfs_overlay *ovl, u64 key, u64 pool_offset)
+static int overlay_insert(struct daxfs_overlay *ovl, u64 key, u64 pool_offset,
+			  u64 *old_value)
 {
 	u32 idx = (u32)(key & ovl->bucket_mask);
 	u32 i;
+
+	if (old_value)
+		*old_value = (u64)-1;
 
 	for (i = 0; i < ovl->bucket_count; i++) {
 		u32 probe = (idx + i) & ovl->bucket_mask;
@@ -129,7 +137,11 @@ static int overlay_insert(struct daxfs_overlay *ovl, u64 key, u64 pool_offset)
 		}
 
 		if (DAXFS_OVL_KEY(sk) == key) {
-			/* Key already exists — update value */
+			/* Key already exists — capture old value, update */
+			if (old_value) {
+				smp_rmb();
+				*old_value = le64_to_cpu(READ_ONCE(b->value));
+			}
 			WRITE_ONCE(b->value, cpu_to_le64(pool_offset));
 			smp_wmb();
 			return 0;
@@ -140,10 +152,87 @@ static int overlay_insert(struct daxfs_overlay *ovl, u64 key, u64 pool_offset)
 }
 
 /*
+ * ============================================================================
+ * Pool allocator with free list recycling
+ *
+ * Each entry type has a per-class free list (CAS-based stack) in the
+ * overlay header. Freed entries reuse their first 8 bytes as a
+ * next-free pointer. Allocation tries the free list before falling
+ * back to the bump allocator.
+ * ============================================================================
+ */
+
+/*
+ * Get the free list head pointer for a given entry type.
+ */
+static __le64 *overlay_free_head(struct daxfs_overlay *ovl, u32 type)
+{
+	switch (type) {
+	case DAXFS_OVL_INODE:
+		return &ovl->header->free_inode;
+	case DAXFS_OVL_DATA:
+		return &ovl->header->free_data;
+	case DAXFS_OVL_DIRENT:
+		return &ovl->header->free_dirent;
+	default:
+		return NULL;
+	}
+}
+
+/*
+ * Push a freed entry onto the per-type free list (CAS-based stack push).
+ * The first 8 bytes of the entry are overwritten with the next pointer.
+ */
+static void overlay_pool_free(struct daxfs_overlay *ovl, u64 pool_off, u32 type)
+{
+	__le64 *head = overlay_free_head(ovl, type);
+	__le64 *link = (__le64 *)(ovl->pool + pool_off);
+	u64 old_head;
+
+	if (!head)
+		return;
+
+	do {
+		old_head = le64_to_cpu(READ_ONCE(*head));
+		WRITE_ONCE(*link, cpu_to_le64(old_head));
+		smp_wmb();
+	} while (cmpxchg((u64 *)head,
+			 cpu_to_le64(old_head),
+			 cpu_to_le64(pool_off)) != cpu_to_le64(old_head));
+}
+
+/*
+ * Try to pop an entry from the per-type free list (CAS-based stack pop).
+ * Returns pool-relative offset, or (u64)-1 if list is empty.
+ */
+static u64 overlay_pool_alloc_free(struct daxfs_overlay *ovl, u32 type)
+{
+	__le64 *head = overlay_free_head(ovl, type);
+	u64 old_head, next;
+
+	if (!head)
+		return (u64)-1;
+
+	do {
+		old_head = le64_to_cpu(READ_ONCE(*head));
+		if (old_head == DAXFS_OVL_FREE_END)
+			return (u64)-1;
+
+		smp_rmb();
+		next = le64_to_cpu(READ_ONCE(
+			*((__le64 *)(ovl->pool + old_head))));
+	} while (cmpxchg((u64 *)head,
+			 cpu_to_le64(old_head),
+			 cpu_to_le64(next)) != cpu_to_le64(old_head));
+
+	return old_head;
+}
+
+/*
  * Bump-allocate space from the pool.
  * Returns pool-relative offset, or (u64)-1 if out of space.
  */
-static u64 overlay_pool_alloc(struct daxfs_overlay *ovl, size_t size)
+static u64 overlay_pool_bump(struct daxfs_overlay *ovl, size_t size)
 {
 	struct daxfs_overlay_header *hdr = ovl->header;
 	u64 pool_size = le64_to_cpu(hdr->pool_size);
@@ -162,6 +251,20 @@ static u64 overlay_pool_alloc(struct daxfs_overlay *ovl, size_t size)
 			 cpu_to_le64(new_alloc)) != cpu_to_le64(old_alloc));
 
 	return old_alloc;
+}
+
+/*
+ * Allocate a pool entry: try recycled free list first, then bump.
+ */
+static u64 overlay_pool_alloc(struct daxfs_overlay *ovl, size_t size, u32 type)
+{
+	u64 off;
+
+	off = overlay_pool_alloc_free(ovl, type);
+	if (off != (u64)-1)
+		return off;
+
+	return overlay_pool_bump(ovl, size);
 }
 
 /*
@@ -240,22 +343,22 @@ struct daxfs_ovl_inode_entry *daxfs_overlay_get_inode(struct daxfs_info *info,
  * a TOCTOU race where two hosts both see the key as absent, both
  * allocate, and one silently overwrites the other's in-place update.
  *
- * The cost is a leaked pool entry when updating an existing inode,
- * which is acceptable for the bump allocator design.
+ * When an existing inode is replaced, the old pool entry is recycled
+ * onto the inode free list for reuse.
  */
 int daxfs_overlay_set_inode(struct daxfs_info *info, u64 ino,
 			    const struct daxfs_ovl_inode_entry *ie)
 {
 	struct daxfs_overlay *ovl = info->overlay;
 	u64 key = DAXFS_OVL_KEY_INODE(ino);
-	u64 pool_off;
+	u64 pool_off, old_off;
 	struct daxfs_ovl_inode_entry *dst;
+	int ret;
 
 	if (!ovl)
 		return -EROFS;
 
-	/* Allocate new pool entry */
-	pool_off = overlay_pool_alloc(ovl, sizeof(*ie));
+	pool_off = overlay_pool_alloc(ovl, sizeof(*ie), DAXFS_OVL_INODE);
 	if (pool_off == (u64)-1)
 		return -ENOSPC;
 
@@ -263,7 +366,15 @@ int daxfs_overlay_set_inode(struct daxfs_info *info, u64 ino,
 	*dst = *ie;
 	smp_wmb();
 
-	return overlay_insert(ovl, key, pool_off);
+	ret = overlay_insert(ovl, key, pool_off, &old_off);
+	if (ret)
+		return ret;
+
+	/* Recycle the old entry if we replaced one */
+	if (old_off != (u64)-1 && old_off != pool_off)
+		overlay_pool_free(ovl, old_off, DAXFS_OVL_INODE);
+
+	return 0;
 }
 
 /*
@@ -302,7 +413,7 @@ void *daxfs_overlay_alloc_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 	if (!ovl)
 		return NULL;
 
-	pool_off = overlay_pool_alloc(ovl, sizeof(*de));
+	pool_off = overlay_pool_alloc(ovl, sizeof(*de), DAXFS_OVL_DATA);
 	if (pool_off == (u64)-1)
 		return NULL;
 
@@ -311,7 +422,7 @@ void *daxfs_overlay_alloc_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 	de->reserved = 0;
 	memset(de->data, 0, PAGE_SIZE);
 
-	ret = overlay_insert(ovl, key, pool_off);
+	ret = overlay_insert(ovl, key, pool_off, NULL);
 	if (ret)
 		return NULL;
 
@@ -473,7 +584,8 @@ int daxfs_overlay_create_dirent(struct daxfs_info *info,
 		 * Hash collision: key exists but belongs to a different
 		 * dirent. Allocate new entry and append to chain.
 		 */
-		pool_off = overlay_pool_alloc(ovl, sizeof(*de));
+		pool_off = overlay_pool_alloc(ovl, sizeof(*de),
+					      DAXFS_OVL_DIRENT);
 		if (pool_off == (u64)-1)
 			return -ENOSPC;
 
@@ -485,7 +597,7 @@ int daxfs_overlay_create_dirent(struct daxfs_info *info,
 	}
 
 	/* Key doesn't exist — allocate and insert as new bucket entry */
-	pool_off = overlay_pool_alloc(ovl, sizeof(*de));
+	pool_off = overlay_pool_alloc(ovl, sizeof(*de), DAXFS_OVL_DIRENT);
 	if (pool_off == (u64)-1)
 		return -ENOSPC;
 
@@ -493,7 +605,7 @@ int daxfs_overlay_create_dirent(struct daxfs_info *info,
 	dirent_init(de, parent_ino, child_ino, child_mode,
 		    name, name_len, 0);
 
-	ret = overlay_insert(ovl, key, pool_off);
+	ret = overlay_insert(ovl, key, pool_off, NULL);
 	if (ret == 0)
 		return 0;
 
@@ -547,7 +659,7 @@ int daxfs_overlay_delete_dirent(struct daxfs_info *info,
 	 * Entry not in overlay — it's a base image entry.
 	 * Create a tombstone in overlay.
 	 */
-	pool_off = overlay_pool_alloc(ovl, sizeof(*de));
+	pool_off = overlay_pool_alloc(ovl, sizeof(*de), DAXFS_OVL_DIRENT);
 	if (pool_off == (u64)-1)
 		return -ENOSPC;
 
@@ -560,7 +672,7 @@ int daxfs_overlay_delete_dirent(struct daxfs_info *info,
 		return dirent_chain_append(ovl, head, pool_off);
 	}
 
-	ret = overlay_insert(ovl, key, pool_off);
+	ret = overlay_insert(ovl, key, pool_off, NULL);
 	if (ret == 0)
 		return 0;
 
