@@ -131,6 +131,7 @@ struct daxfs_dirent {
 #define DAXFS_OVL_INODE		1
 #define DAXFS_OVL_DATA		2
 #define DAXFS_OVL_DIRENT	3
+#define DAXFS_OVL_DIRLIST	4	/* Per-directory dirent list head */
 
 /* Dirent flags */
 #define DAXFS_OVL_DIRENT_TOMBSTONE	(1 << 0)
@@ -159,12 +160,14 @@ struct daxfs_overlay_bucket {
 
 /*
  * Key encoding (63 bits):
- *   DATA:   (ino << 20) | (pgoff & 0xFFFFF)
- *   INODE:  (ino << 20) | 0xFFFFF
- *   DIRENT: hash(parent_ino, name)   — 63-bit FNV-1a variant
+ *   DATA:    (ino << 20) | (pgoff & 0xFFFFF)
+ *   INODE:   (ino << 20) | 0xFFFFF
+ *   DIRLIST: (ino << 20) | 0xFFFFE    — per-directory dirent list head
+ *   DIRENT:  hash(parent_ino, name)   — 63-bit FNV-1a variant
  */
 #define DAXFS_OVL_KEY_DATA(ino, pgoff)		((((__u64)(ino)) << 20) | ((pgoff) & 0xFFFFF))
 #define DAXFS_OVL_KEY_INODE(ino)		((((__u64)(ino)) << 20) | 0xFFFFF)
+#define DAXFS_OVL_KEY_DIRLIST(ino)		((((__u64)(ino)) << 20) | 0xFFFFE)
 #define DAXFS_OVL_KEY_INO(key)			((key) >> 20)
 #define DAXFS_OVL_KEY_PGOFF(key)		((key) & 0xFFFFF)
 
@@ -226,7 +229,23 @@ struct daxfs_ovl_dirent_entry {
 	__u8   reserved[2];
 	__le64 next;		/* Pool offset of next entry in hash chain,
 				 * DAXFS_OVL_NO_NEXT = end of chain */
+	__le64 dir_next;	/* Next dirent in same directory's list,
+				 * DAXFS_OVL_NO_NEXT = end of list */
 	char   name[DAXFS_NAME_MAX + 1]; /* Null-terminated */
+};
+
+/*
+ * Per-directory dirent list head — links all overlay dirents in one
+ * directory for O(n) readdir instead of O(bucket_count).
+ *
+ * Keyed by DAXFS_OVL_KEY_DIRLIST(parent_ino). The 'first' field is
+ * the pool offset of the first dirent; new entries are CAS-prepended.
+ */
+struct daxfs_ovl_dirlist_entry {
+	__le32 type;		/* DAXFS_OVL_DIRLIST */
+	__le32 reserved;
+	__le64 first;		/* Pool offset of first dirent, or
+				 * DAXFS_OVL_NO_NEXT = empty */
 };
 
 /*
