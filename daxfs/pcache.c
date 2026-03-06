@@ -60,15 +60,12 @@ static void pcache_dec_pending(struct daxfs_pcache_header *hdr)
 
 /*
  * Find a backing file for the given inode number.
+ * O(1) via direct array lookup.
  */
 static struct file *pcache_find_backing(struct daxfs_pcache *pc, u64 ino)
 {
-	struct daxfs_pcache_backing *b;
-
-	list_for_each_entry(b, &pc->backing_files, list) {
-		if (b->ino == ino)
-			return b->file;
-	}
+	if (ino < pc->backing_array_size && pc->backing_array)
+		return pc->backing_array[ino];
 	return NULL;
 }
 
@@ -480,13 +477,47 @@ bool daxfs_is_pcache_data(struct daxfs_info *info, void *ptr)
 }
 
 /*
+ * Ensure the backing_array is large enough for the given ino.
+ */
+static int pcache_grow_backing_array(struct daxfs_pcache *pc, u64 ino)
+{
+	u32 new_size;
+	struct file **new_array;
+
+	if (ino < pc->backing_array_size)
+		return 0;
+
+	new_size = (u32)(ino + 1);
+	new_array = krealloc(pc->backing_array,
+			     new_size * sizeof(struct file *), GFP_KERNEL);
+	if (!new_array)
+		return -ENOMEM;
+
+	memset(new_array + pc->backing_array_size, 0,
+	       (new_size - pc->backing_array_size) * sizeof(struct file *));
+	pc->backing_array = new_array;
+	pc->backing_array_size = new_size;
+	return 0;
+}
+
+/*
  * Add a backing file for a specific inode, sharing an already-open file.
  */
 static int pcache_add_backing_file(struct daxfs_pcache *pc, u64 ino,
 				   struct file *f)
 {
 	struct daxfs_pcache_backing *b;
+	int ret;
 
+	/* Populate O(1) lookup array */
+	ret = pcache_grow_backing_array(pc, ino);
+	if (ret)
+		return ret;
+	if (pc->backing_array[ino])
+		fput(pc->backing_array[ino]);
+	pc->backing_array[ino] = get_file(f);
+
+	/* Keep list for cleanup */
 	b = kzalloc(sizeof(*b), GFP_KERNEL);
 	if (!b)
 		return -ENOMEM;
@@ -749,6 +780,17 @@ void daxfs_pcache_exit(struct daxfs_info *info)
 			fput(b->file);
 		list_del(&b->list);
 		kfree(b);
+	}
+
+	/* backing_array holds duplicate refs; drop them */
+	if (pc->backing_array) {
+		u32 i;
+
+		for (i = 0; i < pc->backing_array_size; i++) {
+			if (pc->backing_array[i])
+				fput(pc->backing_array[i]);
+		}
+		kfree(pc->backing_array);
 	}
 
 	info->pcache = NULL;

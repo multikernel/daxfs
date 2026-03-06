@@ -200,6 +200,42 @@ static __le64 *overlay_free_head(struct daxfs_overlay *ovl, u32 type)
 }
 
 /*
+ * Tagged free list head: upper 16 bits = generation counter, lower 48
+ * bits = pool offset. The generation counter prevents ABA races where
+ * a thread reads (offset, next), gets preempted while other threads
+ * pop and push the same offset back, then wakes and succeeds a stale
+ * CAS. With the generation tag, the CAS fails because the generation
+ * changed even though the offset didn't.
+ *
+ * DAXFS_OVL_FREE_END ((u64)-1) has all bits set, which means
+ * offset = 0xFFFFFFFFFFFF and gen = 0xFFFF — a valid "empty" state.
+ * No valid pool offset can equal 0xFFFFFFFFFFFF since pool sizes are
+ * bounded well below 2^48.
+ *
+ * Link pointers within freed entries remain plain pool offsets (no tag)
+ * since only the head is CAS'd.
+ */
+#define FREELIST_OFF_MASK	0x0000FFFFFFFFFFFFULL
+#define FREELIST_GEN_INC	0x0001000000000000ULL
+
+static inline u64 freelist_offset(u64 tagged)
+{
+	return tagged & FREELIST_OFF_MASK;
+}
+
+static inline bool freelist_is_end(u64 tagged)
+{
+	return freelist_offset(tagged) ==
+	       (DAXFS_OVL_FREE_END & FREELIST_OFF_MASK);
+}
+
+static inline u64 freelist_make(u64 offset, u64 old_tagged)
+{
+	return (offset & FREELIST_OFF_MASK) |
+	       ((old_tagged + FREELIST_GEN_INC) & ~FREELIST_OFF_MASK);
+}
+
+/*
  * Push a freed entry onto the per-type free list (CAS-based stack push).
  * The first 8 bytes of the entry are overwritten with the next pointer.
  */
@@ -207,18 +243,25 @@ static void overlay_pool_free(struct daxfs_overlay *ovl, u64 pool_off, u32 type)
 {
 	__le64 *head = overlay_free_head(ovl, type);
 	__le64 *link = (__le64 *)(ovl->pool + pool_off);
-	u64 old_head;
+	u64 old_tagged, new_tagged;
 
 	if (!head)
 		return;
 
 	do {
-		old_head = le64_to_cpu(READ_ONCE(*head));
-		WRITE_ONCE(*link, cpu_to_le64(old_head));
+		old_tagged = le64_to_cpu(READ_ONCE(*head));
+		/* Store raw offset in link (not tagged) */
+		if (freelist_is_end(old_tagged))
+			WRITE_ONCE(*link, cpu_to_le64(DAXFS_OVL_FREE_END));
+		else
+			WRITE_ONCE(*link, cpu_to_le64(
+				freelist_offset(old_tagged)));
 		smp_wmb();
+		new_tagged = freelist_make(pool_off, old_tagged);
 	} while (cmpxchg((u64 *)head,
-			 cpu_to_le64(old_head),
-			 cpu_to_le64(pool_off)) != cpu_to_le64(old_head));
+			 cpu_to_le64(old_tagged),
+			 cpu_to_le64(new_tagged)) !=
+		 cpu_to_le64(old_tagged));
 }
 
 /*
@@ -228,24 +271,28 @@ static void overlay_pool_free(struct daxfs_overlay *ovl, u64 pool_off, u32 type)
 static u64 overlay_pool_alloc_free(struct daxfs_overlay *ovl, u32 type)
 {
 	__le64 *head = overlay_free_head(ovl, type);
-	u64 old_head, next;
+	u64 old_tagged, new_tagged, off, next_raw;
 
 	if (!head)
 		return (u64)-1;
 
 	do {
-		old_head = le64_to_cpu(READ_ONCE(*head));
-		if (old_head == DAXFS_OVL_FREE_END)
+		old_tagged = le64_to_cpu(READ_ONCE(*head));
+		if (freelist_is_end(old_tagged))
 			return (u64)-1;
 
+		off = freelist_offset(old_tagged);
 		smp_rmb();
-		next = le64_to_cpu(READ_ONCE(
-			*((__le64 *)(ovl->pool + old_head))));
+		/* Link stores raw offset */
+		next_raw = le64_to_cpu(READ_ONCE(
+			*((__le64 *)(ovl->pool + off))));
+		new_tagged = freelist_make(next_raw, old_tagged);
 	} while (cmpxchg((u64 *)head,
-			 cpu_to_le64(old_head),
-			 cpu_to_le64(next)) != cpu_to_le64(old_head));
+			 cpu_to_le64(old_tagged),
+			 cpu_to_le64(new_tagged)) !=
+		 cpu_to_le64(old_tagged));
 
-	return old_head;
+	return off;
 }
 
 /*

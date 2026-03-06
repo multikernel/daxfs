@@ -155,12 +155,17 @@ phys_addr_t daxfs_mem_phys(struct daxfs_info *info, u64 offset)
  */
 void daxfs_mem_sync(struct daxfs_info *info, void *ptr, size_t size)
 {
-	/*
-	 * For persistent memory with ADR, writes are automatically
-	 * persisted. For other platforms, cache line flushes may be
-	 * needed. Currently a no-op.
-	 */
 	(void)info;
-	(void)ptr;
-	(void)size;
+
+	if (!ptr || !size)
+		return;
+
+	/*
+	 * Ensure all prior stores are globally visible. On platforms
+	 * with ADR/eADR, this is sufficient for persistence. On
+	 * platforms without hardware persistence guarantees, explicit
+	 * cache line flushes (clflush/clwb) would be needed per
+	 * cache line — not yet implemented.
+	 */
+	smp_wmb();
 }

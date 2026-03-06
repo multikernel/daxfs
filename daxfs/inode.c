@@ -52,6 +52,10 @@ struct inode *daxfs_iget(struct super_block *sb, u64 ino)
 	gid_t gid = 0;
 	u32 nlink = 1;
 
+	/* iget_locked takes unsigned long; reject inos that would truncate */
+	if (ino > (u64)(unsigned long)-1)
+		return ERR_PTR(-EOVERFLOW);
+
 	inode = iget_locked(sb, ino);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);

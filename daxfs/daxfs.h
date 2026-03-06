@@ -40,6 +40,8 @@ struct daxfs_pcache {
 	u32 hash_mask;                       /* slot_count - 1 */
 	struct list_head backing_files;      /* List of daxfs_pcache_backing */
 	struct task_struct *fill_thread;     /* Host kthread, NULL for spawn */
+	struct file **backing_array;         /* O(1) lookup by ino, [0..max_ino] */
+	u32 backing_array_size;              /* Number of entries in array */
 };
 
 /*

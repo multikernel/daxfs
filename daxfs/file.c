@@ -25,6 +25,11 @@
  *
  * Resolution order: overlay page → pcache → inline base image data
  *
+ * COW granularity is per-page (4KB). After a partial-page write, only
+ * the written page has an overlay entry; adjacent pages still resolve
+ * through pcache or base image. This is intentional — each page is
+ * independently versioned.
+ *
  * If data comes from pcache, the slot is pinned (refcount incremented).
  * Caller MUST call daxfs_pcache_put_page(info, *pinned_slot) when done.
  * pinned_slot is set to -1 when data does not come from pcache.
@@ -513,13 +518,28 @@ const struct address_space_operations daxfs_aops = {
 	/* Empty - DAX bypasses page cache */
 };
 
+static int daxfs_fsync(struct file *file, loff_t start, loff_t end,
+		       int datasync)
+{
+	struct daxfs_info *info = DAXFS_SB(file_inode(file)->i_sb);
+
+	if (info->overlay) {
+		u64 ovl_offset = le64_to_cpu(info->super->overlay_offset);
+		u64 ovl_size = le64_to_cpu(info->super->overlay_size);
+
+		daxfs_mem_sync(info, daxfs_mem_ptr(info, ovl_offset),
+			       ovl_size);
+	}
+	return 0;
+}
+
 const struct file_operations daxfs_file_ops = {
 	.llseek		= generic_file_llseek,
 	.read_iter	= daxfs_read_iter,
 	.write_iter	= daxfs_write_iter,
 	.splice_read	= copy_splice_read,
 	.mmap		= daxfs_file_mmap,
-	.fsync		= noop_fsync,
+	.fsync		= daxfs_fsync,
 	.unlocked_ioctl	= daxfs_ioctl,
 };
 
