@@ -266,17 +266,28 @@ struct daxfs_ovl_dirlist_entry {
  */
 
 #define DAXFS_PCACHE_MAGIC	0x70636163	/* "pcac" */
-#define DAXFS_PCACHE_VERSION	1
+#define DAXFS_PCACHE_VERSION	2
 
 /* Cache slot states (stored in bits[1:0] of state_tag) */
 #define PCACHE_STATE_FREE	0	/* Slot empty, available */
 #define PCACHE_STATE_PENDING	1	/* Claimed, needs host to fill */
 #define PCACHE_STATE_VALID	2	/* Data ready */
 
-/* Helpers for packed state_tag field */
+/*
+ * Packed state_tag layout (64 bits):
+ *   bits[1:0]  = state (FREE/PENDING/VALID)
+ *   bits[5:2]  = refcount (0-15 concurrent readers)
+ *   bits[63:6] = tag
+ *
+ * Readers CAS-increment refcount to pin a slot during access.
+ * Eviction only succeeds when refcount == 0.
+ */
 #define PCACHE_STATE(v)		((v) & 3)
-#define PCACHE_TAG(v)		((v) >> 2)
-#define PCACHE_MAKE(state, tag)	(((tag) << 2) | (state))
+#define PCACHE_REFCNT(v)	(((v) >> 2) & 0xF)
+#define PCACHE_TAG(v)		((v) >> 6)
+#define PCACHE_MAKE(state, tag)	(((tag) << 6) | (state))
+#define PCACHE_REFCNT_INC	4	/* Add to state_tag to increment refcount */
+#define PCACHE_REFCNT_MAX	15
 
 /* Multi-file tag encoding: tag = (ino << 20) | (pgoff & 0xFFFFF) */
 #define PCACHE_TAG_MAKE(ino, pgoff)	((((__u64)(ino)) << 20) | ((pgoff) & 0xFFFFF))
@@ -304,8 +315,9 @@ struct daxfs_pcache_header {		/* 4KB, at pcache_offset */
 };
 
 struct daxfs_pcache_slot {		/* 16 bytes per slot */
-	__le64 state_tag;		/* bits[1:0] = state, bits[63:2] = tag */
-					/* Packed so cmpxchg atomically sets both */
+	__le64 state_tag;		/* bits[1:0] = state, bits[5:2] = refcount,
+					 * bits[63:6] = tag. Packed so cmpxchg
+					 * atomically updates all three. */
 	__le32 ref_bit;			/* Clock algorithm: recently accessed */
 	__le32 reserved;
 };

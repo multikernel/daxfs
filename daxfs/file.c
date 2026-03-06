@@ -24,13 +24,21 @@
  * Get file data from base image, overlay, or pcache.
  *
  * Resolution order: overlay page → pcache → inline base image data
+ *
+ * If data comes from pcache, the slot is pinned (refcount incremented).
+ * Caller MUST call daxfs_pcache_put_page(info, *pinned_slot) when done.
+ * pinned_slot is set to -1 when data does not come from pcache.
  */
 void *daxfs_base_file_data(struct daxfs_info *info, u64 ino,
-			   loff_t pos, size_t len, size_t *out_len)
+			   loff_t pos, size_t len, size_t *out_len,
+			   s32 *pinned_slot)
 {
 	struct daxfs_base_inode *raw;
 	u64 data_offset, file_size;
 	size_t avail;
+
+	if (pinned_slot)
+		*pinned_slot = -1;
 
 	/* Check overlay first */
 	if (info->overlay) {
@@ -69,7 +77,7 @@ void *daxfs_base_file_data(struct daxfs_info *info, u64 ino,
 		void *page;
 		u32 intra;
 
-		page = daxfs_pcache_get_page(info, ino, pgoff);
+		page = daxfs_pcache_get_page(info, ino, pgoff, pinned_slot);
 		if (IS_ERR(page))
 			return NULL;
 		intra = pcache_off & (PAGE_SIZE - 1);
@@ -106,15 +114,21 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	while (count > 0) {
 		size_t chunk;
 		void *src;
+		s32 pcslot = -1;
 
 		src = daxfs_base_file_data(info, inode->i_ino, pos, count,
-					   &chunk);
-		if (!src || chunk == 0)
+					   &chunk, &pcslot);
+		if (!src || chunk == 0) {
+			daxfs_pcache_put_page(info, pcslot);
 			break;
+		}
 
-		if (copy_to_iter(src, chunk, to) != chunk)
+		if (copy_to_iter(src, chunk, to) != chunk) {
+			daxfs_pcache_put_page(info, pcslot);
 			return total ? total : -EFAULT;
+		}
 
+		daxfs_pcache_put_page(info, pcslot);
 		pos += chunk;
 		count -= chunk;
 		total += chunk;
@@ -162,14 +176,16 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			{
 				size_t base_len;
 				void *base_data;
+				s32 pcslot = -1;
 
 				base_data = daxfs_base_file_data(info,
 					inode->i_ino,
 					(loff_t)pgoff << PAGE_SHIFT,
-					PAGE_SIZE, &base_len);
+					PAGE_SIZE, &base_len, &pcslot);
 				if (base_data && base_len > 0)
 					memcpy(page, base_data,
 					       min(base_len, (size_t)PAGE_SIZE));
+				daxfs_pcache_put_page(info, pcslot);
 			}
 		}
 
@@ -304,11 +320,13 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 				/* COW from base */
 				size_t base_len;
 				void *base;
+				s32 pcslot = -1;
 
 				base = daxfs_base_file_data(info, inode->i_ino,
 							    pos, PAGE_SIZE,
-							    &base_len);
+							    &base_len, &pcslot);
 				daxfs_copy_page(data, base, base_len);
+				daxfs_pcache_put_page(info, pcslot);
 			}
 		}
 		sb_end_pagefault(inode->i_sb);
@@ -325,42 +343,54 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 	}
 
 	/* Read path */
-	data = daxfs_base_file_data(info, inode->i_ino, pos, PAGE_SIZE, &len);
-
-	/*
-	 * MAP_SHARED with page-aligned data: use direct PFN mapping.
-	 * Never use PFN mapping for pcache data (can be evicted).
-	 */
-	if (is_shared && data && IS_ALIGNED((unsigned long)data, PAGE_SIZE) &&
-	    !daxfs_is_pcache_data(info, data)) {
-		pfn = daxfs_data_to_pfn(info, data);
-		if (pfn)
-			return vmf_insert_pfn_prot(vma, vmf->address, pfn,
-						   vma->vm_page_prot);
-	}
-
-	/*
-	 * Fall back to anonymous pages for:
-	 * - MAP_PRIVATE (COW requires struct pages)
-	 * - Non-page-aligned base image data
-	 * - pcache data (can be evicted)
-	 */
 	{
-		struct page *page;
-		void *dst;
+		s32 pcslot = -1;
 
-		page = alloc_page(GFP_HIGHUSER_MOVABLE);
-		if (!page)
-			return VM_FAULT_OOM;
+		data = daxfs_base_file_data(info, inode->i_ino, pos,
+					    PAGE_SIZE, &len, &pcslot);
 
-		dst = kmap_local_page(page);
-		daxfs_copy_page(dst, data, len);
-		kunmap_local(dst);
+		/*
+		 * MAP_SHARED with page-aligned data: use direct PFN mapping.
+		 * Never use PFN mapping for pcache data (can be evicted).
+		 */
+		if (is_shared && data &&
+		    IS_ALIGNED((unsigned long)data, PAGE_SIZE) &&
+		    !daxfs_is_pcache_data(info, data)) {
+			daxfs_pcache_put_page(info, pcslot);
+			pfn = daxfs_data_to_pfn(info, data);
+			if (pfn)
+				return vmf_insert_pfn_prot(vma, vmf->address,
+							   pfn,
+							   vma->vm_page_prot);
+		}
 
-		__SetPageUptodate(page);
-		lock_page(page);
-		vmf->page = page;
-		return VM_FAULT_LOCKED;
+		/*
+		 * Fall back to anonymous pages for:
+		 * - MAP_PRIVATE (COW requires struct pages)
+		 * - Non-page-aligned base image data
+		 * - pcache data (can be evicted)
+		 */
+		{
+			struct page *page;
+			void *dst;
+
+			page = alloc_page(GFP_HIGHUSER_MOVABLE);
+			if (!page) {
+				daxfs_pcache_put_page(info, pcslot);
+				return VM_FAULT_OOM;
+			}
+
+			dst = kmap_local_page(page);
+			daxfs_copy_page(dst, data, len);
+			kunmap_local(dst);
+
+			daxfs_pcache_put_page(info, pcslot);
+
+			__SetPageUptodate(page);
+			lock_page(page);
+			vmf->page = page;
+			return VM_FAULT_LOCKED;
+		}
 	}
 }
 
@@ -387,10 +417,13 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 		if (data) {
 			size_t base_len;
 			void *base;
+			s32 pcslot = -1;
 
 			base = daxfs_base_file_data(info, inode->i_ino,
-						    pos, PAGE_SIZE, &base_len);
+						    pos, PAGE_SIZE,
+						    &base_len, &pcslot);
 			daxfs_copy_page(data, base, base_len);
+			daxfs_pcache_put_page(info, pcslot);
 		}
 	}
 	sb_end_pagefault(inode->i_sb);

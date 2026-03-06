@@ -127,7 +127,8 @@ extern long daxfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 
 /* file.c - base image data access */
 extern void *daxfs_base_file_data(struct daxfs_info *info, u64 ino,
-				  loff_t pos, size_t len, size_t *out_len);
+				  loff_t pos, size_t len, size_t *out_len,
+				  s32 *pinned_slot);
 
 /* inode.c */
 extern struct inode *daxfs_alloc_inode(struct super_block *sb);
@@ -199,7 +200,8 @@ static inline bool daxfs_valid_base_offset(struct daxfs_info *info,
 extern int daxfs_pcache_init(struct daxfs_info *info, const char *backing_path);
 extern void daxfs_pcache_exit(struct daxfs_info *info);
 extern void *daxfs_pcache_get_page(struct daxfs_info *info, u64 ino,
-				   u64 pgoff);
+				   u64 pgoff, s32 *pinned_slot);
+extern void daxfs_pcache_put_page(struct daxfs_info *info, s32 slot_idx);
 extern bool daxfs_is_pcache_data(struct daxfs_info *info, void *ptr);
 extern int daxfs_pcache_add_backing(struct daxfs_info *info, u64 ino,
 				    const char *path);
