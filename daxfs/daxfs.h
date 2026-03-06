@@ -235,6 +235,8 @@ extern int daxfs_overlay_iterate_dir(struct daxfs_info *info,
 				     u64 parent_ino,
 				     struct dir_context *ctx,
 				     loff_t *pos);
+extern bool daxfs_overlay_dir_has_entries(struct daxfs_info *info,
+					  u64 parent_ino);
 
 /* validate.c - image validation for untrusted images */
 extern int daxfs_validate_super(struct daxfs_info *info);

@@ -200,14 +200,17 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	/* Update inode size if extending */
 	if (pos > inode->i_size) {
 		struct daxfs_ovl_inode_entry *oie;
-		struct daxfs_ovl_inode_entry ie;
 
 		inode->i_size = pos;
 		oie = daxfs_overlay_get_inode(info, inode->i_ino);
 		if (oie) {
-			ie = *oie;
-			ie.size = cpu_to_le64(pos);
-			daxfs_overlay_set_inode(info, inode->i_ino, &ie);
+			/*
+			 * Atomic field update: only touch size, not other
+			 * fields. Avoids lost-update race where a concurrent
+			 * setattr (mode/uid/gid change) gets overwritten.
+			 */
+			WRITE_ONCE(oie->size, cpu_to_le64(pos));
+			smp_wmb();
 		}
 	}
 
@@ -233,32 +236,44 @@ static int daxfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (ret)
 		return ret;
 
-	/* Get current overlay inode or build from VFS inode */
+	/*
+	 * If overlay inode exists, update individual fields in-place.
+	 * Each WRITE_ONCE is atomic for its field width, so concurrent
+	 * setattr calls touching different fields won't clobber each other.
+	 */
 	existing = daxfs_overlay_get_inode(info, inode->i_ino);
 	if (existing) {
-		ie = *existing;
+		if (attr->ia_valid & ATTR_SIZE)
+			WRITE_ONCE(existing->size, cpu_to_le64(attr->ia_size));
+		if (attr->ia_valid & ATTR_MODE)
+			WRITE_ONCE(existing->mode, cpu_to_le32(attr->ia_mode));
+		if (attr->ia_valid & ATTR_UID)
+			WRITE_ONCE(existing->uid, cpu_to_le32(
+				from_kuid(&init_user_ns, attr->ia_uid)));
+		if (attr->ia_valid & ATTR_GID)
+			WRITE_ONCE(existing->gid, cpu_to_le32(
+				from_kgid(&init_user_ns, attr->ia_gid)));
+		smp_wmb();
 	} else {
+		/* No overlay inode yet — create from VFS state + changes */
 		ie.type = cpu_to_le32(DAXFS_OVL_INODE);
-		ie.mode = cpu_to_le32(inode->i_mode);
-		ie.uid = cpu_to_le32(from_kuid(&init_user_ns, inode->i_uid));
-		ie.gid = cpu_to_le32(from_kgid(&init_user_ns, inode->i_gid));
-		ie.size = cpu_to_le64(inode->i_size);
+		ie.mode = cpu_to_le32((attr->ia_valid & ATTR_MODE) ?
+			attr->ia_mode : inode->i_mode);
+		ie.uid = cpu_to_le32(from_kuid(&init_user_ns,
+			(attr->ia_valid & ATTR_UID) ?
+			attr->ia_uid : inode->i_uid));
+		ie.gid = cpu_to_le32(from_kgid(&init_user_ns,
+			(attr->ia_valid & ATTR_GID) ?
+			attr->ia_gid : inode->i_gid));
+		ie.size = cpu_to_le64((attr->ia_valid & ATTR_SIZE) ?
+			attr->ia_size : inode->i_size);
 		ie.nlink = cpu_to_le32(inode->i_nlink);
 		ie.flags = 0;
+
+		ret = daxfs_overlay_set_inode(info, inode->i_ino, &ie);
+		if (ret)
+			return ret;
 	}
-
-	if (attr->ia_valid & ATTR_SIZE)
-		ie.size = cpu_to_le64(attr->ia_size);
-	if (attr->ia_valid & ATTR_MODE)
-		ie.mode = cpu_to_le32(attr->ia_mode);
-	if (attr->ia_valid & ATTR_UID)
-		ie.uid = cpu_to_le32(from_kuid(&init_user_ns, attr->ia_uid));
-	if (attr->ia_valid & ATTR_GID)
-		ie.gid = cpu_to_le32(from_kgid(&init_user_ns, attr->ia_gid));
-
-	ret = daxfs_overlay_set_inode(info, inode->i_ino, &ie);
-	if (ret)
-		return ret;
 
 	setattr_copy(idmap, inode, attr);
 	return 0;

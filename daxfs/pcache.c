@@ -97,10 +97,17 @@ static int pcache_fill_slot(struct daxfs_pcache *pc, u32 slot_idx, u64 tag)
 	if (n < 0) {
 		pr_err_ratelimited("daxfs: pcache read error ino=%llu pgoff=%llu: %zd\n",
 				   ino, pgoff, n);
-		memset(dst, 0, PAGE_SIZE);
-	} else if (n < PAGE_SIZE) {
-		memset(dst + n, 0, PAGE_SIZE - n);
+		/* Revert to FREE so the slot can be retried later */
+		old_val = PCACHE_MAKE(PCACHE_STATE_PENDING, tag);
+		new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
+		if (slot_cmpxchg(&pc->slots[slot_idx], old_val, new_val) ==
+		    old_val)
+			pcache_dec_pending(pc->header);
+		return (int)n;
 	}
+
+	if (n < PAGE_SIZE)
+		memset(dst + n, 0, PAGE_SIZE - n);
 
 	smp_wmb();
 

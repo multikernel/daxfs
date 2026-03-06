@@ -888,6 +888,44 @@ static bool overlay_emit_dirent(struct daxfs_ovl_dirent_entry *de,
 }
 
 /*
+ * Check if a directory has any non-tombstone overlay entries.
+ * Returns true if at least one live entry exists.
+ */
+bool daxfs_overlay_dir_has_entries(struct daxfs_info *info, u64 parent_ino)
+{
+	struct daxfs_overlay *ovl = info->overlay;
+	u64 key;
+	struct daxfs_ovl_dirlist_entry *dl;
+	u64 off;
+	int limit = 1 << 20;
+
+	if (!ovl)
+		return false;
+
+	key = DAXFS_OVL_KEY_DIRLIST(parent_ino);
+	dl = overlay_lookup(ovl, info, key);
+	if (!dl)
+		return false;
+
+	off = le64_to_cpu(READ_ONCE(dl->first));
+
+	while (off != DAXFS_OVL_NO_NEXT && limit-- > 0) {
+		struct daxfs_ovl_dirent_entry *de;
+
+		smp_rmb();
+		de = ovl->pool + off;
+
+		if (le64_to_cpu(de->parent_ino) == parent_ino &&
+		    !(le32_to_cpu(de->flags) & DAXFS_OVL_DIRENT_TOMBSTONE))
+			return true;
+
+		off = le64_to_cpu(READ_ONCE(de->dir_next));
+	}
+
+	return false;
+}
+
+/*
  * Iterate overlay directory entries for readdir.
  *
  * Uses the per-directory dirent list (DIRLIST → dir_next chain) for

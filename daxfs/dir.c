@@ -233,9 +233,48 @@ static int daxfs_unlink(struct inode *dir, struct dentry *dentry)
 	return 0;
 }
 
+/*
+ * Check if a directory is empty (no live children in base image or overlay).
+ * Base image entries that have overlay tombstones are considered deleted.
+ */
+static bool daxfs_dir_is_empty(struct daxfs_info *info, struct inode *dir)
+{
+	struct daxfs_dirent *dirents;
+	u32 dirent_count, i;
+
+	/* Check base image entries (skip tombstoned ones) */
+	dirents = daxfs_get_base_dirents(info, dir->i_ino, &dirent_count);
+	for (i = 0; i < dirent_count; i++) {
+		struct daxfs_dirent *de = &dirents[i];
+		u16 name_len = le16_to_cpu(de->name_len);
+
+		if (info->overlay) {
+			struct daxfs_ovl_dirent_entry *ode;
+
+			ode = daxfs_overlay_lookup_dirent(info, dir->i_ino,
+							  de->name, name_len);
+			if (ode && (le32_to_cpu(ode->flags) &
+				    DAXFS_OVL_DIRENT_TOMBSTONE))
+				continue;
+		}
+		return false;
+	}
+
+	/* Check overlay entries */
+	if (daxfs_overlay_dir_has_entries(info, dir->i_ino))
+		return false;
+
+	return true;
+}
+
 static int daxfs_rmdir(struct inode *dir, struct dentry *dentry)
 {
-	/* TODO: check if directory is empty (base + overlay) */
+	struct daxfs_info *info = DAXFS_SB(dir->i_sb);
+	struct inode *inode = d_inode(dentry);
+
+	if (!daxfs_dir_is_empty(info, inode))
+		return -ENOTEMPTY;
+
 	return daxfs_unlink(dir, dentry);
 }
 
