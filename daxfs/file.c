@@ -131,9 +131,6 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	size_t count = iov_iter_count(to);
 	size_t total = 0;
 
-	/* Pick up size changes from other hosts */
-	daxfs_refresh_isize(inode, info);
-
 	if (pos >= inode->i_size)
 		return 0;
 
@@ -203,7 +200,7 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 			/* COW: copy existing data into new page */
 			{
-				size_t base_len;
+				size_t base_len = 0;
 				void *base_data;
 				s32 pcslot = -1;
 
@@ -215,6 +212,15 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 					memcpy(page, base_data,
 					       min(base_len, (size_t)PAGE_SIZE));
 				daxfs_pcache_put_page(info, pcslot);
+
+				/*
+				 * Zero unwritten portion only for partial
+				 * writes; full-page writes will be fully
+				 * overwritten by copy_from_iter below.
+				 */
+				if (chunk < PAGE_SIZE && base_len < PAGE_SIZE)
+					memset(page + base_len, 0,
+					       PAGE_SIZE - base_len);
 			}
 		}
 
@@ -346,9 +352,6 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 	void *data;
 	size_t len;
 	unsigned long pfn;
-
-	/* Pick up size changes from other hosts */
-	daxfs_refresh_isize(inode, info);
 
 	if (!is_write && pos >= inode->i_size)
 		return VM_FAULT_SIGBUS;
@@ -560,7 +563,14 @@ static int daxfs_fsync(struct file *file, loff_t start, loff_t end,
 	return 0;
 }
 
+static int daxfs_file_open(struct inode *inode, struct file *file)
+{
+	daxfs_refresh_isize(inode, DAXFS_SB(inode->i_sb));
+	return 0;
+}
+
 const struct file_operations daxfs_file_ops = {
+	.open		= daxfs_file_open,
 	.llseek		= generic_file_llseek,
 	.read_iter	= daxfs_read_iter,
 	.write_iter	= daxfs_write_iter,
@@ -570,7 +580,18 @@ const struct file_operations daxfs_file_ops = {
 	.unlocked_ioctl	= daxfs_ioctl,
 };
 
+static int daxfs_getattr(struct mnt_idmap *idmap,
+			 const struct path *path, struct kstat *stat,
+			 u32 request_mask, unsigned int query_flags)
+{
+	struct inode *inode = d_inode(path->dentry);
+
+	daxfs_refresh_isize(inode, DAXFS_SB(inode->i_sb));
+	generic_fillattr(idmap, request_mask, inode, stat);
+	return 0;
+}
+
 const struct inode_operations daxfs_file_inode_ops = {
-	.getattr	= simple_getattr,
+	.getattr	= daxfs_getattr,
 	.setattr	= daxfs_setattr,
 };

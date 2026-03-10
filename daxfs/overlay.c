@@ -525,7 +525,6 @@ void *daxfs_overlay_alloc_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 	de = ovl->pool + pool_off;
 	de->type = cpu_to_le32(DAXFS_OVL_DATA);
 	de->reserved = 0;
-	memset(de->data, 0, PAGE_SIZE);
 
 	ret = overlay_insert(ovl, key, pool_off, NULL, false);
 	if (ret == -EEXIST) {
