@@ -1345,9 +1345,9 @@ int main(int argc, char *argv[])
 	} else if (phys_addr) {
 		int fd;
 
-		fd = open("/dev/mem", O_RDWR | O_SYNC);
+		fd = open("/dev/lazy_cma", O_RDWR | O_SYNC);
 		if (fd < 0) {
-			perror("/dev/mem");
+			perror("/dev/lazy_cma");
 			return 1;
 		}
 
