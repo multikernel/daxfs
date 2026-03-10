@@ -49,6 +49,21 @@ struct dma_heap_allocation_data {
 #define DMA_HEAP_IOCTL_ALLOC	_IOWR(DMA_HEAP_IOC_MAGIC, 0x0, \
 				      struct dma_heap_allocation_data)
 
+/* From lazy_cma.h */
+#define LAZY_CMA_IOC_MAGIC	'H'
+#define LAZY_CMA_NAME_MAX	64
+
+struct lazy_cma_allocation_data {
+	uint64_t len;
+	uint64_t phys_addr;
+	int32_t node;
+	uint32_t pad;
+	char name[LAZY_CMA_NAME_MAX];
+};
+
+#define LAZY_CMA_IOCTL_ALLOC	_IOWR(LAZY_CMA_IOC_MAGIC, 0x0, \
+				      struct lazy_cma_allocation_data)
+
 #define ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
 struct file_entry {
@@ -1087,7 +1102,7 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  -H, --heap PATH        Allocate from DMA heap (e.g., /dev/dma_heap/multikernel)\n");
 	fprintf(stderr, "  -m, --mountpoint DIR   Mount after creating (required with -H)\n");
 	fprintf(stderr, "  -D, --dax PATH         Use device for DAX storage (e.g., /dev/dax0.0, /dev/lazy_cma)\n");
-	fprintf(stderr, "  -p, --phys ADDR        Physical address offset (required for non-DAX devices like /dev/lazy_cma)\n");
+	fprintf(stderr, "  -p, --phys ADDR        Use pre-existing physical address (skip auto-detection/allocation)\n");
 	fprintf(stderr, "  -s, --size SIZE        Override allocation size (default: auto-calculated)\n");
 	fprintf(stderr, "  -V, --validate         Validate image on mount\n");
 	fprintf(stderr, "  -C, --pcache-slots N   Page cache slot count (power of 2)\n");
@@ -1107,7 +1122,8 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/mk -m /mnt -o /data/rootfs.img\n", prog);
 	fprintf(stderr, "  %s --empty -H /dev/dma_heap/mk -m /mnt -s 256M\n", prog);
 	fprintf(stderr, "  %s -d /path/to/rootfs -D /dev/dax0.0 -m /mnt\n", prog);
-	fprintf(stderr, "  %s -d /path/to/rootfs -D /dev/lazy_cma -p 0x100000000\n", prog);
+	fprintf(stderr, "  %s -d /path/to/rootfs -D /dev/lazy_cma -m /mnt -s 256M\n", prog);
+	fprintf(stderr, "  %s -d /path/to/rootfs -D /dev/mem -p 0x100000000 -s 256M\n", prog);
 }
 
 int main(int argc, char *argv[])
@@ -1263,12 +1279,6 @@ int main(int argc, char *argv[])
 
 	if (heap_path && !mountpoint) {
 		fprintf(stderr, "Error: -m/--mountpoint is required with -H/--heap\n");
-		print_usage(argv[0]);
-		return 1;
-	}
-
-	if (phys_addr && !dax_path) {
-		fprintf(stderr, "Error: -p/--phys requires -D/--dax (e.g., -D /dev/lazy_cma -p 0x...)\n");
 		print_usage(argv[0]);
 		return 1;
 	}
@@ -1483,7 +1493,6 @@ int main(int argc, char *argv[])
 		unsigned long long dax_phys = 0;
 		size_t dax_size = 0;
 		bool is_dax_device;
-		off_t mmap_offset = 0;
 		int fd;
 
 		is_dax_device = (dax_device_info(dax_path, &dax_phys, &dax_size) == 0);
@@ -1505,28 +1514,64 @@ int main(int argc, char *argv[])
 					max_size, dax_size);
 				return 1;
 			}
+
+			fd = open(dax_path, O_RDWR);
+			if (fd < 0) {
+				perror(dax_path);
+				return 1;
+			}
+
+			mem = mmap(NULL, max_size, PROT_READ | PROT_WRITE,
+				   MAP_SHARED, fd, 0);
+			close(fd);
+		} else if (phys_addr) {
+			/* Pre-existing physical address (e.g. /dev/mem, FPGA BAR) */
+			dax_phys = phys_addr;
+
+			fd = open(dax_path, O_RDWR | O_SYNC);
+			if (fd < 0) {
+				perror(dax_path);
+				return 1;
+			}
+
+			printf("Device %s: mapping at phys=0x%llx\n",
+			       dax_path, dax_phys);
+
+			mem = mmap(NULL, max_size, PROT_READ | PROT_WRITE,
+				   MAP_SHARED, fd, dax_phys);
+			close(fd);
 		} else {
-			/* Non-DAX device (e.g. /dev/lazy_cma): need -p for phys addr */
-			if (!phys_addr) {
-				fprintf(stderr, "Error: %s is not a DAX device, -p/--phys is required\n",
+			/* Allocator device (e.g. /dev/lazy_cma): alloc via ioctl, then mmap */
+			struct lazy_cma_allocation_data alloc = { 0 };
+
+			if (!max_size) {
+				fprintf(stderr, "Error: -s/--size is required with %s\n",
 					dax_path);
 				return 1;
 			}
-			dax_phys = phys_addr;
-			mmap_offset = phys_addr;
-			printf("Device %s: mapping at phys=0x%llx\n",
-			       dax_path, dax_phys);
-		}
 
-		fd = open(dax_path, O_RDWR);
-		if (fd < 0) {
-			perror(dax_path);
-			return 1;
-		}
+			fd = open(dax_path, O_RDWR | O_SYNC);
+			if (fd < 0) {
+				perror(dax_path);
+				return 1;
+			}
 
-		mem = mmap(NULL, max_size, PROT_READ | PROT_WRITE,
-			   MAP_SHARED, fd, mmap_offset);
-		close(fd);
+			alloc.len = max_size;
+			alloc.node = -1;
+			snprintf(alloc.name, sizeof(alloc.name), "daxfs");
+			if (ioctl(fd, LAZY_CMA_IOCTL_ALLOC, &alloc) < 0) {
+				perror("LAZY_CMA_IOCTL_ALLOC");
+				close(fd);
+				return 1;
+			}
+			dax_phys = alloc.phys_addr;
+			printf("Allocated %zu bytes from %s at phys=0x%llx\n",
+			       max_size, dax_path, dax_phys);
+
+			mem = mmap(NULL, max_size, PROT_READ | PROT_WRITE,
+				   MAP_SHARED, fd, dax_phys);
+			close(fd);
+		}
 
 		if (mem == MAP_FAILED) {
 			perror("mmap");
