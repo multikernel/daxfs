@@ -21,12 +21,14 @@ struct inode *daxfs_alloc_inode(struct super_block *sb)
 
 	di->raw = NULL;
 	di->data_offset = 0;
+	xa_init(&di->ovl_pages);
 
 	return &di->vfs_inode;
 }
 
 void daxfs_free_inode(struct inode *inode)
 {
+	xa_destroy(&DAXFS_I(inode)->ovl_pages);
 	kmem_cache_free(daxfs_inode_cachep, DAXFS_I(inode));
 }
 

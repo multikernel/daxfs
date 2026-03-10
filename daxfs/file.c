@@ -55,21 +55,47 @@ static void daxfs_refresh_isize(struct inode *inode, struct daxfs_info *info)
  * Caller MUST call daxfs_pcache_put_page(info, *pinned_slot) when done.
  * pinned_slot is set to -1 when data does not come from pcache.
  */
-void *daxfs_base_file_data(struct daxfs_info *info, u64 ino,
+/*
+ * Look up an overlay page, checking the per-inode DRAM cache first.
+ * On cache miss, falls back to the DAX hash table and caches the result.
+ */
+static void *daxfs_overlay_get_page_cached(struct daxfs_info *info,
+					   struct inode *inode, u64 pgoff)
+{
+	struct daxfs_inode_info *di = DAXFS_I(inode);
+	void *page;
+
+	/* Fast path: check local DRAM cache */
+	page = xa_load(&di->ovl_pages, pgoff);
+	if (page)
+		return page;
+
+	/* Slow path: DAX hash lookup */
+	page = daxfs_overlay_get_page(info, inode->i_ino, pgoff);
+	if (page)
+		xa_store(&di->ovl_pages, pgoff, page, GFP_ATOMIC);
+
+	return page;
+}
+
+void *daxfs_base_file_data(struct daxfs_info *info,
+			   struct inode *inode,
 			   loff_t pos, size_t len, size_t *out_len,
 			   s32 *pinned_slot)
 {
 	struct daxfs_base_inode *raw;
+	u64 ino = inode->i_ino;
 	u64 data_offset, file_size;
 	size_t avail;
 
 	if (pinned_slot)
 		*pinned_slot = -1;
 
-	/* Check overlay first */
+	/* Check overlay first (with local DRAM cache) */
 	if (info->overlay) {
 		u64 pgoff = pos >> PAGE_SHIFT;
-		void *page = daxfs_overlay_get_page(info, ino, pgoff);
+		void *page = daxfs_overlay_get_page_cached(info, inode,
+							   pgoff);
 
 		if (page) {
 			u32 intra = pos & (PAGE_SIZE - 1);
@@ -142,7 +168,7 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		void *src;
 		s32 pcslot = -1;
 
-		src = daxfs_base_file_data(info, inode->i_ino, pos, count,
+		src = daxfs_base_file_data(info, inode, pos, count,
 					   &chunk, &pcslot);
 		if (!src || chunk == 0) {
 			daxfs_pcache_put_page(info, pcslot);
@@ -190,7 +216,7 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		size_t chunk = min(len, (size_t)(PAGE_SIZE - intra));
 		void *page;
 
-		page = daxfs_overlay_get_page(info, inode->i_ino, pgoff);
+		page = daxfs_overlay_get_page_cached(info, inode, pgoff);
 		if (!page) {
 			/* Allocate new overlay page, COW from base */
 			page = daxfs_overlay_alloc_page(info, inode->i_ino,
@@ -198,14 +224,14 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			if (!page)
 				return total ? total : -ENOSPC;
 
-			/* COW: copy existing data into new page */
+			/* COW: copy existing data BEFORE caching the page */
 			{
 				size_t base_len = 0;
 				void *base_data;
 				s32 pcslot = -1;
 
 				base_data = daxfs_base_file_data(info,
-					inode->i_ino,
+					inode,
 					(loff_t)pgoff << PAGE_SHIFT,
 					PAGE_SIZE, &base_len, &pcslot);
 				if (base_data && base_len > 0)
@@ -222,6 +248,10 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 					memset(page + base_len, 0,
 					       PAGE_SIZE - base_len);
 			}
+
+			/* Cache after COW is complete */
+			xa_store(&DAXFS_I(inode)->ovl_pages, pgoff, page,
+				 GFP_KERNEL);
 		}
 
 		if (copy_from_iter(page + intra, chunk, from) != chunk)
@@ -366,21 +396,23 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 		u64 pgoff = pos >> PAGE_SHIFT;
 
 		sb_start_pagefault(inode->i_sb);
-		data = daxfs_overlay_get_page(info, inode->i_ino, pgoff);
+		data = daxfs_overlay_get_page_cached(info, inode, pgoff);
 		if (!data) {
 			data = daxfs_overlay_alloc_page(info, inode->i_ino,
 							pgoff);
 			if (data) {
-				/* COW from base */
+				/* COW from base BEFORE caching */
 				size_t base_len;
 				void *base;
 				s32 pcslot = -1;
 
-				base = daxfs_base_file_data(info, inode->i_ino,
+				base = daxfs_base_file_data(info, inode,
 							    pos, PAGE_SIZE,
 							    &base_len, &pcslot);
 				daxfs_copy_page(data, base, base_len);
 				daxfs_pcache_put_page(info, pcslot);
+				xa_store(&DAXFS_I(inode)->ovl_pages, pgoff,
+					 data, GFP_KERNEL);
 			}
 		}
 		sb_end_pagefault(inode->i_sb);
@@ -400,7 +432,7 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 	{
 		s32 pcslot = -1;
 
-		data = daxfs_base_file_data(info, inode->i_ino, pos,
+		data = daxfs_base_file_data(info, inode, pos,
 					    PAGE_SIZE, &len, &pcslot);
 
 		/*
@@ -465,7 +497,7 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 		return VM_FAULT_SIGBUS;
 
 	sb_start_pagefault(inode->i_sb);
-	data = daxfs_overlay_get_page(info, inode->i_ino, pgoff);
+	data = daxfs_overlay_get_page_cached(info, inode, pgoff);
 	if (!data) {
 		data = daxfs_overlay_alloc_page(info, inode->i_ino, pgoff);
 		if (data) {
@@ -473,11 +505,13 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 			void *base;
 			s32 pcslot = -1;
 
-			base = daxfs_base_file_data(info, inode->i_ino,
+			base = daxfs_base_file_data(info, inode,
 						    pos, PAGE_SIZE,
 						    &base_len, &pcslot);
 			daxfs_copy_page(data, base, base_len);
 			daxfs_pcache_put_page(info, pcslot);
+			xa_store(&DAXFS_I(inode)->ovl_pages, pgoff, data,
+				 GFP_KERNEL);
 		}
 	}
 	sb_end_pagefault(inode->i_sb);

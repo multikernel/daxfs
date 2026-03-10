@@ -17,6 +17,7 @@
 #endif
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/xarray.h>
 #include "daxfs_format.h"
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0)
@@ -101,6 +102,7 @@ struct daxfs_inode_info {
 	struct inode vfs_inode;		/* VFS inode (must be first) */
 	struct daxfs_base_inode *raw;	/* On-disk inode (base image) */
 	u64 data_offset;		/* Cached data offset */
+	struct xarray ovl_pages;	/* Local cache: pgoff → overlay page ptr */
 };
 
 static inline struct daxfs_info *DAXFS_SB(struct super_block *sb)
@@ -128,7 +130,8 @@ extern const struct address_space_operations daxfs_aops;
 extern long daxfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 
 /* file.c - base image data access */
-extern void *daxfs_base_file_data(struct daxfs_info *info, u64 ino,
+extern void *daxfs_base_file_data(struct daxfs_info *info,
+				  struct inode *inode,
 				  loff_t pos, size_t len, size_t *out_len,
 				  s32 *pinned_slot);
 
