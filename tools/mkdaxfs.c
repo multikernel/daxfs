@@ -5,13 +5,15 @@
  * Copyright (C) 2026 Multikernel Technologies, Inc. All rights reserved.
  *
  * Creates a daxfs image from a directory tree. Can write to a file,
- * directly to physical memory via /dev/mem, or allocate from a DMA
- * heap and mount immediately.
+ * directly to physical memory via /dev/mem, allocate from a DMA
+ * heap, or use a Device-DAX device (e.g., CXL memory) and mount
+ * immediately.
  *
  * Modes:
  *   Static:  mkdaxfs -d /path/to/rootfs -o image.daxfs
  *   Split:   mkdaxfs -d /path/to/rootfs -H /dev/dma_heap/mk -m /mnt -o /data/rootfs.img
  *   Empty:   mkdaxfs --empty -H /dev/dma_heap/mk -m /mnt -s 256M
+ *   DAX:     mkdaxfs -d /path/to/rootfs -D /dev/dax0.0 -m /mnt
  */
 
 #define _GNU_SOURCE
@@ -913,6 +915,128 @@ static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint,
 	return 0;
 }
 
+static int mount_daxfs_phys(unsigned long long phys_addr, size_t size,
+			    const char *mountpoint, bool writable, bool validate,
+			    const char *backing_path, const char *export_path)
+{
+	int fs_fd, mnt_fd;
+	char buf[64];
+
+	fs_fd = sys_fsopen("daxfs", 0);
+	if (fs_fd < 0) {
+		perror("fsopen(daxfs)");
+		return -1;
+	}
+
+	snprintf(buf, sizeof(buf), "0x%llx", phys_addr);
+	if (sys_fsconfig(fs_fd, FSCONFIG_SET_STRING, "phys", buf, 0) < 0) {
+		perror("fsconfig(phys)");
+		close(fs_fd);
+		return -1;
+	}
+
+	snprintf(buf, sizeof(buf), "%zu", size);
+	if (sys_fsconfig(fs_fd, FSCONFIG_SET_STRING, "size", buf, 0) < 0) {
+		perror("fsconfig(size)");
+		close(fs_fd);
+		return -1;
+	}
+
+	if (backing_path) {
+		if (sys_fsconfig(fs_fd, FSCONFIG_SET_STRING, "backing",
+				 backing_path, 0) < 0) {
+			perror("fsconfig(backing)");
+			close(fs_fd);
+			return -1;
+		}
+	}
+
+	if (export_path) {
+		if (sys_fsconfig(fs_fd, FSCONFIG_SET_STRING, "export",
+				 export_path, 0) < 0) {
+			perror("fsconfig(export)");
+			close(fs_fd);
+			return -1;
+		}
+	}
+
+	if (validate) {
+		if (sys_fsconfig(fs_fd, FSCONFIG_SET_FLAG, "validate", NULL, 0) < 0) {
+			perror("fsconfig(validate)");
+			close(fs_fd);
+			return -1;
+		}
+	}
+
+	if (sys_fsconfig(fs_fd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) < 0) {
+		perror("fsconfig(FSCONFIG_CMD_CREATE)");
+		close(fs_fd);
+		return -1;
+	}
+
+	mnt_fd = sys_fsmount(fs_fd, 0, writable ? 0 : MOUNT_ATTR_RDONLY);
+	if (mnt_fd < 0) {
+		perror("fsmount");
+		close(fs_fd);
+		return -1;
+	}
+	close(fs_fd);
+
+	if (sys_move_mount(mnt_fd, "", AT_FDCWD, mountpoint,
+			   MOVE_MOUNT_F_EMPTY_PATH) < 0) {
+		perror("move_mount");
+		close(mnt_fd);
+		return -1;
+	}
+	close(mnt_fd);
+
+	return 0;
+}
+
+/*
+ * Read physical address and size of a Device-DAX device from sysfs.
+ * For /dev/daxX.Y, reads /sys/bus/dax/devices/daxX.Y/resource and size.
+ * Returns 0 on success, -1 if not a DAX device (no sysfs entry).
+ */
+static int dax_device_info(const char *dev_path, unsigned long long *phys_out,
+			   size_t *size_out)
+{
+	const char *devname;
+	char sysfs_path[PATH_MAX];
+	char buf[64];
+	FILE *f;
+
+	/* Extract device name: "/dev/dax0.0" -> "dax0.0" */
+	devname = strrchr(dev_path, '/');
+	devname = devname ? devname + 1 : dev_path;
+
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/bus/dax/devices/%s/resource", devname);
+	f = fopen(sysfs_path, "r");
+	if (!f)
+		return -1;
+	if (!fgets(buf, sizeof(buf), f)) {
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+	*phys_out = strtoull(buf, NULL, 0);
+
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/bus/dax/devices/%s/size", devname);
+	f = fopen(sysfs_path, "r");
+	if (!f)
+		return -1;
+	if (!fgets(buf, sizeof(buf), f)) {
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+	*size_out = strtoull(buf, NULL, 0);
+
+	return 0;
+}
+
 /*
  * Write static daxfs image (read-only, no overlay)
  * Layout: [Superblock (4KB)] [Base Image (no sub-header)]
@@ -962,7 +1086,8 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  -o, --output FILE      Output file (backing file in split mode)\n");
 	fprintf(stderr, "  -H, --heap PATH        Allocate from DMA heap (e.g., /dev/dma_heap/multikernel)\n");
 	fprintf(stderr, "  -m, --mountpoint DIR   Mount after creating (required with -H)\n");
-	fprintf(stderr, "  -p, --phys ADDR        Write to physical address via /dev/mem\n");
+	fprintf(stderr, "  -D, --dax PATH         Use device for DAX storage (e.g., /dev/dax0.0, /dev/lazy_cma)\n");
+	fprintf(stderr, "  -p, --phys ADDR        Physical address offset (required for non-DAX devices like /dev/lazy_cma)\n");
 	fprintf(stderr, "  -s, --size SIZE        Override allocation size (default: auto-calculated)\n");
 	fprintf(stderr, "  -V, --validate         Validate image on mount\n");
 	fprintf(stderr, "  -C, --pcache-slots N   Page cache slot count (power of 2)\n");
@@ -973,7 +1098,7 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  -h, --help             Show this help\n");
 	fprintf(stderr, "\nBy default, creates a static read-only image.\n");
 	fprintf(stderr, "Use -O/--overlay to add a writable overlay region.\n");
-	fprintf(stderr, "\nSplit mode: when both -H/-p AND -o are given, metadata+overlay+cache go to DAX\n");
+	fprintf(stderr, "\nSplit mode: when both -H/-D AND -o are given, metadata+overlay+cache go to DAX\n");
 	fprintf(stderr, "and file data goes to the backing file (-o). Overlay is auto-enabled.\n");
 	fprintf(stderr, "\nEmpty mode: creates a writable filesystem with no base image.\n");
 	fprintf(stderr, "\nExamples:\n");
@@ -981,7 +1106,8 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/system -m /mnt\n", prog);
 	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/mk -m /mnt -o /data/rootfs.img\n", prog);
 	fprintf(stderr, "  %s --empty -H /dev/dma_heap/mk -m /mnt -s 256M\n", prog);
-	fprintf(stderr, "  %s -d /path/to/rootfs -p 0x100000000\n", prog);
+	fprintf(stderr, "  %s -d /path/to/rootfs -D /dev/dax0.0 -m /mnt\n", prog);
+	fprintf(stderr, "  %s -d /path/to/rootfs -D /dev/lazy_cma -p 0x100000000\n", prog);
 }
 
 int main(int argc, char *argv[])
@@ -990,6 +1116,7 @@ int main(int argc, char *argv[])
 		{"directory", required_argument, 0, 'd'},
 		{"output", required_argument, 0, 'o'},
 		{"heap", required_argument, 0, 'H'},
+		{"dax", required_argument, 0, 'D'},
 		{"mountpoint", required_argument, 0, 'm'},
 		{"phys", required_argument, 0, 'p'},
 		{"size", required_argument, 0, 's'},
@@ -1006,6 +1133,7 @@ int main(int argc, char *argv[])
 	char *src_dir = NULL;
 	char *output_file = NULL;
 	char *heap_path = NULL;
+	char *dax_path = NULL;
 	char *mountpoint = NULL;
 	unsigned long long phys_addr = 0;
 	size_t max_size = 0;
@@ -1024,13 +1152,16 @@ int main(int argc, char *argv[])
 	size_t overlay_pool_size = 0;
 	uint32_t overlay_buckets = 0;
 
-	while ((opt = getopt_long(argc, argv, "d:o:H:m:p:s:C:O:B:EXVh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:H:D:m:p:s:C:O:B:EXVh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			src_dir = optarg;
 			break;
 		case 'o':
 			output_file = optarg;
+			break;
+		case 'D':
+			dax_path = optarg;
 			break;
 		case 'H':
 			heap_path = optarg;
@@ -1078,7 +1209,7 @@ int main(int argc, char *argv[])
 	}
 
 	/* Detect split mode: DAX target + output backing file + source dir */
-	if ((heap_path || phys_addr) && output_file && src_dir)
+	if ((heap_path || dax_path) && output_file && src_dir)
 		split_mode = true;
 
 	/* Validate export mode */
@@ -1093,8 +1224,8 @@ int main(int argc, char *argv[])
 			print_usage(argv[0]);
 			return 1;
 		}
-		if (!heap_path && !phys_addr) {
-			fprintf(stderr, "Error: --export requires -H/--heap or -p/--phys\n");
+		if (!heap_path && !dax_path) {
+			fprintf(stderr, "Error: --export requires -H/--heap or -D/--dax\n");
 			print_usage(argv[0]);
 			return 1;
 		}
@@ -1108,8 +1239,8 @@ int main(int argc, char *argv[])
 			print_usage(argv[0]);
 			return 1;
 		}
-		if (!heap_path && !phys_addr && !output_file) {
-			fprintf(stderr, "Error: output target required (-o, -H, or -p)\n");
+		if (!heap_path && !dax_path && !output_file) {
+			fprintf(stderr, "Error: output target required (-o, -H, or -D)\n");
 			print_usage(argv[0]);
 			return 1;
 		}
@@ -1124,14 +1255,20 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	if (!output_file && !phys_addr && !heap_path) {
-		fprintf(stderr, "Error: -o/--output, -H/--heap, or -p/--phys is required\n");
+	if (!output_file && !heap_path && !dax_path) {
+		fprintf(stderr, "Error: -o/--output, -H/--heap, or -D/--dax is required\n");
 		print_usage(argv[0]);
 		return 1;
 	}
 
 	if (heap_path && !mountpoint) {
 		fprintf(stderr, "Error: -m/--mountpoint is required with -H/--heap\n");
+		print_usage(argv[0]);
+		return 1;
+	}
+
+	if (phys_addr && !dax_path) {
+		fprintf(stderr, "Error: -p/--phys requires -D/--dax (e.g., -D /dev/lazy_cma -p 0x...)\n");
 		print_usage(argv[0]);
 		return 1;
 	}
@@ -1342,17 +1479,53 @@ int main(int argc, char *argv[])
 
 		printf("Done. Mounted daxfs on %s\n", mountpoint);
 		ret = 0;
-	} else if (phys_addr) {
+	} else if (dax_path) {
+		unsigned long long dax_phys = 0;
+		size_t dax_size = 0;
+		bool is_dax_device;
+		off_t mmap_offset = 0;
 		int fd;
 
-		fd = open("/dev/lazy_cma", O_RDWR | O_SYNC);
+		is_dax_device = (dax_device_info(dax_path, &dax_phys, &dax_size) == 0);
+
+		if (is_dax_device) {
+			printf("DAX device %s: phys=0x%llx size=%zu (%.0f MB)\n",
+			       dax_path, dax_phys, dax_size,
+			       (double)dax_size / (1024 * 1024));
+
+			if (max_size && max_size > dax_size) {
+				fprintf(stderr, "Error: requested size %zu exceeds device size %zu\n",
+					max_size, dax_size);
+				return 1;
+			}
+			if (!max_size)
+				max_size = total_size;
+			if (max_size > dax_size) {
+				fprintf(stderr, "Error: image size %zu exceeds device size %zu\n",
+					max_size, dax_size);
+				return 1;
+			}
+		} else {
+			/* Non-DAX device (e.g. /dev/lazy_cma): need -p for phys addr */
+			if (!phys_addr) {
+				fprintf(stderr, "Error: %s is not a DAX device, -p/--phys is required\n",
+					dax_path);
+				return 1;
+			}
+			dax_phys = phys_addr;
+			mmap_offset = phys_addr;
+			printf("Device %s: mapping at phys=0x%llx\n",
+			       dax_path, dax_phys);
+		}
+
+		fd = open(dax_path, O_RDWR);
 		if (fd < 0) {
-			perror("/dev/lazy_cma");
+			perror(dax_path);
 			return 1;
 		}
 
 		mem = mmap(NULL, max_size, PROT_READ | PROT_WRITE,
-			   MAP_SHARED, fd, phys_addr);
+			   MAP_SHARED, fd, mmap_offset);
 		close(fd);
 
 		if (mem == MAP_FAILED) {
@@ -1360,7 +1533,7 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 
-		printf("Writing to physical address 0x%llx...\n", phys_addr);
+		printf("Writing daxfs image to %s...\n", dax_path);
 		if (empty_mode) {
 			if (write_empty_image(mem, max_size, overlay_buckets,
 					      overlay_pool_size, pcache_slots) < 0) {
@@ -1395,7 +1568,24 @@ int main(int argc, char *argv[])
 		}
 
 		munmap(mem, max_size);
-		printf("Done\n");
+
+		if (mountpoint) {
+			/* Mount using phys+size via the new mount API */
+			printf("Mounting on %s (%s%s%s)...\n", mountpoint,
+			       has_overlay ? "writable" : "read-only",
+			       validate ? ", validating" : "",
+			       (split_mode || export_mode) ? ", backing-store" : "");
+			if (mount_daxfs_phys(dax_phys, max_size, mountpoint,
+					     has_overlay, validate,
+					     split_mode ? output_file : NULL,
+					     export_mode ? src_dir : NULL) < 0)
+				return 1;
+
+			printf("Done. Mounted daxfs on %s\n", mountpoint);
+		} else {
+			printf("Done. Use mount -t daxfs -o phys=0x%llx,size=%zu none /mnt\n",
+			       dax_phys, max_size);
+		}
 		ret = 0;
 	} else {
 		int fd;
