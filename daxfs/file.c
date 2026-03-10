@@ -11,6 +11,7 @@
 #include <linux/pagemap.h>
 #include <linux/dma-buf.h>
 #include <linux/splice.h>
+#include <linux/prefetch.h>
 #include <asm/pgtable.h>
 #include "daxfs.h"
 
@@ -153,6 +154,7 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
+	struct daxfs_inode_info *di = DAXFS_I(inode);
 	loff_t pos = iocb->ki_pos;
 	size_t count = iov_iter_count(to);
 	size_t total = 0;
@@ -167,6 +169,43 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		size_t chunk;
 		void *src;
 		s32 pcslot = -1;
+
+		/*
+		 * Fast path: check per-inode overlay cache directly.
+		 * Avoids the full daxfs_base_file_data() call overhead
+		 * and prefetches the next page for sequential reads.
+		 * Overlay pages are 4104 bytes apart in the pool (8-byte
+		 * header + 4096 data), a stride the HW prefetcher
+		 * doesn't recognise, so SW prefetch matters here.
+		 */
+		if (info->overlay) {
+			u64 pgoff = pos >> PAGE_SHIFT;
+			void *page = xa_load(&di->ovl_pages, pgoff);
+
+			if (page) {
+				u32 intra = pos & (PAGE_SIZE - 1);
+
+				chunk = min(count,
+					    (size_t)(PAGE_SIZE - intra));
+
+				/* Prefetch next overlay page data */
+				if (count > chunk) {
+					void *next = xa_load(&di->ovl_pages,
+							     pgoff + 1);
+					if (next)
+						prefetch(next);
+				}
+
+				if (copy_to_iter(page + intra, chunk,
+						 to) != chunk)
+					return total ? total : -EFAULT;
+
+				pos += chunk;
+				count -= chunk;
+				total += chunk;
+				continue;
+			}
+		}
 
 		src = daxfs_base_file_data(info, inode, pos, count,
 					   &chunk, &pcslot);
@@ -196,6 +235,79 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
  * ============================================================================
  */
 
+/*
+ * Batch-preallocate overlay pages for a range of new (uncached) pages.
+ * Scans the write range, identifies pages not yet in the xarray cache,
+ * and allocates them in a single pool bump.  Pages are COW'd and cached.
+ */
+static void daxfs_write_prealloc(struct daxfs_info *info, struct inode *inode,
+				 u64 first_pgoff, u64 last_pgoff)
+{
+	struct daxfs_inode_info *di = DAXFS_I(inode);
+	u32 npages = last_pgoff - first_pgoff + 1;
+	void **pages;
+	u64 *pool_offs;
+	u32 i, reserved;
+
+	if (npages <= 1 || npages > 256)
+		return;
+
+	/* Only batch when ALL pages in the range are new */
+	for (i = 0; i < npages; i++) {
+		if (xa_load(&di->ovl_pages, first_pgoff + i))
+			return; /* Some pages cached — let per-page path handle */
+	}
+
+	pages = kmalloc_array(npages, sizeof(void *), GFP_KERNEL);
+	pool_offs = kmalloc_array(npages, sizeof(u64), GFP_KERNEL);
+	if (!pages || !pool_offs) {
+		kfree(pages);
+		kfree(pool_offs);
+		return;
+	}
+
+	/* Batch allocate entries from pool (no hash insert yet) */
+	reserved = daxfs_overlay_alloc_pages_batch(info, inode->i_ino,
+						   first_pgoff, npages,
+						   pages, pool_offs);
+	if (reserved == 0)
+		goto out;
+
+	/* COW each page, then publish to hash table, then cache */
+	for (i = 0; i < npages; i++) {
+		void *page = pages[i];
+		u64 pgoff = first_pgoff + i;
+		size_t base_len = 0;
+		void *base_data;
+		s32 pcslot = -1;
+
+		if (!page)
+			continue;
+
+		/* COW from base image */
+		base_data = daxfs_base_file_data(info, inode,
+						 (loff_t)pgoff << PAGE_SHIFT,
+						 PAGE_SIZE, &base_len,
+						 &pcslot);
+		if (base_data && base_len > 0)
+			memcpy(page, base_data,
+			       min(base_len, (size_t)PAGE_SIZE));
+		if (base_len < PAGE_SIZE)
+			memset(page + base_len, 0, PAGE_SIZE - base_len);
+		daxfs_pcache_put_page(info, pcslot);
+
+		/* Publish AFTER COW is complete */
+		page = daxfs_overlay_publish_page(info, inode->i_ino,
+						  pgoff, pool_offs[i], page);
+		if (page)
+			xa_store(&di->ovl_pages, pgoff, page, GFP_KERNEL);
+	}
+
+out:
+	kfree(pool_offs);
+	kfree(pages);
+}
+
 static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
@@ -210,6 +322,16 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (len == 0)
 		return 0;
 
+	/* Batch-preallocate overlay pages for multi-page writes */
+	{
+		u64 first_pgoff = pos >> PAGE_SHIFT;
+		u64 last_pgoff = (pos + len - 1) >> PAGE_SHIFT;
+
+		if (last_pgoff > first_pgoff)
+			daxfs_write_prealloc(info, inode,
+					     first_pgoff, last_pgoff);
+	}
+
 	while (len > 0) {
 		u64 pgoff = pos >> PAGE_SHIFT;
 		u32 intra = pos & (PAGE_SIZE - 1);
@@ -218,13 +340,15 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 		page = daxfs_overlay_get_page_cached(info, inode, pgoff);
 		if (!page) {
-			/* Allocate new overlay page, COW from base */
+			u64 pool_off;
+
+			/* Allocate new overlay page (pool only, not published) */
 			page = daxfs_overlay_alloc_page(info, inode->i_ino,
-							pgoff);
+							pgoff, &pool_off);
 			if (!page)
 				return total ? total : -ENOSPC;
 
-			/* COW: copy existing data BEFORE caching the page */
+			/* COW: copy existing data BEFORE publishing */
 			{
 				size_t base_len = 0;
 				void *base_data;
@@ -239,17 +363,18 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 					       min(base_len, (size_t)PAGE_SIZE));
 				daxfs_pcache_put_page(info, pcslot);
 
-				/*
-				 * Zero unwritten portion only for partial
-				 * writes; full-page writes will be fully
-				 * overwritten by copy_from_iter below.
-				 */
 				if (chunk < PAGE_SIZE && base_len < PAGE_SIZE)
 					memset(page + base_len, 0,
 					       PAGE_SIZE - base_len);
 			}
 
-			/* Cache after COW is complete */
+			/* Publish to hash table AFTER COW is complete */
+			page = daxfs_overlay_publish_page(info, inode->i_ino,
+							  pgoff, pool_off,
+							  page);
+			if (!page)
+				return total ? total : -ENOSPC;
+
 			xa_store(&DAXFS_I(inode)->ovl_pages, pgoff, page,
 				 GFP_KERNEL);
 		}
@@ -398,10 +523,12 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 		sb_start_pagefault(inode->i_sb);
 		data = daxfs_overlay_get_page_cached(info, inode, pgoff);
 		if (!data) {
+			u64 pool_off;
+
 			data = daxfs_overlay_alloc_page(info, inode->i_ino,
-							pgoff);
+							pgoff, &pool_off);
 			if (data) {
-				/* COW from base BEFORE caching */
+				/* COW from base BEFORE publishing */
 				size_t base_len;
 				void *base;
 				s32 pcslot = -1;
@@ -411,8 +538,13 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 							    &base_len, &pcslot);
 				daxfs_copy_page(data, base, base_len);
 				daxfs_pcache_put_page(info, pcslot);
-				xa_store(&DAXFS_I(inode)->ovl_pages, pgoff,
-					 data, GFP_KERNEL);
+
+				/* Publish AFTER COW */
+				data = daxfs_overlay_publish_page(info,
+					inode->i_ino, pgoff, pool_off, data);
+				if (data)
+					xa_store(&DAXFS_I(inode)->ovl_pages,
+						 pgoff, data, GFP_KERNEL);
 			}
 		}
 		sb_end_pagefault(inode->i_sb);
@@ -499,7 +631,10 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 	sb_start_pagefault(inode->i_sb);
 	data = daxfs_overlay_get_page_cached(info, inode, pgoff);
 	if (!data) {
-		data = daxfs_overlay_alloc_page(info, inode->i_ino, pgoff);
+		u64 pool_off;
+
+		data = daxfs_overlay_alloc_page(info, inode->i_ino,
+						pgoff, &pool_off);
 		if (data) {
 			size_t base_len;
 			void *base;
@@ -510,8 +645,12 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 						    &base_len, &pcslot);
 			daxfs_copy_page(data, base, base_len);
 			daxfs_pcache_put_page(info, pcslot);
-			xa_store(&DAXFS_I(inode)->ovl_pages, pgoff, data,
-				 GFP_KERNEL);
+
+			data = daxfs_overlay_publish_page(info,
+				inode->i_ino, pgoff, pool_off, data);
+			if (data)
+				xa_store(&DAXFS_I(inode)->ovl_pages, pgoff,
+					 data, GFP_KERNEL);
 		}
 	}
 	sb_end_pagefault(inode->i_sb);

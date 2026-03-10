@@ -224,7 +224,12 @@ extern int daxfs_overlay_set_inode(struct daxfs_info *info, u64 ino,
 extern void *daxfs_overlay_get_page(struct daxfs_info *info, u64 ino,
 				    u64 pgoff);
 extern void *daxfs_overlay_alloc_page(struct daxfs_info *info, u64 ino,
-				      u64 pgoff);
+				      u64 pgoff, u64 *pool_off_out);
+extern void *daxfs_overlay_publish_page(struct daxfs_info *info, u64 ino,
+					u64 pgoff, u64 pool_off, void *page);
+extern int daxfs_overlay_alloc_pages_batch(struct daxfs_info *info, u64 ino,
+					   u64 start_pgoff, u32 count,
+					   void **pages, u64 *pool_offs);
 extern struct daxfs_ovl_dirent_entry *daxfs_overlay_lookup_dirent(
 	struct daxfs_info *info, u64 parent_ino,
 	const char *name, u16 name_len);

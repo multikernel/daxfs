@@ -317,11 +317,17 @@ static int daxfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 
 	/* Store symlink target in first data page */
 	{
-		void *page = daxfs_overlay_alloc_page(info, new_ino, 0);
+		u64 pool_off;
+		void *page = daxfs_overlay_alloc_page(info, new_ino, 0,
+						      &pool_off);
 
 		if (!page)
 			return -ENOSPC;
 		memcpy(page, target, target_len + 1);
+		page = daxfs_overlay_publish_page(info, new_ino, 0,
+						  pool_off, page);
+		if (!page)
+			return -ENOSPC;
 	}
 
 	ret = daxfs_overlay_create_dirent(info, dir->i_ino, new_ino,
