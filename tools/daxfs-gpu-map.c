@@ -150,6 +150,71 @@ static int map_devmem(struct daxfs_gpu_map *gpu)
 	return 0;
 }
 
+/* Fallback path 2: mmap dma-buf fd + cuMemHostRegister */
+static int map_dmabuf_mmap(struct daxfs_gpu_map *gpu)
+{
+	int dmabuf_fd;
+	void *addr;
+	CUresult res;
+
+	dmabuf_fd = ioctl(gpu->mount_fd, DAXFS_IOC_GET_DMABUF);
+	if (dmabuf_fd < 0)
+		return -1;
+
+	fprintf(stderr, "daxfs-gpu-map: dmabuf_mmap: fd=%d size=%llu\n",
+		dmabuf_fd, (unsigned long long)gpu->info.dax_size);
+
+	addr = mmap(NULL, gpu->info.dax_size, PROT_READ | PROT_WRITE,
+		    MAP_SHARED, dmabuf_fd, 0);
+	if (addr == MAP_FAILED) {
+		perror("daxfs-gpu-map: mmap dma-buf fd");
+		close(dmabuf_fd);
+		return -1;
+	}
+
+	fprintf(stderr, "daxfs-gpu-map: dmabuf mmap'd at %p\n", addr);
+
+	gpu->dmabuf_fd = dmabuf_fd;
+	gpu->host_mmap = addr;
+
+	res = cuMemHostRegister(addr, gpu->info.dax_size,
+				CU_MEMHOSTREGISTER_DEVICEMAP |
+				CU_MEMHOSTREGISTER_IOMEMORY);
+	if (res != CUDA_SUCCESS) {
+		fprintf(stderr,
+			"daxfs-gpu-map: cuMemHostRegister(dmabuf, IOMEMORY): "
+			"%d, trying without IOMEMORY...\n", (int)res);
+		res = cuMemHostRegister(addr, gpu->info.dax_size,
+					CU_MEMHOSTREGISTER_DEVICEMAP);
+	}
+	if (res != CUDA_SUCCESS) {
+		fprintf(stderr,
+			"daxfs-gpu-map: cuMemHostRegister(dmabuf): %d\n",
+			(int)res);
+		munmap(addr, gpu->info.dax_size);
+		close(dmabuf_fd);
+		gpu->host_mmap = NULL;
+		gpu->dmabuf_fd = -1;
+		return -1;
+	}
+
+	res = cuMemHostGetDevicePointer(&gpu->base, addr, 0);
+	if (res != CUDA_SUCCESS) {
+		fprintf(stderr,
+			"daxfs-gpu-map: cuMemHostGetDevicePointer(dmabuf): "
+			"%d\n", (int)res);
+		cuMemHostUnregister(addr);
+		munmap(addr, gpu->info.dax_size);
+		close(dmabuf_fd);
+		gpu->host_mmap = NULL;
+		gpu->dmabuf_fd = -1;
+		return -1;
+	}
+
+	gpu->size = gpu->info.dax_size;
+	return 0;
+}
+
 int daxfs_gpu_map(int mount_fd, struct daxfs_gpu_map *gpu)
 {
 	memset(gpu, 0, sizeof(*gpu));
@@ -168,8 +233,9 @@ int daxfs_gpu_map(int mount_fd, struct daxfs_gpu_map *gpu)
 		return -1;
 	}
 
-	/* Step 2: map into GPU - try dma-buf first, fall back to /dev/mem */
-	if (map_dmabuf(gpu) < 0 && map_devmem(gpu) < 0)
+	/* Step 2: map into GPU - try dma-buf import, mmap+register, /dev/mem */
+	if (map_dmabuf(gpu) < 0 && map_dmabuf_mmap(gpu) < 0 &&
+	    map_devmem(gpu) < 0)
 		return -1;
 
 	/* Step 3: compute convenience pointers */

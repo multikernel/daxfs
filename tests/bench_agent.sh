@@ -435,8 +435,8 @@ scale_agents() {
             if [ "$n" -ge 2 ]; then
                 t0=$(now_ns)
                 # Any operation on an invalidated sibling should fail with ESTALE
-                cat "${branch_mnts[1]}/src/module_1.c" > /dev/null 2>&1
-                local estale_rc=$?
+                local estale_rc=0
+                cat "${branch_mnts[1]}/src/module_1.c" > /dev/null 2>&1 || estale_rc=$?
                 t1=$(now_ns)
                 local estale_us
                 estale_us=$(ns_to_us $((t1 - t0)))

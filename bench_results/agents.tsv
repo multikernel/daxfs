@@ -1,0 +1,343 @@
+experiment	parameter	iteration	operation	latency_us	ops_count	delta_bytes	notes
+scale_agents	1	1	branch_create_total	4076	1		
+scale_agents	1	1	branch_create_avg	4076	1		
+scale_agents	1	1	parallel_workload	526182	1		fails=0
+scale_agents	1	1	commit	7195	1		
+scale_agents	1	1	cleanup	14207	1		
+scale_agents	1	2	branch_create_total	5431	1		
+scale_agents	1	2	branch_create_avg	5431	1		
+scale_agents	1	2	parallel_workload	528399	1		fails=0
+scale_agents	1	2	commit	6421	1		
+scale_agents	1	2	cleanup	19778	1		
+scale_agents	1	3	branch_create_total	5494	1		
+scale_agents	1	3	branch_create_avg	5494	1		
+scale_agents	1	3	parallel_workload	547399	1		fails=0
+scale_agents	1	3	commit	9607	1		
+scale_agents	1	3	cleanup	16249	1		
+scale_agents	2	1	branch_create_total	7572	2		
+scale_agents	2	1	branch_create_avg	3786	2		
+scale_agents	2	1	parallel_workload	582696	2		fails=0
+scale_agents	2	1	commit	6274	1		
+scale_agents	2	1	estale_detect	8140	1		rc=1
+scale_agents	2	1	cleanup	22013	2		
+scale_agents	2	2	branch_create_total	10103	2		
+scale_agents	2	2	branch_create_avg	5051	2		
+scale_agents	2	2	parallel_workload	543486	2		fails=0
+scale_agents	2	2	commit	9582	1		
+scale_agents	2	2	estale_detect	4476	1		rc=1
+scale_agents	2	2	cleanup	16557	2		
+scale_agents	2	3	branch_create_total	9241	2		
+scale_agents	2	3	branch_create_avg	4620	2		
+scale_agents	2	3	parallel_workload	548317	2		fails=0
+scale_agents	2	3	commit	5399	1		
+scale_agents	2	3	estale_detect	5502	1		rc=1
+scale_agents	2	3	cleanup	16312	2		
+scale_agents	4	1	branch_create_total	21351	4		
+scale_agents	4	1	branch_create_avg	5337	4		
+scale_agents	4	1	parallel_workload	602268	4		fails=0
+scale_agents	4	1	commit	8011	1		
+scale_agents	4	1	estale_detect	6145	1		rc=1
+scale_agents	4	1	cleanup	22772	4		
+scale_agents	4	2	branch_create_total	16742	4		
+scale_agents	4	2	branch_create_avg	4185	4		
+scale_agents	4	2	parallel_workload	599315	4		fails=0
+scale_agents	4	2	commit	4615	1		
+scale_agents	4	2	estale_detect	4333	1		rc=1
+scale_agents	4	2	cleanup	24804	4		
+scale_agents	4	3	branch_create_total	17419	4		
+scale_agents	4	3	branch_create_avg	4354	4		
+scale_agents	4	3	parallel_workload	619138	4		fails=0
+scale_agents	4	3	commit	4957	1		
+scale_agents	4	3	estale_detect	3831	1		rc=1
+scale_agents	4	3	cleanup	26757	4		
+scale_agents	8	1	branch_create_total	38580	8		
+scale_agents	8	1	branch_create_avg	4822	8		
+scale_agents	8	1	parallel_workload	669078	8		fails=0
+scale_agents	8	1	commit	5471	1		
+scale_agents	8	1	estale_detect	4193	1		rc=1
+scale_agents	8	1	cleanup	38947	8		
+scale_agents	8	2	branch_create_total	37897	8		
+scale_agents	8	2	branch_create_avg	4737	8		
+scale_agents	8	2	parallel_workload	628198	8		fails=0
+scale_agents	8	2	commit	6667	1		
+scale_agents	8	2	estale_detect	4457	1		rc=1
+scale_agents	8	2	cleanup	31432	8		
+scale_agents	8	3	branch_create_total	37498	8		
+scale_agents	8	3	branch_create_avg	4687	8		
+scale_agents	8	3	parallel_workload	639915	8		fails=0
+scale_agents	8	3	commit	7485	1		
+scale_agents	8	3	estale_detect	4584	1		rc=1
+scale_agents	8	3	cleanup	28399	8		
+scale_agents	16	1	branch_create_total	92533	16		
+scale_agents	16	1	branch_create_avg	5783	16		
+scale_agents	16	1	parallel_workload	763445	16		fails=0
+scale_agents	16	1	commit	10479	1		
+scale_agents	16	1	estale_detect	4315	1		rc=1
+scale_agents	16	1	cleanup	45969	16		
+scale_agents	16	2	branch_create_total	74579	16		
+scale_agents	16	2	branch_create_avg	4661	16		
+scale_agents	16	2	parallel_workload	793028	16		fails=0
+scale_agents	16	2	commit	7999	1		
+scale_agents	16	2	estale_detect	5960	1		rc=1
+scale_agents	16	2	cleanup	49899	16		
+scale_agents	16	3	branch_create_total	82432	16		
+scale_agents	16	3	branch_create_avg	5152	16		
+scale_agents	16	3	parallel_workload	787314	16		fails=0
+scale_agents	16	3	commit	8582	1		
+scale_agents	16	3	estale_detect	4980	1		rc=1
+scale_agents	16	3	cleanup	50737	16		
+scale_agents	32	1	branch_create_total	152822	32		
+scale_agents	32	1	branch_create_avg	4775	32		
+scale_agents	32	1	parallel_workload	859543	32		fails=0
+scale_agents	32	1	commit	5684	1		
+scale_agents	32	1	estale_detect	4547	1		rc=1
+scale_agents	32	1	cleanup	104499	32		
+scale_agents	32	2	branch_create_total	153409	32		
+scale_agents	32	2	branch_create_avg	4794	32		
+scale_agents	32	2	parallel_workload	846043	32		fails=0
+scale_agents	32	2	commit	11058	1		
+scale_agents	32	2	estale_detect	4032	1		rc=1
+scale_agents	32	2	cleanup	106802	32		
+scale_agents	32	3	branch_create_total	156743	32		
+scale_agents	32	3	branch_create_avg	4898	32		
+scale_agents	32	3	parallel_workload	907180	32		fails=0
+scale_agents	32	3	commit	6461	1		
+scale_agents	32	3	estale_detect	5525	1		rc=1
+scale_agents	32	3	cleanup	98815	32		
+scale_depth	1	1	chain_create	11518	1		
+scale_depth	1	1	workload	551627	31		
+scale_depth	1	1	commit	6019	1		
+scale_depth	1	2	chain_create	9727	1		
+scale_depth	1	2	workload	502185	31		
+scale_depth	1	2	commit	6570	1		
+scale_depth	1	3	chain_create	10794	1		
+scale_depth	1	3	workload	515411	31		
+scale_depth	1	3	commit	11072	1		
+scale_depth	2	1	chain_create	10614	2		
+scale_depth	2	1	workload	526138	31		
+scale_depth	2	1	commit	10166	2		
+scale_depth	2	2	chain_create	16656	2		
+scale_depth	2	2	workload	523364	31		
+scale_depth	2	2	commit	16197	2		
+scale_depth	2	3	chain_create	16981	2		
+scale_depth	2	3	workload	547954	31		
+scale_depth	2	3	commit	5271	2		
+scale_depth	4	1	chain_create	22894	4		
+scale_depth	4	1	workload	538063	31		
+scale_depth	4	1	commit	10491	4		
+scale_depth	4	2	chain_create	22786	4		
+scale_depth	4	2	workload	511997	31		
+scale_depth	4	2	commit	6308	4		
+scale_depth	4	3	chain_create	23795	4		
+scale_depth	4	3	workload	530256	31		
+scale_depth	4	3	commit	6508	4		
+scale_depth	8	1	chain_create	36028	8		
+scale_depth	8	1	workload	530269	31		
+scale_depth	8	1	commit	10982	8		
+scale_depth	8	2	chain_create	39830	8		
+scale_depth	8	2	workload	500300	31		
+scale_depth	8	2	commit	6466	8		
+scale_depth	8	3	chain_create	36476	8		
+scale_depth	8	3	workload	542417	31		
+scale_depth	8	3	commit	14053	8		
+commit_cost	10	1	workload	202319	10		
+commit_cost	10	1	commit	14481	10		
+commit_cost	10	2	workload	181876	10		
+commit_cost	10	2	commit	5625	10		
+commit_cost	10	3	workload	183334	10		
+commit_cost	10	3	commit	7841	10		
+commit_cost	50	1	workload	1466946	50		
+commit_cost	50	1	commit	8523	50		
+commit_cost	50	2	workload	1464664	50		
+commit_cost	50	2	commit	10627	50		
+commit_cost	50	3	workload	1425226	50		
+commit_cost	50	3	commit	12598	50		
+commit_cost	100	1	workload	3626982	100		
+commit_cost	100	1	commit	11834	100		
+commit_cost	100	2	workload	3530194	100		
+commit_cost	100	2	commit	7431	100		
+commit_cost	100	3	workload	3541508	100		
+commit_cost	100	3	commit	11713	100		
+baseline_tmpfs	1	1	branch_create_total	2443	1		
+baseline_tmpfs	1	1	branch_create_avg	2443	1		
+baseline_tmpfs	1	1	parallel_workload	28326	1		
+baseline_tmpfs	1	1	branch_create_total	3515	1		
+baseline_tmpfs	1	1	branch_create_avg	3515	1		
+baseline_tmpfs	1	1	parallel_workload	32225	1		
+baseline_tmpfs	1	1	commit	86604	1		
+baseline_tmpfs	1	1	cleanup	4935	1		
+baseline_tmpfs	1	2	branch_create_total	3464	1		
+baseline_tmpfs	1	2	branch_create_avg	3464	1		
+baseline_tmpfs	1	2	parallel_workload	31332	1		
+baseline_tmpfs	1	2	commit	46055	1		
+baseline_tmpfs	1	2	cleanup	4084	1		
+baseline_tmpfs	1	3	branch_create_total	2905	1		
+baseline_tmpfs	1	3	branch_create_avg	2905	1		
+baseline_tmpfs	1	3	parallel_workload	31260	1		
+baseline_tmpfs	1	3	commit	45946	1		
+baseline_tmpfs	1	3	cleanup	3764	1		
+baseline_tmpfs	2	1	branch_create_total	5445	2		
+baseline_tmpfs	2	1	branch_create_avg	2722	2		
+baseline_tmpfs	2	1	parallel_workload	31963	2		
+baseline_tmpfs	2	1	commit	46219	1		
+baseline_tmpfs	2	1	cleanup	5454	2		
+baseline_tmpfs	2	2	branch_create_total	5455	2		
+baseline_tmpfs	2	2	branch_create_avg	2727	2		
+baseline_tmpfs	2	2	parallel_workload	32328	2		
+baseline_tmpfs	2	2	commit	46005	1		
+baseline_tmpfs	2	2	cleanup	4468	2		
+baseline_tmpfs	2	3	branch_create_total	5913	2		
+baseline_tmpfs	2	3	branch_create_avg	2956	2		
+baseline_tmpfs	2	3	parallel_workload	32508	2		
+baseline_tmpfs	2	3	commit	45440	1		
+baseline_tmpfs	2	3	cleanup	4795	2		
+baseline_tmpfs	4	1	branch_create_total	10858	4		
+baseline_tmpfs	4	1	branch_create_avg	2714	4		
+baseline_tmpfs	4	1	parallel_workload	34528	4		
+baseline_tmpfs	4	1	commit	45547	1		
+baseline_tmpfs	4	1	cleanup	5669	4		
+baseline_tmpfs	4	2	branch_create_total	11170	4		
+baseline_tmpfs	4	2	branch_create_avg	2792	4		
+baseline_tmpfs	4	2	parallel_workload	33417	4		
+baseline_tmpfs	4	2	commit	46485	1		
+baseline_tmpfs	4	2	cleanup	5774	4		
+baseline_tmpfs	4	3	branch_create_total	9925	4		
+baseline_tmpfs	4	3	branch_create_avg	2481	4		
+baseline_tmpfs	4	3	parallel_workload	33273	4		
+baseline_tmpfs	4	3	commit	45777	1		
+baseline_tmpfs	4	3	cleanup	5591	4		
+baseline_tmpfs	8	1	branch_create_total	22590	8		
+baseline_tmpfs	8	1	branch_create_avg	2823	8		
+baseline_tmpfs	8	1	parallel_workload	37262	8		
+baseline_tmpfs	8	1	commit	46174	1		
+baseline_tmpfs	8	1	cleanup	7164	8		
+baseline_tmpfs	8	2	branch_create_total	21631	8		
+baseline_tmpfs	8	2	branch_create_avg	2703	8		
+baseline_tmpfs	8	2	parallel_workload	35463	8		
+baseline_tmpfs	8	2	commit	45251	1		
+baseline_tmpfs	8	2	cleanup	8081	8		
+baseline_tmpfs	8	3	branch_create_total	21555	8		
+baseline_tmpfs	8	3	branch_create_avg	2694	8		
+baseline_tmpfs	8	3	parallel_workload	36366	8		
+baseline_tmpfs	8	3	commit	44625	1		
+baseline_tmpfs	8	3	cleanup	8296	8		
+baseline_tmpfs	16	1	branch_create_total	41263	16		
+baseline_tmpfs	16	1	branch_create_avg	2578	16		
+baseline_tmpfs	16	1	parallel_workload	38129	16		
+baseline_tmpfs	16	1	commit	45669	1		
+baseline_tmpfs	16	1	cleanup	12275	16		
+baseline_tmpfs	16	2	branch_create_total	42322	16		
+baseline_tmpfs	16	2	branch_create_avg	2645	16		
+baseline_tmpfs	16	2	parallel_workload	38157	16		
+baseline_tmpfs	16	2	commit	45554	1		
+baseline_tmpfs	16	2	cleanup	11999	16		
+baseline_tmpfs	16	3	branch_create_total	45596	16		
+baseline_tmpfs	16	3	branch_create_avg	2849	16		
+baseline_tmpfs	16	3	parallel_workload	39854	16		
+baseline_tmpfs	16	3	commit	45796	1		
+baseline_tmpfs	16	3	cleanup	13391	16		
+baseline_tmpfs	32	1	branch_create_total	93096	32		
+baseline_tmpfs	32	1	branch_create_avg	2909	32		
+baseline_tmpfs	32	1	parallel_workload	47494	32		
+baseline_tmpfs	32	1	commit	45508	1		
+baseline_tmpfs	32	1	cleanup	22176	32		
+baseline_tmpfs	32	2	branch_create_total	93741	32		
+baseline_tmpfs	32	2	branch_create_avg	2929	32		
+baseline_tmpfs	32	2	parallel_workload	47132	32		
+baseline_tmpfs	32	2	commit	46098	1		
+baseline_tmpfs	32	2	cleanup	23098	32		
+baseline_tmpfs	32	3	branch_create_total	94132	32		
+baseline_tmpfs	32	3	branch_create_avg	2941	32		
+baseline_tmpfs	32	3	parallel_workload	47511	32		
+baseline_tmpfs	32	3	commit	46239	1		
+baseline_tmpfs	32	3	cleanup	22055	32		
+baseline_overlayfs	1	1	branch_create_total	3291	1		
+baseline_overlayfs	1	1	branch_create_avg	3291	1		
+baseline_overlayfs	1	1	parallel_workload	33499	1		
+baseline_overlayfs	1	1	commit	3278	1		
+baseline_overlayfs	1	1	cleanup	4828	1		
+baseline_overlayfs	1	2	branch_create_total	2831	1		
+baseline_overlayfs	1	2	branch_create_avg	2831	1		
+baseline_overlayfs	1	2	parallel_workload	32808	1		
+baseline_overlayfs	1	2	commit	2925	1		
+baseline_overlayfs	1	2	cleanup	5142	1		
+baseline_overlayfs	1	3	branch_create_total	2909	1		
+baseline_overlayfs	1	3	branch_create_avg	2909	1		
+baseline_overlayfs	1	3	parallel_workload	32252	1		
+baseline_overlayfs	1	3	commit	2652	1		
+baseline_overlayfs	1	3	cleanup	5210	1		
+baseline_overlayfs	2	1	branch_create_total	5302	2		
+baseline_overlayfs	2	1	branch_create_avg	2651	2		
+baseline_overlayfs	2	1	parallel_workload	33196	2		
+baseline_overlayfs	2	1	commit	3125	1		
+baseline_overlayfs	2	1	cleanup	7034	2		
+baseline_overlayfs	2	2	branch_create_total	5865	2		
+baseline_overlayfs	2	2	branch_create_avg	2932	2		
+baseline_overlayfs	2	2	parallel_workload	34825	2		
+baseline_overlayfs	2	2	commit	2536	1		
+baseline_overlayfs	2	2	cleanup	6319	2		
+baseline_overlayfs	2	3	branch_create_total	5533	2		
+baseline_overlayfs	2	3	branch_create_avg	2766	2		
+baseline_overlayfs	2	3	parallel_workload	34535	2		
+baseline_overlayfs	2	3	commit	3048	1		
+baseline_overlayfs	2	3	cleanup	6330	2		
+baseline_overlayfs	4	1	branch_create_total	10830	4		
+baseline_overlayfs	4	1	branch_create_avg	2707	4		
+baseline_overlayfs	4	1	parallel_workload	35952	4		
+baseline_overlayfs	4	1	commit	2599	1		
+baseline_overlayfs	4	1	cleanup	9030	4		
+baseline_overlayfs	4	2	branch_create_total	12304	4		
+baseline_overlayfs	4	2	branch_create_avg	3076	4		
+baseline_overlayfs	4	2	parallel_workload	36010	4		
+baseline_overlayfs	4	2	commit	2603	1		
+baseline_overlayfs	4	2	cleanup	8558	4		
+baseline_overlayfs	4	3	branch_create_total	12863	4		
+baseline_overlayfs	4	3	branch_create_avg	3215	4		
+baseline_overlayfs	4	3	parallel_workload	35081	4		
+baseline_overlayfs	4	3	commit	2977	1		
+baseline_overlayfs	4	3	cleanup	8511	4		
+baseline_overlayfs	8	1	branch_create_total	21960	8		
+baseline_overlayfs	8	1	branch_create_avg	2745	8		
+baseline_overlayfs	8	1	parallel_workload	38572	8		
+baseline_overlayfs	8	1	commit	3419	1		
+baseline_overlayfs	8	1	cleanup	14066	8		
+baseline_overlayfs	8	2	branch_create_total	23409	8		
+baseline_overlayfs	8	2	branch_create_avg	2926	8		
+baseline_overlayfs	8	2	parallel_workload	38714	8		
+baseline_overlayfs	8	2	commit	2969	1		
+baseline_overlayfs	8	2	cleanup	14206	8		
+baseline_overlayfs	8	3	branch_create_total	21952	8		
+baseline_overlayfs	8	3	branch_create_avg	2744	8		
+baseline_overlayfs	8	3	parallel_workload	38664	8		
+baseline_overlayfs	8	3	commit	3138	1		
+baseline_overlayfs	8	3	cleanup	14526	8		
+baseline_overlayfs	16	1	branch_create_total	46128	16		
+baseline_overlayfs	16	1	branch_create_avg	2883	16		
+baseline_overlayfs	16	1	parallel_workload	39639	16		
+baseline_overlayfs	16	1	commit	3359	1		
+baseline_overlayfs	16	1	cleanup	25121	16		
+baseline_overlayfs	16	2	branch_create_total	45612	16		
+baseline_overlayfs	16	2	branch_create_avg	2850	16		
+baseline_overlayfs	16	2	parallel_workload	38792	16		
+baseline_overlayfs	16	2	commit	2510	1		
+baseline_overlayfs	16	2	cleanup	23516	16		
+baseline_overlayfs	16	3	branch_create_total	44094	16		
+baseline_overlayfs	16	3	branch_create_avg	2755	16		
+baseline_overlayfs	16	3	parallel_workload	37822	16		
+baseline_overlayfs	16	3	commit	2596	1		
+baseline_overlayfs	16	3	cleanup	25847	16		
+baseline_overlayfs	32	1	branch_create_total	87711	32		
+baseline_overlayfs	32	1	branch_create_avg	2740	32		
+baseline_overlayfs	32	1	parallel_workload	44015	32		
+baseline_overlayfs	32	1	commit	2854	1		
+baseline_overlayfs	32	1	cleanup	46727	32		
+baseline_overlayfs	32	2	branch_create_total	90229	32		
+baseline_overlayfs	32	2	branch_create_avg	2819	32		
+baseline_overlayfs	32	2	parallel_workload	45849	32		
+baseline_overlayfs	32	2	commit	2800	1		
+baseline_overlayfs	32	2	cleanup	43240	32		
+baseline_overlayfs	32	3	branch_create_total	90360	32		
+baseline_overlayfs	32	3	branch_create_avg	2823	32		
+baseline_overlayfs	32	3	parallel_workload	48086	32		
+baseline_overlayfs	32	3	commit	3001	1		
+baseline_overlayfs	32	3	cleanup	47871	32		

@@ -1,0 +1,143 @@
+experiment	parameter	iteration	operation	latency_ns	ops_count	thru_mops	notes
+gpu_coord_lock	1	1	lock_unlock_rt	2047.8	10000	0.569	single_thread
+gpu_coord_lock	1	2	lock_unlock_rt	2048.9	10000	0.569	single_thread
+gpu_coord_lock	1	3	lock_unlock_rt	2046.7	10000	0.569	single_thread
+gpu_coord_lock	1	4	lock_unlock_rt	2050.9	10000	0.568	single_thread
+gpu_coord_lock	1	5	lock_unlock_rt	2045.4	10000	0.570	single_thread
+gpu_commit_seq	1	1	volatile_read	532.3	10000	2.189	single_thread
+gpu_commit_seq	1	2	volatile_read	532.8	10000	2.187	single_thread
+gpu_commit_seq	1	3	volatile_read	531.8	10000	2.191	single_thread
+gpu_commit_seq	1	4	volatile_read	524.5	10000	2.219	single_thread
+gpu_commit_seq	1	5	volatile_read	524.1	10000	2.221	single_thread
+gpu_pending_ctr	1	1	cas_inc_dec	1786.7	20000	0.653	single_thread
+gpu_pending_ctr	1	2	cas_inc_dec	1817.5	20000	0.641	single_thread
+gpu_pending_ctr	1	3	cas_inc_dec	1817.8	20000	0.641	single_thread
+gpu_pending_ctr	1	4	cas_inc_dec	1817.6	20000	0.641	single_thread
+gpu_pending_ctr	1	5	cas_inc_dec	1817.6	20000	0.641	single_thread
+gpu_pcache_lookup	1	1	lookup_throughput	918.8	10000	1.088	
+gpu_pcache_lookup	1	2	lookup_throughput	914.4	10000	1.094	
+gpu_pcache_lookup	1	3	lookup_throughput	908.5	10000	1.101	
+gpu_pcache_lookup	1	4	lookup_throughput	908.4	10000	1.101	
+gpu_pcache_lookup	1	5	lookup_throughput	908.7	10000	1.101	
+gpu_pcache_lookup	32	1	lookup_throughput	30.4	320000	32.929	
+gpu_pcache_lookup	32	2	lookup_throughput	30.4	320000	32.860	
+gpu_pcache_lookup	32	3	lookup_throughput	30.4	320000	32.847	
+gpu_pcache_lookup	32	4	lookup_throughput	30.4	320000	32.860	
+gpu_pcache_lookup	32	5	lookup_throughput	30.5	320000	32.833	
+gpu_pcache_lookup	64	1	lookup_throughput	20.3	640000	49.253	
+gpu_pcache_lookup	64	2	lookup_throughput	20.3	640000	49.204	
+gpu_pcache_lookup	64	3	lookup_throughput	20.3	640000	49.161	
+gpu_pcache_lookup	64	4	lookup_throughput	20.3	640000	49.246	
+gpu_pcache_lookup	64	5	lookup_throughput	20.3	640000	49.247	
+gpu_pcache_lookup	128	1	lookup_throughput	15.2	1280000	65.662	
+gpu_pcache_lookup	128	2	lookup_throughput	15.2	1280000	65.661	
+gpu_pcache_lookup	128	3	lookup_throughput	15.2	1280000	65.683	
+gpu_pcache_lookup	128	4	lookup_throughput	15.2	1280000	65.671	
+gpu_pcache_lookup	128	5	lookup_throughput	15.2	1280000	65.663	
+gpu_pcache_lookup	256	1	lookup_throughput	7.6	2560000	131.157	
+gpu_pcache_lookup	256	2	lookup_throughput	7.6	2560000	131.091	
+gpu_pcache_lookup	256	3	lookup_throughput	7.6	2560000	130.796	
+gpu_pcache_lookup	256	4	lookup_throughput	7.6	2560000	130.978	
+gpu_pcache_lookup	256	5	lookup_throughput	7.6	2560000	131.228	
+gpu_pcache_lookup	512	1	lookup_throughput	3.7	5120000	268.549	
+gpu_pcache_lookup	512	2	lookup_throughput	3.7	5120000	267.784	
+gpu_pcache_lookup	512	3	lookup_throughput	3.7	5120000	268.770	
+gpu_pcache_lookup	512	4	lookup_throughput	3.7	5120000	267.830	
+gpu_pcache_lookup	512	5	lookup_throughput	3.7	5120000	268.546	
+gpu_pcache_lookup	1024	1	lookup_throughput	1.9	10240000	539.197	
+gpu_pcache_lookup	1024	2	lookup_throughput	1.9	10240000	538.267	
+gpu_pcache_lookup	1024	3	lookup_throughput	1.9	10240000	537.556	
+gpu_pcache_lookup	1024	4	lookup_throughput	1.9	10240000	537.570	
+gpu_pcache_lookup	1024	5	lookup_throughput	1.9	10240000	538.479	
+gpu_slot_cas	1	1	cas_throughput	1407.7	1000	0.710	independent
+gpu_slot_cas	1	2	cas_throughput	1366.5	1000	0.732	independent
+gpu_slot_cas	1	3	cas_throughput	1365.6	1000	0.732	independent
+gpu_slot_cas	1	4	cas_throughput	1364.6	1000	0.733	independent
+gpu_slot_cas	1	5	cas_throughput	1365.9	1000	0.732	independent
+gpu_slot_cas	32	1	cas_throughput	137.0	32000	7.297	independent
+gpu_slot_cas	32	2	cas_throughput	137.5	32000	7.275	independent
+gpu_slot_cas	32	3	cas_throughput	137.1	32000	7.295	independent
+gpu_slot_cas	32	4	cas_throughput	138.1	32000	7.242	independent
+gpu_slot_cas	32	5	cas_throughput	137.2	32000	7.290	independent
+gpu_slot_cas	64	1	cas_throughput	129.5	64000	7.723	independent
+gpu_slot_cas	64	2	cas_throughput	129.4	64000	7.727	independent
+gpu_slot_cas	64	3	cas_throughput	129.5	64000	7.720	independent
+gpu_slot_cas	64	4	cas_throughput	129.4	64000	7.725	independent
+gpu_slot_cas	64	5	cas_throughput	129.5	64000	7.722	independent
+gpu_slot_cas	128	1	cas_throughput	137.4	128000	7.278	independent
+gpu_slot_cas	128	2	cas_throughput	140.6	128000	7.114	independent
+gpu_slot_cas	128	3	cas_throughput	141.1	128000	7.086	independent
+gpu_slot_cas	128	4	cas_throughput	143.3	128000	6.981	independent
+gpu_slot_cas	128	5	cas_throughput	140.9	128000	7.099	independent
+gpu_slot_cas	256	1	cas_throughput	87.9	256000	11.383	independent
+gpu_slot_cas	256	2	cas_throughput	91.7	256000	10.910	independent
+gpu_slot_cas	256	3	cas_throughput	91.7	256000	10.908	independent
+gpu_slot_cas	256	4	cas_throughput	89.1	256000	11.230	independent
+gpu_slot_cas	256	5	cas_throughput	89.9	256000	11.122	independent
+gpu_slot_cas	512	1	cas_throughput	86.4	512000	11.568	independent
+gpu_slot_cas	512	2	cas_throughput	84.0	512000	11.912	independent
+gpu_slot_cas	512	3	cas_throughput	85.7	512000	11.671	independent
+gpu_slot_cas	512	4	cas_throughput	85.0	512000	11.759	independent
+gpu_slot_cas	512	5	cas_throughput	85.7	512000	11.664	independent
+gpu_slot_cas	1024	1	cas_throughput	85.5	1024000	11.703	independent
+gpu_slot_cas	1024	2	cas_throughput	85.6	1024000	11.678	independent
+gpu_slot_cas	1024	3	cas_throughput	86.0	1024000	11.629	independent
+gpu_slot_cas	1024	4	cas_throughput	85.9	1024000	11.645	independent
+gpu_slot_cas	1024	5	cas_throughput	85.6	1024000	11.681	independent
+gpu_lock_contention	1	1	lock_acquisition	2664.0	100	0.375	counter=100
+gpu_lock_contention	1	2	lock_acquisition	2257.0	100	0.443	counter=100
+gpu_lock_contention	1	3	lock_acquisition	2277.1	100	0.439	counter=100
+gpu_lock_contention	1	4	lock_acquisition	2251.5	100	0.444	counter=100
+gpu_lock_contention	1	5	lock_acquisition	2260.2	100	0.442	counter=100
+gpu_lock_contention	2	1	lock_acquisition	1151.2	200	0.869	counter=101
+gpu_lock_contention	2	2	lock_acquisition	1140.6	200	0.877	counter=101
+gpu_lock_contention	2	3	lock_acquisition	1151.2	200	0.869	counter=101
+gpu_lock_contention	2	4	lock_acquisition	1149.6	200	0.870	counter=101
+gpu_lock_contention	2	5	lock_acquisition	1149.6	200	0.870	counter=101
+gpu_lock_contention	4	1	lock_acquisition	591.2	400	1.691	counter=103
+gpu_lock_contention	4	2	lock_acquisition	592.6	400	1.688	counter=103
+gpu_lock_contention	4	3	lock_acquisition	592.6	400	1.688	counter=103
+gpu_lock_contention	4	4	lock_acquisition	588.0	400	1.701	counter=103
+gpu_lock_contention	4	5	lock_acquisition	588.5	400	1.699	counter=103
+gpu_lock_contention	8	1	lock_acquisition	319.7	800	3.128	counter=107
+gpu_lock_contention	8	2	lock_acquisition	319.4	800	3.130	counter=107
+gpu_lock_contention	8	3	lock_acquisition	319.7	800	3.128	counter=107
+gpu_lock_contention	8	4	lock_acquisition	319.5	800	3.130	counter=107
+gpu_lock_contention	8	5	lock_acquisition	319.4	800	3.131	counter=107
+gpu_lock_contention	16	1	lock_acquisition	199.3	1600	5.017	counter=115
+gpu_lock_contention	16	2	lock_acquisition	198.8	1600	5.030	counter=115
+gpu_lock_contention	16	3	lock_acquisition	198.8	1600	5.030	counter=115
+gpu_lock_contention	16	4	lock_acquisition	199.4	1600	5.015	counter=115
+gpu_lock_contention	16	5	lock_acquisition	198.8	1600	5.030	counter=115
+gpu_lock_contention	32	1	lock_acquisition	168.1	3200	5.948	counter=131
+gpu_lock_contention	32	2	lock_acquisition	168.0	3200	5.953	counter=131
+gpu_lock_contention	32	3	lock_acquisition	168.2	3200	5.944	counter=131
+gpu_lock_contention	32	4	lock_acquisition	167.8	3200	5.959	counter=131
+gpu_lock_contention	32	5	lock_acquisition	167.8	3200	5.958	counter=131
+gpu_pcache_claim	1	1	claim_throughput	4397.6	1000	0.227	free_to_pending
+gpu_pcache_claim	1	2	claim_throughput	4387.6	1000	0.228	free_to_pending
+gpu_pcache_claim	1	3	claim_throughput	4388.1	1000	0.228	free_to_pending
+gpu_pcache_claim	1	4	claim_throughput	4388.2	1000	0.228	free_to_pending
+gpu_pcache_claim	1	5	claim_throughput	4388.0	1000	0.228	free_to_pending
+gpu_pcache_claim	32	1	claim_throughput	20820.4	32000	0.048	free_to_pending
+gpu_pcache_claim	32	2	claim_throughput	20827.9	32000	0.048	free_to_pending
+gpu_pcache_claim	32	3	claim_throughput	19216.1	32000	0.052	free_to_pending
+gpu_pcache_claim	32	4	claim_throughput	17914.2	32000	0.056	free_to_pending
+gpu_pcache_claim	32	5	claim_throughput	20202.7	32000	0.049	free_to_pending
+gpu_pcache_claim	64	1	claim_throughput	50021.0	64000	0.020	free_to_pending
+gpu_pcache_claim	64	2	claim_throughput	49535.5	64000	0.020	free_to_pending
+gpu_pcache_claim	64	3	claim_throughput	50754.8	64000	0.020	free_to_pending
+gpu_pcache_claim	64	4	claim_throughput	49424.7	64000	0.020	free_to_pending
+gpu_pcache_claim	64	5	claim_throughput	49654.4	64000	0.020	free_to_pending
+gpu_pcache_claim	128	1	claim_throughput	48636.7	128000	0.021	free_to_pending
+gpu_pcache_claim	128	2	claim_throughput	51128.5	128000	0.020	free_to_pending
+gpu_pcache_claim	128	3	claim_throughput	50332.4	128000	0.020	free_to_pending
+gpu_pcache_claim	128	4	claim_throughput	50294.6	128000	0.020	free_to_pending
+gpu_pcache_claim	128	5	claim_throughput	50091.9	128000	0.020	free_to_pending
+gpu_pcache_claim	256	1	claim_throughput	97352.1	256000	0.010	free_to_pending
+gpu_pcache_claim	256	2	claim_throughput	98231.3	256000	0.010	free_to_pending
+gpu_pcache_claim	256	3	claim_throughput	97677.1	256000	0.010	free_to_pending
+gpu_pcache_claim	256	4	claim_throughput	98483.2	256000	0.010	free_to_pending
+gpu_pcache_claim	256	5	claim_throughput	98240.5	256000	0.010	free_to_pending
+gpu_pcache_claim	512	1	claim_throughput	196027.4	512000	0.005	free_to_pending
+gpu_pcache_claim	512	2	claim_throughput	196364.6	512000	0.005	free_to_pending
