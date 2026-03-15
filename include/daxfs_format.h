@@ -16,18 +16,18 @@
 #define DAXFS_IOC_GET_DMABUF	_IO('D', 1)	/* Get dma-buf fd for this mount */
 
 #define DAXFS_SUPER_MAGIC	0x64617835	/* "dax5" */
-#define DAXFS_VERSION		7
-#define DAXFS_BLOCK_SIZE	4096
+#define DAXFS_VERSION		8
+#define DAXFS_MIN_BLOCK_SIZE	4096	/* Minimum (superblock/header padding) */
 #define DAXFS_INODE_SIZE	64
 #define DAXFS_NAME_MAX		255
 #define DAXFS_DIRENT_SIZE	(16 + DAXFS_NAME_MAX)	/* ino + mode + name_len + reserved + name */
 #define DAXFS_ROOT_INO		1
 
 /*
- * Superblock - at offset 0, 4KB
+ * Superblock - 4KB struct at offset 0, occupies one block (block_size bytes)
  *
  * On-DAX Layout:
- * [ Superblock (4KB) | Base Image (optional) | Overlay (optional) | Page Cache (optional) ]
+ * [ Superblock (block_size) | Base Image (optional) | Overlay (optional) | Page Cache (optional) ]
  *
  * All layout metadata lives here - region headers only carry magic/version
  * for validation, not duplicated layout fields.
@@ -35,7 +35,7 @@
 struct daxfs_super {
 	__le32 magic;			/* DAXFS_SUPER_MAGIC */
 	__le32 version;			/* DAXFS_VERSION */
-	__le32 block_size;		/* 4096 */
+	__le32 block_size;		/* Native page size at mkfs time */
 	__le32 reserved0;
 	__le64 total_size;
 
@@ -215,7 +215,7 @@ struct daxfs_ovl_inode_entry {
 };
 
 /*
- * Data page entries are raw PAGE_SIZE allocations in the pool
+ * Data page entries are raw block_size allocations in the pool
  * with no header. This makes consecutively allocated pages
  * contiguous in memory, enabling large sequential reads.
  * The entry type is inferred from the hash key encoding.
@@ -223,7 +223,6 @@ struct daxfs_ovl_inode_entry {
  * Free-list recycling reuses the first 8 bytes of the page
  * as the next-free pointer (same as other entry types).
  */
-#define DAXFS_OVL_DATA_SIZE	4096
 
 struct daxfs_ovl_dirent_entry {
 	__le32 type;		/* DAXFS_OVL_DIRENT */
@@ -266,9 +265,9 @@ struct daxfs_ovl_dirlist_entry {
  * Slot count/hash_shift are in the main superblock.
  *
  * Region layout:
- *   [pcache_header (4KB)]
- *   [slot_metadata (slot_count * 16B, padded to 4KB)]
- *   [slot_data (slot_count * 4KB)]
+ *   [pcache_header (block_size)]
+ *   [slot_metadata (slot_count * 16B, padded to block_size)]
+ *   [slot_data (slot_count * block_size)]
  */
 
 #define DAXFS_PCACHE_MAGIC	0x70636163	/* "pcac" */

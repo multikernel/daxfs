@@ -256,8 +256,9 @@ setup_split() {
     echo "Nested split file" > "$SPLIT_SOURCE/subdir/nested.txt"
     ln -s hello.txt "$SPLIT_SOURCE/link_to_hello"
 
-    # Create a multi-page file (larger than 4KB)
-    dd if=/dev/urandom of="$SPLIT_SOURCE/largefile.bin" bs=4096 count=8 2>/dev/null
+    # Create a multi-page file (at least 4 pages on any page size)
+    PAGE_SIZE=$(getconf PAGESIZE)
+    dd if=/dev/urandom of="$SPLIT_SOURCE/largefile.bin" bs="$PAGE_SIZE" count=4 2>/dev/null
     LARGE_CKSUM=$(md5sum "$SPLIT_SOURCE/largefile.bin" | awk '{print $1}')
 
     # Create more files to exercise multiple cache slots

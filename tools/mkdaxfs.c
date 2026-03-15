@@ -38,6 +38,9 @@
 #define DAXFS_DEFAULT_OVERLAY_POOL	(64ULL * 1024 * 1024)	/* 64MB default pool */
 #define DAXFS_DEFAULT_BUCKET_COUNT	65536			/* 64K buckets = 1MB */
 
+/* Block size = native page size (stored in superblock, validated at mount) */
+static uint32_t block_size;
+
 /* From linux/dma-heap.h */
 struct dma_heap_allocation_data {
 	uint64_t len;
@@ -280,7 +283,7 @@ static void calculate_offsets(bool split, bool export)
 	struct hardlink_entry *hl;
 	uint64_t inode_offset = 0;  /* relative to base start */
 	uint64_t base_data_offset = ALIGN(inode_offset + file_count * DAXFS_INODE_SIZE,
-					  DAXFS_BLOCK_SIZE);
+					  block_size);
 	uint64_t back_offset = 0;
 
 	for (e = files_head; e; e = e->next) {
@@ -294,24 +297,24 @@ static void calculate_offsets(bool split, bool export)
 				e->data_offset = 0;
 			} else if (split) {
 				e->data_offset = back_offset;
-				back_offset += ALIGN(e->st.st_size, DAXFS_BLOCK_SIZE);
+				back_offset += ALIGN(e->st.st_size, block_size);
 				hl = find_hardlink(e->st.st_dev, e->st.st_ino);
 				if (hl)
 					hl->data_offset = e->data_offset;
 			} else {
 				e->data_offset = base_data_offset;
-				base_data_offset += ALIGN(e->st.st_size, DAXFS_BLOCK_SIZE);
+				base_data_offset += ALIGN(e->st.st_size, block_size);
 				hl = find_hardlink(e->st.st_dev, e->st.st_ino);
 				if (hl)
 					hl->data_offset = e->data_offset;
 			}
 		} else if (S_ISLNK(e->st.st_mode)) {
 			e->data_offset = base_data_offset;
-			base_data_offset += ALIGN(e->st.st_size + 1, DAXFS_BLOCK_SIZE);
+			base_data_offset += ALIGN(e->st.st_size + 1, block_size);
 		} else if (S_ISDIR(e->st.st_mode) && e->child_count > 0) {
 			e->data_offset = base_data_offset;
 			base_data_offset += ALIGN(e->child_count * DAXFS_DIRENT_SIZE,
-						  DAXFS_BLOCK_SIZE);
+						  block_size);
 		}
 	}
 
@@ -328,17 +331,17 @@ static size_t calculate_base_size(bool split)
 	struct file_entry *e;
 	uint64_t inode_offset = 0;
 	uint64_t data_offset = ALIGN(inode_offset + file_count * DAXFS_INODE_SIZE,
-				     DAXFS_BLOCK_SIZE);
+				     block_size);
 	size_t total = data_offset;
 
 	for (e = files_head; e; e = e->next) {
 		if (S_ISREG(e->st.st_mode)) {
 			if (!split && !e->is_hardlink)
-				total += ALIGN(e->st.st_size, DAXFS_BLOCK_SIZE);
+				total += ALIGN(e->st.st_size, block_size);
 		} else if (S_ISLNK(e->st.st_mode)) {
-			total += ALIGN(e->st.st_size + 1, DAXFS_BLOCK_SIZE);
+			total += ALIGN(e->st.st_size + 1, block_size);
 		} else if (S_ISDIR(e->st.st_mode) && e->child_count > 0) {
-			total += ALIGN(e->child_count * DAXFS_DIRENT_SIZE, DAXFS_BLOCK_SIZE);
+			total += ALIGN(e->child_count * DAXFS_DIRENT_SIZE, block_size);
 		}
 	}
 
@@ -367,18 +370,18 @@ static uint32_t calc_ilog2(uint32_t v)
 static size_t calculate_pcache_region_size(uint32_t slot_count)
 {
 	uint64_t meta_size = ALIGN((uint64_t)slot_count * sizeof(struct daxfs_pcache_slot),
-				   DAXFS_BLOCK_SIZE);
-	uint64_t data_size = (uint64_t)slot_count * DAXFS_BLOCK_SIZE;
+				   block_size);
+	uint64_t data_size = (uint64_t)slot_count * block_size;
 
-	return DAXFS_BLOCK_SIZE + meta_size + data_size;
+	return block_size + meta_size + data_size;
 }
 
 static size_t calculate_overlay_region_size(uint32_t bucket_count, size_t pool_size)
 {
 	uint64_t bucket_array_size = ALIGN((uint64_t)bucket_count *
 					   sizeof(struct daxfs_overlay_bucket),
-					   DAXFS_BLOCK_SIZE);
-	return DAXFS_BLOCK_SIZE + bucket_array_size + pool_size;
+					   block_size);
+	return block_size + bucket_array_size + pool_size;
 }
 
 static int write_overlay_region(void *overlay_mem, uint32_t bucket_count,
@@ -387,15 +390,15 @@ static int write_overlay_region(void *overlay_mem, uint32_t bucket_count,
 	struct daxfs_overlay_header *hdr = overlay_mem;
 	uint64_t bucket_array_size = ALIGN((uint64_t)bucket_count *
 					   sizeof(struct daxfs_overlay_bucket),
-					   DAXFS_BLOCK_SIZE);
-	size_t total = DAXFS_BLOCK_SIZE + bucket_array_size + pool_size;
+					   block_size);
+	size_t total = block_size + bucket_array_size + pool_size;
 
 	memset(overlay_mem, 0, total);
 
 	hdr->magic = htole32(DAXFS_OVERLAY_MAGIC);
 	hdr->version = htole32(DAXFS_OVERLAY_VERSION);
-	hdr->bucket_offset = htole64(DAXFS_BLOCK_SIZE);
-	hdr->pool_offset = htole64(DAXFS_BLOCK_SIZE + bucket_array_size);
+	hdr->bucket_offset = htole64(block_size);
+	hdr->pool_offset = htole64(block_size + bucket_array_size);
 	hdr->pool_size = htole64(pool_size);
 	hdr->pool_alloc = htole64(0);
 	hdr->next_ino = htole64(next_ino_val);
@@ -557,10 +560,10 @@ static int write_pcache_region(void *pcache_mem, uint32_t slot_count)
 {
 	struct daxfs_pcache_header *hdr = pcache_mem;
 	uint64_t meta_size = ALIGN((uint64_t)slot_count * sizeof(struct daxfs_pcache_slot),
-				   DAXFS_BLOCK_SIZE);
-	uint64_t slot_meta_offset = DAXFS_BLOCK_SIZE;
-	uint64_t slot_data_offset = DAXFS_BLOCK_SIZE + meta_size;
-	size_t total = slot_data_offset + (uint64_t)slot_count * DAXFS_BLOCK_SIZE;
+				   block_size);
+	uint64_t slot_meta_offset = block_size;
+	uint64_t slot_data_offset = block_size + meta_size;
+	size_t total = slot_data_offset + (uint64_t)slot_count * block_size;
 
 	memset(pcache_mem, 0, total);
 
@@ -581,7 +584,7 @@ static void fill_super_common(struct daxfs_super *super, uint64_t total_size)
 {
 	super->magic = htole32(DAXFS_SUPER_MAGIC);
 	super->version = htole32(DAXFS_VERSION);
-	super->block_size = htole32(DAXFS_BLOCK_SIZE);
+	super->block_size = htole32(block_size);  /* Native page size */
 	super->total_size = htole64(total_size);
 }
 
@@ -593,7 +596,7 @@ static void fill_super_base(struct daxfs_super *super, uint64_t base_offset,
 {
 	uint64_t inode_offset = 0;
 	uint64_t data_offset = ALIGN(inode_offset + file_count * DAXFS_INODE_SIZE,
-				     DAXFS_BLOCK_SIZE);
+				     block_size);
 
 	super->base_offset = htole64(base_offset);
 	super->base_size = htole64(base_size);
@@ -612,12 +615,12 @@ static int write_split_image(void *mem, size_t mem_size, const char *src_dir,
 			     size_t overlay_pool_size, uint32_t pcache_slots)
 {
 	struct daxfs_super *super = mem;
-	uint64_t base_offset = DAXFS_BLOCK_SIZE;
-	uint64_t overlay_offset = ALIGN(base_offset + base_size, DAXFS_BLOCK_SIZE);
+	uint64_t base_offset = block_size;
+	uint64_t overlay_offset = ALIGN(base_offset + base_size, block_size);
 	size_t overlay_region_size = calculate_overlay_region_size(overlay_buckets,
 								  overlay_pool_size);
 	uint64_t pcache_offset = ALIGN(overlay_offset + overlay_region_size,
-				       DAXFS_BLOCK_SIZE);
+				       block_size);
 	size_t pcache_region_size = calculate_pcache_region_size(pcache_slots);
 	uint64_t total = pcache_offset + pcache_region_size;
 
@@ -654,7 +657,7 @@ static int write_split_image(void *mem, size_t mem_size, const char *src_dir,
 	write_pcache_region(mem + pcache_offset, pcache_slots);
 
 	printf("Image layout (split mode):\n");
-	printf("  Superblock:    0x%x - 0x%x\n", 0, DAXFS_BLOCK_SIZE);
+	printf("  Superblock:    0x%x - 0x%x\n", 0, block_size);
 	printf("  Base image:    0x%lx - 0x%lx (%zu bytes, metadata only)\n",
 	       (unsigned long)base_offset,
 	       (unsigned long)(base_offset + base_size),
@@ -675,12 +678,12 @@ static size_t calculate_split_dax_size(size_t base_size, uint32_t overlay_bucket
 				       size_t overlay_pool_size,
 				       uint32_t pcache_slots)
 {
-	uint64_t base_offset = DAXFS_BLOCK_SIZE;
-	uint64_t overlay_offset = ALIGN(base_offset + base_size, DAXFS_BLOCK_SIZE);
+	uint64_t base_offset = block_size;
+	uint64_t overlay_offset = ALIGN(base_offset + base_size, block_size);
 	size_t overlay_region_size = calculate_overlay_region_size(overlay_buckets,
 								  overlay_pool_size);
 	uint64_t pcache_offset = ALIGN(overlay_offset + overlay_region_size,
-				       DAXFS_BLOCK_SIZE);
+				       block_size);
 	size_t pcache_region_size = calculate_pcache_region_size(pcache_slots);
 
 	return pcache_offset + pcache_region_size;
@@ -695,7 +698,7 @@ static int write_empty_image(void *mem, size_t mem_size,
 			     uint32_t pcache_slots)
 {
 	struct daxfs_super *super = mem;
-	uint64_t overlay_offset = DAXFS_BLOCK_SIZE;
+	uint64_t overlay_offset = block_size;
 	size_t overlay_region_size = calculate_overlay_region_size(overlay_buckets,
 								  overlay_pool_size);
 	uint64_t pcache_offset = 0;
@@ -704,7 +707,7 @@ static int write_empty_image(void *mem, size_t mem_size,
 
 	if (pcache_slots) {
 		pcache_offset = ALIGN(overlay_offset + overlay_region_size,
-				      DAXFS_BLOCK_SIZE);
+				      block_size);
 		pcache_region_size = calculate_pcache_region_size(pcache_slots);
 		total = pcache_offset + pcache_region_size;
 	} else {
@@ -751,9 +754,9 @@ static int write_empty_image(void *mem, size_t mem_size,
 		uint64_t bucket_array_size = ALIGN(
 			(uint64_t)overlay_buckets *
 			sizeof(struct daxfs_overlay_bucket),
-			DAXFS_BLOCK_SIZE);
+			block_size);
 		void *pool_base = mem + overlay_offset +
-			DAXFS_BLOCK_SIZE + bucket_array_size;
+			block_size + bucket_array_size;
 		struct daxfs_ovl_inode_entry *ie;
 		struct daxfs_overlay_bucket *buckets;
 		uint64_t key, pool_off;
@@ -774,7 +777,7 @@ static int write_empty_image(void *mem, size_t mem_size,
 
 		/* Insert into hash table */
 		key = DAXFS_OVL_KEY_INODE(DAXFS_ROOT_INO);
-		buckets = mem + overlay_offset + DAXFS_BLOCK_SIZE;
+		buckets = mem + overlay_offset + block_size;
 		idx = (uint32_t)(key & (overlay_buckets - 1));
 		buckets[idx].state_key = htole64(DAXFS_OVL_MAKE(
 			DAXFS_OVL_USED, key));
@@ -785,7 +788,7 @@ static int write_empty_image(void *mem, size_t mem_size,
 		write_pcache_region(mem + pcache_offset, pcache_slots);
 
 	printf("Image layout (empty mode):\n");
-	printf("  Superblock:    0x%x - 0x%x\n", 0, DAXFS_BLOCK_SIZE);
+	printf("  Superblock:    0x%x - 0x%x\n", 0, block_size);
 	printf("  Overlay:       0x%lx - 0x%lx (%zu bytes, %u buckets, %zu pool)\n",
 	       (unsigned long)overlay_offset,
 	       (unsigned long)(overlay_offset + overlay_region_size),
@@ -803,13 +806,13 @@ static size_t calculate_empty_size(uint32_t overlay_buckets,
 				   size_t overlay_pool_size,
 				   uint32_t pcache_slots)
 {
-	uint64_t overlay_offset = DAXFS_BLOCK_SIZE;
+	uint64_t overlay_offset = block_size;
 	size_t overlay_region_size = calculate_overlay_region_size(overlay_buckets,
 								  overlay_pool_size);
 
 	if (pcache_slots) {
 		uint64_t pcache_offset = ALIGN(overlay_offset + overlay_region_size,
-					       DAXFS_BLOCK_SIZE);
+					       block_size);
 		return pcache_offset + calculate_pcache_region_size(pcache_slots);
 	}
 
@@ -1060,7 +1063,7 @@ static int write_static_image(void *mem, size_t mem_size, const char *src_dir,
 			      size_t base_size)
 {
 	struct daxfs_super *super = mem;
-	uint64_t base_offset = DAXFS_BLOCK_SIZE;
+	uint64_t base_offset = block_size;
 
 	if (base_offset + base_size > mem_size) {
 		fprintf(stderr, "Error: image too large for allocated space\n");
@@ -1079,7 +1082,7 @@ static int write_static_image(void *mem, size_t mem_size, const char *src_dir,
 	write_base_image(mem + base_offset, base_size, src_dir, false);
 
 	printf("Image layout (static):\n");
-	printf("  Superblock:    0x%x - 0x%x\n", 0, DAXFS_BLOCK_SIZE);
+	printf("  Superblock:    0x%x - 0x%x\n", 0, block_size);
 	printf("  Base image:    0x%lx - 0x%lx (%zu bytes)\n",
 	       (unsigned long)base_offset,
 	       (unsigned long)(base_offset + base_size),
@@ -1090,7 +1093,7 @@ static int write_static_image(void *mem, size_t mem_size, const char *src_dir,
 
 static size_t calculate_static_size(size_t base_size)
 {
-	return DAXFS_BLOCK_SIZE + base_size;
+	return block_size + base_size;
 }
 
 static void print_usage(const char *prog)
@@ -1167,6 +1170,20 @@ int main(int argc, char *argv[])
 	uint32_t pcache_slots = 0;
 	size_t overlay_pool_size = 0;
 	uint32_t overlay_buckets = 0;
+
+	/* Set block_size to native page size */
+	{
+		long ps = sysconf(_SC_PAGESIZE);
+
+		if (ps <= 0) {
+			fprintf(stderr, "Warning: sysconf(_SC_PAGESIZE) failed, "
+				"defaulting to %u\n", DAXFS_MIN_BLOCK_SIZE);
+			ps = DAXFS_MIN_BLOCK_SIZE;
+		}
+		block_size = (uint32_t)ps;
+		if (block_size < DAXFS_MIN_BLOCK_SIZE)
+			block_size = DAXFS_MIN_BLOCK_SIZE;
+	}
 
 	while ((opt = getopt_long(argc, argv, "d:o:H:D:m:p:s:C:O:B:EXVh", long_options, NULL)) != -1) {
 		switch (opt) {
@@ -1338,8 +1355,8 @@ int main(int argc, char *argv[])
 						prev_power_of_2(file_count) : 16;
 				} else {
 					uint32_t backing_pages = (backing_file_size +
-								  DAXFS_BLOCK_SIZE - 1) /
-								 DAXFS_BLOCK_SIZE;
+								  block_size - 1) /
+								 block_size;
 					pcache_slots = backing_pages > 0 ?
 						prev_power_of_2(backing_pages) : 16;
 				}

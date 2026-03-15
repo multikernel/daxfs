@@ -47,7 +47,7 @@ static void daxfs_refresh_isize(struct inode *inode, struct daxfs_info *info)
  *
  * Resolution order: overlay page → pcache → inline base image data
  *
- * COW granularity is per-page (4KB). After a partial-page write, only
+ * COW granularity is per-page (block_size). After a partial-page write, only
  * the written page has an overlay entry; adjacent pages still resolve
  * through pcache or base image. This is intentional — each page is
  * independently versioned.

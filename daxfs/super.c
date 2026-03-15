@@ -154,8 +154,17 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	/* Validate version */
 	if (le32_to_cpu(info->super->version) != DAXFS_VERSION) {
-		pr_err("daxfs: unsupported version %u\n",
-		       le32_to_cpu(info->super->version));
+		pr_err("daxfs: unsupported version %u (expected %u)\n",
+		       le32_to_cpu(info->super->version), DAXFS_VERSION);
+		ret = -EINVAL;
+		goto err_unmap;
+	}
+
+	/* Validate block_size matches native page size */
+	info->block_size = le32_to_cpu(info->super->block_size);
+	if (info->block_size != PAGE_SIZE) {
+		pr_err("daxfs: block_size %u does not match PAGE_SIZE %lu\n",
+		       info->block_size, PAGE_SIZE);
 		ret = -EINVAL;
 		goto err_unmap;
 	}
@@ -320,8 +329,8 @@ static int daxfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	struct daxfs_info *info = DAXFS_SB(dentry->d_sb);
 
 	buf->f_type = DAXFS_SUPER_MAGIC;
-	buf->f_bsize = DAXFS_BLOCK_SIZE;
-	buf->f_blocks = info->size / DAXFS_BLOCK_SIZE;
+	buf->f_bsize = info->block_size;
+	buf->f_blocks = info->size / info->block_size;
 	buf->f_bfree = 0;
 	buf->f_bavail = 0;
 	buf->f_files = info->base_inode_count;
@@ -334,7 +343,7 @@ static int daxfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 		u64 pool_size = le64_to_cpu(ovl->header->pool_size);
 
 		if (pool_size > pool_used) {
-			buf->f_bfree = (pool_size - pool_used) / DAXFS_BLOCK_SIZE;
+			buf->f_bfree = (pool_size - pool_used) / info->block_size;
 			buf->f_bavail = buf->f_bfree;
 		}
 		buf->f_ffree = UINT_MAX;
