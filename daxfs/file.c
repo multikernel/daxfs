@@ -465,6 +465,14 @@ static int daxfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			return ret;
 	}
 
+	/*
+	 * setattr_copy() does not handle ATTR_SIZE — the filesystem
+	 * must update i_size itself.  Use truncate_setsize() which
+	 * also invalidates any stale pagecache above the new size.
+	 */
+	if (attr->ia_valid & ATTR_SIZE)
+		truncate_setsize(inode, attr->ia_size);
+
 	setattr_copy(idmap, inode, attr);
 	return 0;
 }
