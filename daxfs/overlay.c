@@ -328,30 +328,35 @@ static u64 overlay_pool_alloc_free(struct daxfs_overlay *ovl, u32 type)
 /*
  * Bump-allocate space from the pool.
  * Returns pool-relative offset, or (u64)-1 if out of space.
+ *
+ * @align: minimum alignment (8 for metadata, PAGE_SIZE for data pages).
+ *         Data pages must be page-aligned for DAX mmap PFN mapping.
  */
-static u64 overlay_pool_bump(struct daxfs_overlay *ovl, size_t size)
+static u64 overlay_pool_bump(struct daxfs_overlay *ovl, size_t size,
+			     size_t align)
 {
 	struct daxfs_overlay_header *hdr = ovl->header;
 	u64 pool_size = le64_to_cpu(hdr->pool_size);
-	u64 old_alloc, new_alloc;
+	u64 old_alloc, new_alloc, aligned_off;
 
-	/* Align to 8 bytes */
 	size = ALIGN(size, 8);
 
 	do {
 		old_alloc = le64_to_cpu(READ_ONCE(hdr->pool_alloc));
-		new_alloc = old_alloc + size;
+		aligned_off = ALIGN(old_alloc, align);
+		new_alloc = aligned_off + size;
 		if (new_alloc > pool_size)
 			return (u64)-1;
 	} while (cmpxchg((u64 *)&hdr->pool_alloc,
 			 cpu_to_le64(old_alloc),
 			 cpu_to_le64(new_alloc)) != cpu_to_le64(old_alloc));
 
-	return old_alloc;
+	return aligned_off;
 }
 
 /*
  * Allocate a pool entry: try recycled free list first, then bump.
+ * Data pages use PAGE_SIZE alignment for DAX mmap support.
  */
 static u64 overlay_pool_alloc(struct daxfs_overlay *ovl, size_t size, u32 type)
 {
@@ -361,33 +366,34 @@ static u64 overlay_pool_alloc(struct daxfs_overlay *ovl, size_t size, u32 type)
 	if (off != (u64)-1)
 		return off;
 
-	return overlay_pool_bump(ovl, size);
+	return overlay_pool_bump(ovl, size,
+				 type == DAXFS_OVL_DATA ? PAGE_SIZE : 8);
 }
 
 /*
- * Batch bump-allocate N entries of a given size from the pool.
- * Returns the base pool offset (first entry), or (u64)-1 if out of space.
- * Entries are spaced at ALIGN(entry_size, 8) intervals from the base.
+ * Batch bump-allocate N data pages from the pool.
+ * Returns the base pool offset (first page), or (u64)-1 if out of space.
+ * Pages are PAGE_SIZE-aligned and contiguous.
  */
 static u64 overlay_pool_bump_batch(struct daxfs_overlay *ovl,
 				   size_t entry_size, u32 count)
 {
 	struct daxfs_overlay_header *hdr = ovl->header;
 	u64 pool_size = le64_to_cpu(hdr->pool_size);
-	size_t aligned = ALIGN(entry_size, 8);
-	size_t total = aligned * count;
-	u64 old_alloc, new_alloc;
+	size_t total = entry_size * count;
+	u64 old_alloc, new_alloc, aligned_off;
 
 	do {
 		old_alloc = le64_to_cpu(READ_ONCE(hdr->pool_alloc));
-		new_alloc = old_alloc + total;
+		aligned_off = ALIGN(old_alloc, PAGE_SIZE);
+		new_alloc = aligned_off + total;
 		if (new_alloc > pool_size)
 			return (u64)-1;
 	} while (cmpxchg((u64 *)&hdr->pool_alloc,
 			 cpu_to_le64(old_alloc),
 			 cpu_to_le64(new_alloc)) != cpu_to_le64(old_alloc));
 
-	return old_alloc;
+	return aligned_off;
 }
 
 /*
@@ -413,6 +419,12 @@ int daxfs_overlay_init(struct daxfs_info *info)
 	if (le32_to_cpu(hdr->magic) != DAXFS_OVERLAY_MAGIC) {
 		pr_err("daxfs: invalid overlay magic 0x%x\n",
 		       le32_to_cpu(hdr->magic));
+		kfree(ovl);
+		return -EINVAL;
+	}
+	if (le32_to_cpu(hdr->version) != DAXFS_OVERLAY_VERSION) {
+		pr_err("daxfs: unsupported overlay version %u (expected %u)\n",
+		       le32_to_cpu(hdr->version), DAXFS_OVERLAY_VERSION);
 		kfree(ovl);
 		return -EINVAL;
 	}
@@ -508,7 +520,6 @@ void *daxfs_overlay_get_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 {
 	struct daxfs_overlay *ovl = info->overlay;
 	u64 key;
-	struct daxfs_ovl_data_entry *de;
 
 	if (!ovl)
 		return NULL;
@@ -517,17 +528,16 @@ void *daxfs_overlay_get_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 		return NULL;
 
 	key = DAXFS_OVL_KEY_DATA(ino, pgoff);
-	de = overlay_lookup(ovl, info, key);
-	if (!de)
-		return NULL;
-
-	return de->data;
+	return overlay_lookup(ovl, info, key);
 }
 
 /*
- * Allocate a new data page entry from the pool WITHOUT publishing it
- * to the hash table. The caller must initialise the data (COW) and
+ * Allocate a new data page from the pool WITHOUT publishing it
+ * to the hash table. The caller must initialise the data and
  * then call daxfs_overlay_publish_page() to make it visible.
+ *
+ * Data pages are raw PAGE_SIZE allocations (no header), so
+ * consecutive bump-allocated pages are contiguous in memory.
  *
  * Returns pointer to 4KB data area, or NULL on failure.
  * On success, *pool_off_out receives the pool offset (needed for publish).
@@ -537,7 +547,6 @@ void *daxfs_overlay_alloc_page(struct daxfs_info *info, u64 ino, u64 pgoff,
 {
 	struct daxfs_overlay *ovl = info->overlay;
 	u64 pool_off;
-	struct daxfs_ovl_data_entry *de;
 
 	if (!ovl)
 		return NULL;
@@ -545,23 +554,20 @@ void *daxfs_overlay_alloc_page(struct daxfs_info *info, u64 ino, u64 pgoff,
 	if (pgoff > DAXFS_OVL_MAX_PGOFF)
 		return NULL;
 
-	pool_off = overlay_pool_alloc(ovl, sizeof(*de), DAXFS_OVL_DATA);
+	pool_off = overlay_pool_alloc(ovl, DAXFS_OVL_DATA_SIZE,
+				      DAXFS_OVL_DATA);
 	if (pool_off == (u64)-1)
 		return NULL;
 
-	de = ovl->pool + pool_off;
-	de->type = cpu_to_le32(DAXFS_OVL_DATA);
-	de->reserved = 0;
-
 	*pool_off_out = pool_off;
-	return de->data;
+	return ovl->pool + pool_off;
 }
 
 /*
  * Publish a previously allocated data page to the hash table.
  *
- * Must be called AFTER the page data is fully initialised (COW
- * complete) so that other hosts never see uninitialised data.
+ * Must be called AFTER the page data is fully initialised so that
+ * other hosts never see uninitialised data.
  *
  * If another host already published this (ino, pgoff), recycles our
  * entry and returns the existing page.  Otherwise returns @page.
@@ -574,16 +580,13 @@ void *daxfs_overlay_publish_page(struct daxfs_info *info, u64 ino,
 	u64 key = DAXFS_OVL_KEY_DATA(ino, pgoff);
 	int ret;
 
-	/* Ensure COW data is globally visible before publishing key */
+	/* Ensure page data is globally visible before publishing key */
 	smp_wmb();
 
 	ret = overlay_insert(ovl, key, pool_off, NULL, false);
 	if (ret == -EEXIST) {
-		struct daxfs_ovl_data_entry *existing;
-
 		overlay_pool_free(ovl, pool_off, DAXFS_OVL_DATA);
-		existing = overlay_lookup(ovl, info, key);
-		return existing ? existing->data : NULL;
+		return overlay_lookup(ovl, info, key);
 	}
 	if (ret)
 		return NULL;
@@ -592,11 +595,12 @@ void *daxfs_overlay_publish_page(struct daxfs_info *info, u64 ino,
 }
 
 /*
- * Batch-allocate N data page entries from the pool for consecutive
- * pgoffs, WITHOUT publishing to the hash table.
+ * Batch-allocate N data pages from the pool for consecutive pgoffs,
+ * WITHOUT publishing to the hash table.
  *
- * Uses a single atomic bump for all N entries.  Caller must COW each
- * page and then call daxfs_overlay_publish_page() individually.
+ * Uses a single atomic bump for all N pages. Since data pages are
+ * raw PAGE_SIZE allocations (no header), the resulting pages are
+ * contiguous in memory, enabling large sequential reads later.
  *
  * pages[i] receives the data pointer; pool_offs[i] the pool offset.
  * Returns the number of successfully reserved entries.
@@ -606,22 +610,20 @@ int daxfs_overlay_alloc_pages_batch(struct daxfs_info *info, u64 ino,
 				    void **pages, u64 *pool_offs)
 {
 	struct daxfs_overlay *ovl = info->overlay;
-	size_t entry_size = sizeof(struct daxfs_ovl_data_entry);
-	size_t aligned = ALIGN(entry_size, 8);
 	u64 base_pool_off;
 	u32 i, ok = 0;
 
 	if (!ovl || count == 0)
 		return 0;
 
-	base_pool_off = overlay_pool_bump_batch(ovl, entry_size, count);
+	base_pool_off = overlay_pool_bump_batch(ovl, DAXFS_OVL_DATA_SIZE,
+						count);
 	if (base_pool_off == (u64)-1)
 		return 0;
 
 	for (i = 0; i < count; i++) {
 		u64 pgoff = start_pgoff + i;
-		u64 pool_off = base_pool_off + aligned * i;
-		struct daxfs_ovl_data_entry *de = ovl->pool + pool_off;
+		u64 pool_off = base_pool_off + DAXFS_OVL_DATA_SIZE * i;
 
 		if (pgoff > DAXFS_OVL_MAX_PGOFF) {
 			pages[i] = NULL;
@@ -629,9 +631,7 @@ int daxfs_overlay_alloc_pages_batch(struct daxfs_info *info, u64 ino,
 			continue;
 		}
 
-		de->type = cpu_to_le32(DAXFS_OVL_DATA);
-		de->reserved = 0;
-		pages[i] = de->data;
+		pages[i] = ovl->pool + pool_off;
 		pool_offs[i] = pool_off;
 		ok++;
 	}

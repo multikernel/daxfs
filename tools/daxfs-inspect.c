@@ -421,30 +421,43 @@ static int cmd_overlay(void)
 
 		used_buckets++;
 
-		/* Try to classify entry by reading pool entry type */
+		/*
+		 * Classify entry. INODE/DIRLIST keys have unique
+		 * sentinel pgoff values.  For other keys, read the
+		 * pool entry type field: dirent/dirlist entries still
+		 * have a type header; data pages (v2) do not, so any
+		 * unrecognised type value means data.
+		 */
 		if (value < pool_alloc) {
-			void *entry = mem + overlay_offset + pool_offset + value;
-			uint32_t type;
+			uint64_t key = DAXFS_OVL_KEY(state_key);
+			uint64_t pgoff = DAXFS_OVL_KEY_PGOFF(key);
 
-			if ((char *)entry + sizeof(uint32_t) <=
-			    (char *)mem + mem_size) {
-				type = le32_to_cpu(*(uint32_t *)entry);
-				switch (type) {
-				case DAXFS_OVL_INODE:
-					inode_count++;
-					break;
-				case DAXFS_OVL_DATA:
-					data_count++;
-					break;
-				case DAXFS_OVL_DIRENT: {
-					struct daxfs_ovl_dirent_entry *de = entry;
+			if (pgoff == 0xFFFFF) {
+				/* INODE sentinel */
+				inode_count++;
+			} else if (pgoff == 0xFFFFE) {
+				/* DIRLIST sentinel */
+			} else {
+				/*
+				 * Could be DATA or DIRENT. Check pool
+				 * entry type: dirents have type header,
+				 * data pages do not.
+				 */
+				void *entry = mem + overlay_offset +
+					      pool_offset + value;
+				if ((char *)entry + sizeof(uint32_t) <=
+				    (char *)mem + mem_size &&
+				    le32_to_cpu(*(uint32_t *)entry) ==
+				    DAXFS_OVL_DIRENT) {
+					struct daxfs_ovl_dirent_entry *de =
+						entry;
 					if (le32_to_cpu(de->flags) &
 					    DAXFS_OVL_DIRENT_TOMBSTONE)
 						tombstone_count++;
 					else
 						dirent_count++;
-					break;
-				}
+				} else {
+					data_count++;
 				}
 			}
 		}

@@ -125,7 +125,7 @@ struct daxfs_dirent {
  */
 
 #define DAXFS_OVERLAY_MAGIC	0x6f766c79	/* "ovly" */
-#define DAXFS_OVERLAY_VERSION	1
+#define DAXFS_OVERLAY_VERSION	2
 
 /* Entry types stored in pool */
 #define DAXFS_OVL_INODE		1
@@ -214,11 +214,16 @@ struct daxfs_ovl_inode_entry {
 	__le32 flags;
 };
 
-struct daxfs_ovl_data_entry {
-	__le32 type;		/* DAXFS_OVL_DATA */
-	__le32 reserved;
-	__u8   data[4096];	/* One page of file data */
-};
+/*
+ * Data page entries are raw PAGE_SIZE allocations in the pool
+ * with no header. This makes consecutively allocated pages
+ * contiguous in memory, enabling large sequential reads.
+ * The entry type is inferred from the hash key encoding.
+ *
+ * Free-list recycling reuses the first 8 bytes of the page
+ * as the next-free pointer (same as other entry types).
+ */
+#define DAXFS_OVL_DATA_SIZE	4096
 
 struct daxfs_ovl_dirent_entry {
 	__le32 type;		/* DAXFS_OVL_DIRENT */

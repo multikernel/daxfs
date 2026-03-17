@@ -171,12 +171,10 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		s32 pcslot = -1;
 
 		/*
-		 * Fast path: check per-inode overlay cache directly.
-		 * Avoids the full daxfs_base_file_data() call overhead
-		 * and prefetches the next page for sequential reads.
-		 * Overlay pages are 4104 bytes apart in the pool (8-byte
-		 * header + 4096 data), a stride the HW prefetcher
-		 * doesn't recognise, so SW prefetch matters here.
+		 * Fast path: overlay pages are raw PAGE_SIZE
+		 * allocations, so consecutive pages from the same
+		 * bump allocation are contiguous in memory. Detect
+		 * contiguous runs and copy them in a single call.
 		 */
 		if (info->overlay) {
 			u64 pgoff = pos >> PAGE_SHIFT;
@@ -184,25 +182,31 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 			if (page) {
 				u32 intra = pos & (PAGE_SIZE - 1);
+				void *start = page + intra;
+				size_t contig = min(count,
+						(size_t)(PAGE_SIZE - intra));
+				void *expect = page + PAGE_SIZE;
 
-				chunk = min(count,
-					    (size_t)(PAGE_SIZE - intra));
-
-				/* Prefetch next overlay page data */
-				if (count > chunk) {
+				/* Extend while next pages are contiguous */
+				while (contig < count) {
 					void *next = xa_load(&di->ovl_pages,
-							     pgoff + 1);
-					if (next)
-						prefetch(next);
+						pgoff + 1 +
+						(contig + intra -
+						 PAGE_SIZE) / PAGE_SIZE);
+					if (next != expect)
+						break;
+					contig += min(count - contig,
+						      (size_t)PAGE_SIZE);
+					expect += PAGE_SIZE;
 				}
 
-				if (copy_to_iter(page + intra, chunk,
-						 to) != chunk)
+				if (copy_to_iter(start, contig,
+						 to) != contig)
 					return total ? total : -EFAULT;
 
-				pos += chunk;
-				count -= chunk;
-				total += chunk;
+				pos += contig;
+				count -= contig;
+				total += contig;
 				continue;
 			}
 		}
@@ -571,12 +575,19 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 		if (!data)
 			return VM_FAULT_SIGBUS;
 
-		pfn = daxfs_data_to_pfn(info, data);
-		if (!pfn)
-			return VM_FAULT_SIGBUS;
-
-		return vmf_insert_pfn_prot(vma, vmf->address, pfn,
-			__pgprot(pgprot_val(vma->vm_page_prot) | _PAGE_RW));
+		/*
+		 * Direct PFN mapping for page-aligned overlay data.
+		 * Non-aligned pages fall through to anonymous copy.
+		 */
+		if (IS_ALIGNED((unsigned long)data, PAGE_SIZE)) {
+			pfn = daxfs_data_to_pfn(info, data);
+			if (pfn)
+				return vmf_insert_pfn_prot(vma,
+					vmf->address, pfn,
+					__pgprot(pgprot_val(
+						vma->vm_page_prot) |
+						_PAGE_RW));
+		}
 	}
 
 	/* Read path */
@@ -673,6 +684,9 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 		}
 	}
 	sb_end_pagefault(inode->i_sb);
+
+	if (!data || !IS_ALIGNED((unsigned long)data, PAGE_SIZE))
+		return VM_FAULT_SIGBUS;
 
 	pfn = daxfs_data_to_pfn(info, data);
 	if (!pfn)
