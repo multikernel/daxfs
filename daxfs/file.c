@@ -273,30 +273,38 @@ static void daxfs_write_prealloc(struct daxfs_info *info, struct inode *inode,
 	if (reserved == 0)
 		goto out;
 
-	/* COW each page, then publish to hash table, then cache */
+	/*
+	 * Fill each page, publish to hash table, then cache.
+	 * Skip base image lookup when inode has no base data.
+	 */
 	for (i = 0; i < npages; i++) {
 		void *page = pages[i];
 		u64 pgoff = first_pgoff + i;
-		size_t base_len = 0;
-		void *base_data;
-		s32 pcslot = -1;
 
 		if (!page)
 			continue;
 
-		/* COW from base image */
-		base_data = daxfs_base_file_data(info, inode,
-						 (loff_t)pgoff << PAGE_SHIFT,
-						 PAGE_SIZE, &base_len,
-						 &pcslot);
-		if (base_data && base_len > 0)
-			memcpy(page, base_data,
-			       min(base_len, (size_t)PAGE_SIZE));
-		if (base_len < PAGE_SIZE)
-			memset(page + base_len, 0, PAGE_SIZE - base_len);
-		daxfs_pcache_put_page(info, pcslot);
+		if (info->base_inodes && inode->i_ino >= 1 &&
+		    inode->i_ino <= info->base_inode_count) {
+			size_t base_len = 0;
+			void *base_data;
+			s32 pcslot = -1;
 
-		/* Publish AFTER COW is complete */
+			base_data = daxfs_base_file_data(info, inode,
+					(loff_t)pgoff << PAGE_SHIFT,
+					PAGE_SIZE, &base_len, &pcslot);
+			if (base_data && base_len > 0)
+				memcpy(page, base_data,
+				       min(base_len, (size_t)PAGE_SIZE));
+			if (base_len < PAGE_SIZE)
+				memset(page + base_len, 0,
+				       PAGE_SIZE - base_len);
+			daxfs_pcache_put_page(info, pcslot);
+		} else {
+			memset(page, 0, PAGE_SIZE);
+		}
+
+		/* Publish AFTER page is fully initialised */
 		page = daxfs_overlay_publish_page(info, inode->i_ino,
 						  pgoff, pool_offs[i], page);
 		if (page)
@@ -348,8 +356,11 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			if (!page)
 				return total ? total : -ENOSPC;
 
-			/* COW: copy existing data BEFORE publishing */
-			{
+			/*
+			 * Fill new overlay page before publishing.
+			 * Full-page writes need no base data copy.
+			 */
+			if (chunk < PAGE_SIZE) {
 				size_t base_len = 0;
 				void *base_data;
 				s32 pcslot = -1;
@@ -363,7 +374,7 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 					       min(base_len, (size_t)PAGE_SIZE));
 				daxfs_pcache_put_page(info, pcslot);
 
-				if (chunk < PAGE_SIZE && base_len < PAGE_SIZE)
+				if (base_len < PAGE_SIZE)
 					memset(page + base_len, 0,
 					       PAGE_SIZE - base_len);
 			}
