@@ -158,6 +158,8 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	loff_t pos = iocb->ki_pos;
 	size_t count = iov_iter_count(to);
 	size_t total = 0;
+	void *ovl_prefetched = NULL;
+	u64 ovl_prefetch_pgoff = 0;
 
 	if (pos >= inode->i_size)
 		return 0;
@@ -171,36 +173,52 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		s32 pcslot = -1;
 
 		/*
-		 * Fast path: overlay pages are raw PAGE_SIZE
-		 * allocations, so consecutive pages from the same
-		 * bump allocation are contiguous in memory. Detect
-		 * contiguous runs and copy them in a single call.
+		 * Fast path: check per-inode overlay cache directly.
+		 * Overlay pages are raw PAGE_SIZE allocations, so
+		 * consecutively bump-allocated pages are contiguous.
+		 *
+		 * We prefetch the next page and remember the pointer
+		 * across iterations to avoid redundant xa_load calls.
 		 */
 		if (info->overlay) {
 			u64 pgoff = pos >> PAGE_SHIFT;
-			void *page = xa_load(&di->ovl_pages, pgoff);
+			void *page;
+
+			if (ovl_prefetched &&
+			    pgoff == ovl_prefetch_pgoff) {
+				page = ovl_prefetched;
+				ovl_prefetched = NULL;
+			} else {
+				page = xa_load(&di->ovl_pages, pgoff);
+			}
 
 			if (page) {
 				u32 intra = pos & (PAGE_SIZE - 1);
-				void *start = page + intra;
 				size_t contig = min(count,
 						(size_t)(PAGE_SIZE - intra));
-				void *expect = page + PAGE_SIZE;
 
 				/* Extend while next pages are contiguous */
 				while (contig < count) {
-					void *next = xa_load(&di->ovl_pages,
-						pgoff + 1 +
+					u64 next_pgoff = pgoff + 1 +
 						(contig + intra -
-						 PAGE_SIZE) / PAGE_SIZE);
-					if (next != expect)
+						 PAGE_SIZE) / PAGE_SIZE;
+					void *next =
+					    daxfs_overlay_get_page_cached(
+						info, inode, next_pgoff);
+					if (next != page + contig + intra) {
+						if (next) {
+							ovl_prefetched = next;
+							ovl_prefetch_pgoff =
+								next_pgoff;
+							prefetch(next);
+						}
 						break;
+					}
 					contig += min(count - contig,
 						      (size_t)PAGE_SIZE);
-					expect += PAGE_SIZE;
 				}
 
-				if (copy_to_iter(start, contig,
+				if (copy_to_iter(page + intra, contig,
 						 to) != contig)
 					return total ? total : -EFAULT;
 
