@@ -211,8 +211,8 @@ int daxfs_validate_super(struct daxfs_info *info)
 			u64 bucket_array_size = ALIGN(
 				(u64)bucket_count *
 				sizeof(struct daxfs_overlay_bucket),
-				DAXFS_BLOCK_SIZE);
-			u64 min_size = DAXFS_BLOCK_SIZE + bucket_array_size;
+				info->block_size);
+			u64 min_size = info->block_size + bucket_array_size;
 
 			if (overlay_size < min_size) {
 				pr_err("daxfs: overlay region too small (%llu < %llu)\n",
@@ -245,9 +245,9 @@ int daxfs_validate_super(struct daxfs_info *info)
 
 		{
 			u64 meta_size = ALIGN((u64)slot_count * sizeof(struct daxfs_pcache_slot),
-					      DAXFS_BLOCK_SIZE);
-			u64 data_size = (u64)slot_count * DAXFS_BLOCK_SIZE;
-			u64 min_size = DAXFS_BLOCK_SIZE + meta_size + data_size;
+					      info->block_size);
+			u64 data_size = (u64)slot_count * info->block_size;
+			u64 min_size = info->block_size + meta_size + data_size;
 
 			if (pcache_size < min_size) {
 				pr_err("daxfs: pcache region too small (%llu < %llu)\n",

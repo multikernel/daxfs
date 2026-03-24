@@ -73,8 +73,9 @@ static int pcache_fill_slot(struct daxfs_pcache *pc, u32 slot_idx, u64 tag)
 {
 	u64 ino = PCACHE_TAG_INO(tag);
 	u64 pgoff = PCACHE_TAG_PGOFF(tag);
-	loff_t pos = (loff_t)pgoff << PAGE_SHIFT;
-	void *dst = pc->data + (u64)slot_idx * PAGE_SIZE;
+	u32 bsize = pc->block_size;
+	loff_t pos = (loff_t)pgoff << pc->block_shift;
+	void *dst = pc->data + (u64)slot_idx * bsize;
 	struct file *backing;
 	ssize_t n;
 	u64 old_val, new_val;
@@ -90,7 +91,7 @@ static int pcache_fill_slot(struct daxfs_pcache *pc, u32 slot_idx, u64 tag)
 		return -ENOENT;
 	}
 
-	n = kernel_read(backing, dst, PAGE_SIZE, &pos);
+	n = kernel_read(backing, dst, bsize, &pos);
 	if (n < 0) {
 		pr_err_ratelimited("daxfs: pcache read error ino=%llu pgoff=%llu: %zd\n",
 				   ino, pgoff, n);
@@ -103,8 +104,8 @@ static int pcache_fill_slot(struct daxfs_pcache *pc, u32 slot_idx, u64 tag)
 		return (int)n;
 	}
 
-	if (n < PAGE_SIZE)
-		memset(dst + n, 0, PAGE_SIZE - n);
+	if (n < bsize)
+		memset(dst + n, 0, bsize - n);
 
 	smp_wmb();
 
@@ -238,7 +239,7 @@ static void *pcache_wait_valid(struct daxfs_pcache *pc, u32 target_idx,
 			pcache_touch(&pc->slots[target_idx]);
 			if (pinned_slot)
 				*pinned_slot = (s32)target_idx;
-			return pc->data + (u64)target_idx * PAGE_SIZE;
+			return pc->data + (u64)target_idx * pc->block_size;
 		}
 		if (PCACHE_STATE(val) == PCACHE_STATE_FREE)
 			return ERR_PTR(-EAGAIN);
@@ -292,7 +293,7 @@ void *daxfs_pcache_get_page(struct daxfs_info *info, u64 ino, u64 pgoff,
 			pcache_touch(&pc->slots[slot_idx]);
 			if (pinned_slot)
 				*pinned_slot = (s32)slot_idx;
-			return pc->data + (u64)slot_idx * PAGE_SIZE;
+			return pc->data + (u64)slot_idx * pc->block_size;
 		}
 	}
 
@@ -334,7 +335,7 @@ restart:
 					pcache_touch(&pc->slots[idx]);
 					if (pinned_slot)
 						*pinned_slot = (s32)idx;
-					return pc->data + (u64)idx * PAGE_SIZE;
+					return pc->data + (u64)idx * pc->block_size;
 				}
 				break;
 
@@ -383,7 +384,7 @@ restart:
 					pcache_touch(&pc->slots[free_idx]);
 					if (pinned_slot)
 						*pinned_slot = (s32)free_idx;
-					return pc->data + (u64)free_idx * PAGE_SIZE;
+					return pc->data + (u64)free_idx * pc->block_size;
 				}
 				goto restart;
 			}
@@ -473,7 +474,7 @@ bool daxfs_is_pcache_data(struct daxfs_info *info, void *ptr)
 	if (!pc || !ptr)
 		return false;
 	return ptr >= pc->data &&
-	       ptr < pc->data + (u64)pc->slot_count * PAGE_SIZE;
+	       ptr < pc->data + (u64)pc->slot_count * pc->block_size;
 }
 
 /*
@@ -692,6 +693,8 @@ int daxfs_pcache_init(struct daxfs_info *info, const char *backing_path)
 		return -ENOMEM;
 
 	INIT_LIST_HEAD(&pc->backing_files);
+	pc->block_size = info->block_size;
+	pc->block_shift = ilog2(info->block_size);
 
 	hdr = daxfs_mem_ptr(info, pcache_offset);
 	if (le32_to_cpu(hdr->magic) != DAXFS_PCACHE_MAGIC) {

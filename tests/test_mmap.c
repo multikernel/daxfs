@@ -28,7 +28,7 @@ static int tests_run = 0;
 static int tests_passed = 0;
 
 #define TEST_FILE "mmap_test_file"
-#define PAGE_SIZE 4096
+static long PAGE_SIZE;
 
 #define TEST_START(name) do { \
 	printf("  TEST: %s ... ", name); \
@@ -691,6 +691,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 	mountpoint = argv[1];
+	PAGE_SIZE = sysconf(_SC_PAGESIZE);
 
 	printf("DAXFS mmap test suite\n");
 	printf("Mountpoint: %s\n\n", mountpoint);

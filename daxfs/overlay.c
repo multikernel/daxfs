@@ -514,7 +514,7 @@ int daxfs_overlay_set_inode(struct daxfs_info *info, u64 ino,
 
 /*
  * Get a data page from overlay.
- * Returns pointer to 4KB data, or NULL if not found.
+ * Returns pointer to block_size data, or NULL if not found.
  */
 void *daxfs_overlay_get_page(struct daxfs_info *info, u64 ino, u64 pgoff)
 {
@@ -536,10 +536,10 @@ void *daxfs_overlay_get_page(struct daxfs_info *info, u64 ino, u64 pgoff)
  * to the hash table. The caller must initialise the data and
  * then call daxfs_overlay_publish_page() to make it visible.
  *
- * Data pages are raw PAGE_SIZE allocations (no header), so
+ * Data pages are raw block_size allocations (no header), so
  * consecutive bump-allocated pages are contiguous in memory.
  *
- * Returns pointer to 4KB data area, or NULL on failure.
+ * Returns pointer to block_size data area, or NULL on failure.
  * On success, *pool_off_out receives the pool offset (needed for publish).
  */
 void *daxfs_overlay_alloc_page(struct daxfs_info *info, u64 ino, u64 pgoff,
@@ -554,7 +554,7 @@ void *daxfs_overlay_alloc_page(struct daxfs_info *info, u64 ino, u64 pgoff,
 	if (pgoff > DAXFS_OVL_MAX_PGOFF)
 		return NULL;
 
-	pool_off = overlay_pool_alloc(ovl, DAXFS_OVL_DATA_SIZE,
+	pool_off = overlay_pool_alloc(ovl, info->block_size,
 				      DAXFS_OVL_DATA);
 	if (pool_off == (u64)-1)
 		return NULL;
@@ -616,14 +616,14 @@ int daxfs_overlay_alloc_pages_batch(struct daxfs_info *info, u64 ino,
 	if (!ovl || count == 0)
 		return 0;
 
-	base_pool_off = overlay_pool_bump_batch(ovl, DAXFS_OVL_DATA_SIZE,
+	base_pool_off = overlay_pool_bump_batch(ovl, info->block_size,
 						count);
 	if (base_pool_off == (u64)-1)
 		return 0;
 
 	for (i = 0; i < count; i++) {
 		u64 pgoff = start_pgoff + i;
-		u64 pool_off = base_pool_off + DAXFS_OVL_DATA_SIZE * i;
+		u64 pool_off = base_pool_off + info->block_size * i;
 
 		if (pgoff > DAXFS_OVL_MAX_PGOFF) {
 			pages[i] = NULL;

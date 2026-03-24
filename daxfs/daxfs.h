@@ -39,6 +39,8 @@ struct daxfs_pcache {
 	void *data;                          /* On-DAX slot data area */
 	u32 slot_count;
 	u32 hash_mask;                       /* slot_count - 1 */
+	u32 block_size;                      /* Cached from daxfs_info */
+	u32 block_shift;                     /* ilog2(block_size) */
 	struct list_head backing_files;      /* List of daxfs_pcache_backing */
 	struct task_struct *fill_thread;     /* Host kthread, NULL for spawn */
 	struct file **backing_array;         /* O(1) lookup by ino, [0..max_ino] */
@@ -82,6 +84,9 @@ struct daxfs_info {
 
 	/* On-DAX Superblock */
 	struct daxfs_super *super;
+
+	/* Cached block_size from superblock (== PAGE_SIZE, validated at mount) */
+	u32 block_size;
 
 	/* Base image access */
 	struct daxfs_base_inode *base_inodes;

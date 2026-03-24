@@ -12,7 +12,6 @@
 #include <linux/dma-buf.h>
 #include <linux/splice.h>
 #include <linux/prefetch.h>
-#include <asm/pgtable.h>
 #include "daxfs.h"
 
 /*
@@ -47,7 +46,7 @@ static void daxfs_refresh_isize(struct inode *inode, struct daxfs_info *info)
  *
  * Resolution order: overlay page → pcache → inline base image data
  *
- * COW granularity is per-page (4KB). After a partial-page write, only
+ * COW granularity is per-page (block_size). After a partial-page write, only
  * the written page has an overlay entry; adjacent pages still resolve
  * through pcache or base image. This is intentional — each page is
  * independently versioned.
@@ -602,9 +601,7 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 			if (pfn)
 				return vmf_insert_pfn_prot(vma,
 					vmf->address, pfn,
-					__pgprot(pgprot_val(
-						vma->vm_page_prot) |
-						_PAGE_RW));
+					vm_get_page_prot(vma->vm_flags));
 		}
 	}
 
@@ -713,7 +710,7 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 	zap_vma_ptes(vma, vmf->address, PAGE_SIZE);
 
 	return vmf_insert_pfn_prot(vma, vmf->address, pfn,
-			__pgprot(pgprot_val(vma->vm_page_prot) | _PAGE_RW));
+			vm_get_page_prot(vma->vm_flags));
 }
 
 static const struct vm_operations_struct daxfs_dax_vm_ops = {
