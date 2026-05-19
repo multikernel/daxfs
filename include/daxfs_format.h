@@ -39,197 +39,50 @@ struct daxfs_gpu_info {
 };
 
 #define DAXFS_SUPER_MAGIC	0x64617835	/* "dax5" */
-#define DAXFS_VERSION		5
-#define DAXFS_BLOCK_SIZE	4096
+#define DAXFS_VERSION		8
+#define DAXFS_MIN_BLOCK_SIZE	4096	/* Minimum (superblock/header padding) */
 #define DAXFS_INODE_SIZE	64
 #define DAXFS_NAME_MAX		255
 #define DAXFS_DIRENT_SIZE	(16 + DAXFS_NAME_MAX)	/* ino + mode + name_len + reserved + name */
 #define DAXFS_ROOT_INO		1
 
-#define DAXFS_BRANCH_NAME_MAX	31
-#define DAXFS_MAX_BRANCHES	256
-
-/* Branch states */
-#define DAXFS_BRANCH_FREE	0
-#define DAXFS_BRANCH_ACTIVE	1
-#define DAXFS_BRANCH_COMMITTED	2
-#define DAXFS_BRANCH_ABORTED	3
-
-/* Delta log entry types */
-#define DAXFS_DELTA_WRITE	1	/* File data write */
-#define DAXFS_DELTA_CREATE	2	/* Create file */
-#define DAXFS_DELTA_DELETE	3	/* Delete (tombstone) */
-#define DAXFS_DELTA_TRUNCATE	4	/* Truncate file */
-#define DAXFS_DELTA_MKDIR	5	/* Create directory */
-#define DAXFS_DELTA_RENAME	6	/* Rename */
-#define DAXFS_DELTA_SETATTR	7	/* Inode metadata update */
-#define DAXFS_DELTA_SYMLINK	8	/* Create symlink */
-
 /*
- * Superblock - at offset 0, 4KB
+ * Superblock - 4KB struct at offset 0, occupies one block (block_size bytes)
  *
  * On-DAX Layout:
- * [ Superblock (4KB) | Branch Table | Base Image (optional) | Delta Region ]
+ * [ Superblock (block_size) | Base Image (optional) | Overlay (optional) | Page Cache (optional) ]
+ *
+ * All layout metadata lives here - region headers only carry magic/version
+ * for validation, not duplicated layout fields.
  */
-/*
- * Global coordination structure for cross-mount branch synchronization.
- * Located at offset 152 in superblock (start of reserved area).
- */
-struct daxfs_global_coord {
-	__le64 commit_sequence;		/* Incremented on each commit */
-	__le64 last_committed_id;	/* Branch ID that last committed */
-	__le32 coord_lock;		/* Simple spinlock (0=free, 1=held) */
-	__le32 padding;
-	__u8   reserved[40];		/* Total 64 bytes */
-};
-
 struct daxfs_super {
-	__le32 magic;			/* DAXFS_SUPER_MAGIC (0x64617834) */
+	__le32 magic;			/* DAXFS_SUPER_MAGIC */
 	__le32 version;			/* DAXFS_VERSION */
-	__le32 flags;
-	__le32 block_size;		/* 4096 */
+	__le32 block_size;		/* Native page size at mkfs time */
+	__le32 reserved0;
 	__le64 total_size;
 
 	/* Base image (optional embedded read-only image) */
 	__le64 base_offset;		/* Offset to base image (0 if none) */
 	__le64 base_size;
+	__le64 inode_offset;		/* Offset to inode table (relative to base_offset) */
+	__le32 inode_count;		/* Number of inodes */
+	__le32 root_inode;		/* Root directory inode number */
+	__le64 data_offset;		/* Offset to file data area (relative to base_offset) */
 
-	/* Branch management */
-	__le64 branch_table_offset;
-	__le32 branch_table_entries;	/* Max branches (DAXFS_MAX_BRANCHES) */
-	__le32 active_branches;
-	__le64 next_branch_id;
-	__le64 next_inode_id;		/* Global inode counter */
-
-	/* Delta region */
-	__le64 delta_region_offset;
-	__le64 delta_region_size;	/* Total size of delta region */
-	__le64 delta_alloc_offset;	/* Next free byte in delta region */
-
-	/* Global coordination - at offset 152 (64 bytes) */
-	struct daxfs_global_coord coord;
+	/* Hash overlay region (optional, enables writes) */
+	__le64 overlay_offset;		/* Offset to overlay region (0 if none) */
+	__le64 overlay_size;		/* Total size of overlay region */
+	__le32 overlay_bucket_count;	/* Number of buckets (power of 2) */
+	__le32 overlay_bucket_shift;	/* log2(bucket_count) */
 
 	/* Page cache for backing store mode */
 	__le64 pcache_offset;		/* Offset to page cache region (0 = no cache) */
 	__le64 pcache_size;		/* Total size of page cache region */
 	__le32 pcache_slot_count;	/* Number of cache slots */
 	__le32 pcache_hash_shift;	/* log2(slot_count) for masking */
-	__le32 pcache_pending;		/* Atomic: count of PENDING slots */
-	__le32 pcache_reserved;
 
-	__u8   reserved[3848];		/* Pad to 4KB (3880 - 32) */
-};
-
-/*
- * Branch record - 128 bytes
- */
-struct daxfs_branch {
-	__le64 branch_id;
-	__le64 parent_id;		/* 0 = no parent (main branch) */
-	__le64 delta_log_offset;	/* Start of this branch's delta log */
-	__le64 delta_log_size;		/* Bytes used */
-	__le64 delta_log_capacity;	/* Bytes allocated */
-	__le32 state;			/* FREE, ACTIVE, COMMITTED, ABORTED */
-	__le32 refcount;		/* Child branches + active mounts */
-	__le64 next_local_ino;		/* Branch-local inode counter */
-	char   name[32];		/* Branch name (null-terminated) */
-	__le32 generation;		/* Incremented on invalidation */
-	__u8   reserved[36];		/* Pad to 128 bytes */
-};
-
-/*
- * Delta log entry header - variable size entries
- */
-struct daxfs_delta_hdr {
-	__le32 type;
-	__le32 total_size;		/* Size of this entry including header */
-	__le64 ino;
-	__le64 timestamp;		/* For ordering */
-};
-
-/*
- * WRITE entry: header + this + data
- */
-struct daxfs_delta_write {
-	__le64 offset;			/* File offset */
-	__le32 len;			/* Data length */
-	__le32 flags;
-	/* Data follows immediately */
-};
-
-/*
- * CREATE entry: header + this + name
- */
-struct daxfs_delta_create {
-	__le64 parent_ino;
-	__le64 new_ino;
-	__le32 mode;
-	__le32 uid;
-	__le32 gid;
-	__le16 name_len;
-	__le16 flags;
-	/* Name follows immediately */
-};
-
-/*
- * DELETE entry (tombstone): header + this + name
- */
-struct daxfs_delta_delete {
-	__le64 parent_ino;
-	__le16 name_len;
-	__le16 flags;
-	__le32 reserved;
-	/* Name follows immediately */
-};
-
-/*
- * TRUNCATE entry: header + this
- */
-struct daxfs_delta_truncate {
-	__le64 new_size;
-};
-
-/*
- * RENAME entry: header + this + old_name + new_name
- */
-struct daxfs_delta_rename {
-	__le64 old_parent_ino;
-	__le64 new_parent_ino;
-	__le64 ino;
-	__le16 old_name_len;
-	__le16 new_name_len;
-	__le32 reserved;
-	/* old_name then new_name follow */
-};
-
-/*
- * SETATTR entry: header + this
- */
-struct daxfs_delta_setattr {
-	__le32 mode;
-	__le32 uid;
-	__le32 gid;
-	__le32 valid;			/* Bitmask of which fields are valid */
-	__le64 size;			/* For truncate via setattr */
-};
-
-/* Flags for daxfs_delta_setattr.valid */
-#define DAXFS_ATTR_MODE		(1 << 0)
-#define DAXFS_ATTR_UID		(1 << 1)
-#define DAXFS_ATTR_GID		(1 << 2)
-#define DAXFS_ATTR_SIZE		(1 << 3)
-
-/*
- * SYMLINK entry: header + this + name + target
- */
-struct daxfs_delta_symlink {
-	__le64 parent_ino;
-	__le64 new_ino;
-	__le32 uid;
-	__le32 gid;
-	__le16 name_len;
-	__le16 target_len;
-	/* Name follows immediately, then target (null-terminated) */
+	__u8   reserved[3984];		/* Pad to 4KB */
 };
 
 /*
@@ -238,33 +91,15 @@ struct daxfs_delta_symlink {
  * ============================================================================
  *
  * The base image is an optional embedded read-only filesystem image
- * that provides the initial state. New changes are stored in deltas.
+ * that provides the initial state. New changes are stored in the overlay.
  *
- * Version 4 uses flat directories: directory contents are stored as an
- * array of daxfs_dirent entries in the data area. No linked lists, no
- * string table - names are stored directly in directory entries.
+ * Layout within base region (no sub-header):
+ *   [Inode table] [File/dir/symlink data]
+ *
+ * Flat directories: directory contents are stored as an array of
+ * daxfs_dirent entries in the data area. No linked lists, no string
+ * table - names are stored directly in directory entries.
  */
-
-#define DAXFS_BASE_MAGIC	0x64646135	/* "dda5" - version 5 */
-
-/* Base image flags */
-#define DAXFS_BASE_FLAG_EXTERNAL_DATA	(1 << 0)  /* Regular file data in external backing file */
-
-/*
- * Base image superblock - always at base_offset, padded to DAXFS_BLOCK_SIZE
- */
-struct daxfs_base_super {
-	__le32 magic;		/* DAXFS_BASE_MAGIC */
-	__le32 version;		/* 4 */
-	__le32 flags;
-	__le32 block_size;	/* Always DAXFS_BLOCK_SIZE */
-	__le64 total_size;	/* Total base image size in bytes */
-	__le64 inode_offset;	/* Offset to inode table (relative to base) */
-	__le32 inode_count;	/* Number of inodes */
-	__le32 root_inode;	/* Root directory inode number */
-	__le64 data_offset;	/* Offset to file data area (relative to base) */
-	__u8   reserved[4048];	/* Pad to 4KB */
-};
 
 /*
  * Base image inode - fixed size for simple indexing (64 bytes)
@@ -302,6 +137,147 @@ struct daxfs_dirent {
 
 /*
  * ============================================================================
+ * Hash Overlay (CAS-based, lock-free writes for multi-kernel access)
+ * ============================================================================
+ *
+ * Open-addressing hash table on DAX memory. Each bucket is 16 bytes
+ * so cmpxchg16b can atomically update state + key + value.
+ *
+ * Pool entries are bump-allocated from a contiguous region after
+ * the bucket array.
+ */
+
+#define DAXFS_OVERLAY_MAGIC	0x6f766c79	/* "ovly" */
+#define DAXFS_OVERLAY_VERSION	2
+
+/* Entry types stored in pool */
+#define DAXFS_OVL_INODE		1
+#define DAXFS_OVL_DATA		2
+#define DAXFS_OVL_DIRENT	3
+#define DAXFS_OVL_DIRLIST	4	/* Per-directory dirent list head */
+
+/* Dirent flags */
+#define DAXFS_OVL_DIRENT_TOMBSTONE	(1 << 0)
+
+/* Sentinel for end of dirent hash collision chain */
+#define DAXFS_OVL_NO_NEXT		(((__u64)-1))
+
+/* Sentinel for empty free list / end of free chain */
+#define DAXFS_OVL_FREE_END		(((__u64)-1))
+
+/*
+ * Bucket: 16 bytes, open addressing with linear probing.
+ * state_key: bit[0] = state (FREE=0, USED=1), bits[63:1] = key
+ */
+struct daxfs_overlay_bucket {
+	__le64 state_key;	/* CAS target: bit0=USED, bits[63:1]=key */
+	__le64 value;		/* Pool offset of entry */
+};
+
+#define DAXFS_OVL_FREE		0
+#define DAXFS_OVL_USED		1
+
+#define DAXFS_OVL_STATE(v)	((v) & 1)
+#define DAXFS_OVL_KEY(v)	((v) >> 1)
+#define DAXFS_OVL_MAKE(state, key)	(((key) << 1) | (state))
+
+/*
+ * Key encoding (63 bits):
+ *   DATA:    (ino << 20) | (pgoff & 0xFFFFF)   — pgoff must be < 0xFFFFE
+ *   INODE:   (ino << 20) | 0xFFFFF             — sentinel
+ *   DIRLIST: (ino << 20) | 0xFFFFE             — sentinel
+ *   DIRENT:  hash(parent_ino, name)            — 63-bit FNV-1a variant
+ */
+#define DAXFS_OVL_MAX_PGOFF			0xFFFFDULL	/* Max valid pgoff for DATA keys */
+#define DAXFS_OVL_KEY_DATA(ino, pgoff)		((((__u64)(ino)) << 20) | ((pgoff) & 0xFFFFF))
+#define DAXFS_OVL_KEY_INODE(ino)		((((__u64)(ino)) << 20) | 0xFFFFF)
+#define DAXFS_OVL_KEY_DIRLIST(ino)		((((__u64)(ino)) << 20) | 0xFFFFE)
+#define DAXFS_OVL_KEY_INO(key)			((key) >> 20)
+#define DAXFS_OVL_KEY_PGOFF(key)		((key) & 0xFFFFF)
+
+/*
+ * Overlay header — 4KB, at overlay_offset
+ *
+ * Bucket count/shift are in the main superblock.
+ * This header carries magic/version for validation plus
+ * runtime-mutable fields (pool_alloc, next_ino).
+ */
+struct daxfs_overlay_header {
+	__le32 magic;			/* DAXFS_OVERLAY_MAGIC */
+	__le32 version;			/* DAXFS_OVERLAY_VERSION */
+	__le64 bucket_offset;		/* From overlay start */
+	__le64 pool_offset;		/* From overlay start */
+	__le64 pool_size;		/* Total pool capacity */
+	__le64 pool_alloc;		/* Atomic bump allocator (next free byte) */
+	__le64 next_ino;		/* Atomic inode counter */
+
+	/*
+	 * Per-size-class free lists for pool entry recycling.
+	 * Each is a CAS-based stack head (pool offset, or
+	 * DAXFS_OVL_FREE_END if empty). Freed entries reuse
+	 * their first 8 bytes as the next-free pointer.
+	 */
+	__le64 free_inode;		/* Free list: inode entries */
+	__le64 free_data;		/* Free list: data page entries */
+	__le64 free_dirent;		/* Free list: dirent entries */
+
+	__u8   reserved[4096 - 72];	/* Pad to 4KB */
+};
+
+/*
+ * Pool entries (variable size, bump-allocated)
+ */
+struct daxfs_ovl_inode_entry {
+	__le32 type;		/* DAXFS_OVL_INODE */
+	__le32 mode;
+	__le32 uid;
+	__le32 gid;
+	__le64 size;
+	__le32 nlink;
+	__le32 flags;
+};
+
+/*
+ * Data page entries are raw block_size allocations in the pool
+ * with no header. This makes consecutively allocated pages
+ * contiguous in memory, enabling large sequential reads.
+ * The entry type is inferred from the hash key encoding.
+ *
+ * Free-list recycling reuses the first 8 bytes of the page
+ * as the next-free pointer (same as other entry types).
+ */
+
+struct daxfs_ovl_dirent_entry {
+	__le32 type;		/* DAXFS_OVL_DIRENT */
+	__le32 flags;		/* DAXFS_OVL_DIRENT_TOMBSTONE etc. */
+	__le64 parent_ino;
+	__le64 child_ino;
+	__le32 child_mode;
+	__le16 name_len;
+	__u8   reserved[2];
+	__le64 next;		/* Pool offset of next entry in hash chain,
+				 * DAXFS_OVL_NO_NEXT = end of chain */
+	__le64 dir_next;	/* Next dirent in same directory's list,
+				 * DAXFS_OVL_NO_NEXT = end of list */
+	char   name[DAXFS_NAME_MAX + 1]; /* Null-terminated */
+};
+
+/*
+ * Per-directory dirent list head — links all overlay dirents in one
+ * directory for O(n) readdir instead of O(bucket_count).
+ *
+ * Keyed by DAXFS_OVL_KEY_DIRLIST(parent_ino). The 'first' field is
+ * the pool offset of the first dirent; new entries are CAS-prepended.
+ */
+struct daxfs_ovl_dirlist_entry {
+	__le32 type;		/* DAXFS_OVL_DIRLIST */
+	__le32 reserved;
+	__le64 first;		/* Pool offset of first dirent, or
+				 * DAXFS_OVL_NO_NEXT = empty */
+};
+
+/*
+ * ============================================================================
  * Page Cache (shared across kernel instances via DAX memory)
  * ============================================================================
  *
@@ -309,40 +285,67 @@ struct daxfs_dirent {
  * to exactly one cache slot via hash. 3-state machine with all transitions
  * via cmpxchg on DAX memory (no IPIs needed).
  *
+ * Slot count/hash_shift are in the main superblock.
+ *
  * Region layout:
- *   [pcache_header (4KB)]
- *   [slot_metadata (slot_count * 16B, padded to 4KB)]
- *   [slot_data (slot_count * 4KB)]
+ *   [pcache_header (block_size)]
+ *   [slot_metadata (slot_count * 16B, padded to block_size)]
+ *   [slot_data (slot_count * block_size)]
  */
 
 #define DAXFS_PCACHE_MAGIC	0x70636163	/* "pcac" */
-#define DAXFS_PCACHE_VERSION	1
+#define DAXFS_PCACHE_VERSION	2
 
 /* Cache slot states (stored in bits[1:0] of state_tag) */
 #define PCACHE_STATE_FREE	0	/* Slot empty, available */
 #define PCACHE_STATE_PENDING	1	/* Claimed, needs host to fill */
 #define PCACHE_STATE_VALID	2	/* Data ready */
 
-/* Helpers for packed state_tag field */
+/*
+ * Packed state_tag layout (64 bits):
+ *   bits[1:0]  = state (FREE/PENDING/VALID)
+ *   bits[5:2]  = refcount (0-15 concurrent readers)
+ *   bits[63:6] = tag
+ *
+ * Readers CAS-increment refcount to pin a slot during access.
+ * Eviction only succeeds when refcount == 0.
+ */
 #define PCACHE_STATE(v)		((v) & 3)
-#define PCACHE_TAG(v)		((v) >> 2)
-#define PCACHE_MAKE(state, tag)	(((tag) << 2) | (state))
+#define PCACHE_REFCNT(v)	(((v) >> 2) & 0xF)
+#define PCACHE_TAG(v)		((v) >> 6)
+#define PCACHE_MAKE(state, tag)	(((tag) << 6) | (state))
+#define PCACHE_REFCNT_INC	4	/* Add to state_tag to increment refcount */
+#define PCACHE_REFCNT_MAX	15
 
+/* Multi-file tag encoding: tag = (ino << 20) | (pgoff & 0xFFFFF) */
+#define PCACHE_TAG_MAKE(ino, pgoff)	((((__u64)(ino)) << 20) | ((pgoff) & 0xFFFFF))
+#define PCACHE_TAG_INO(tag)		((tag) >> 20)
+#define PCACHE_TAG_PGOFF(tag)		((tag) & 0xFFFFF)
+
+#define PCACHE_PROBE_LEN	8
+#define PCACHE_SWEEP_BATCH	64
+
+/*
+ * Page cache header — 4KB, at pcache_offset
+ *
+ * Slot count/hash_shift are in the main superblock.
+ * This header carries magic/version for validation plus
+ * runtime-mutable fields (evict_hand, pending_count).
+ */
 struct daxfs_pcache_header {		/* 4KB, at pcache_offset */
 	__le32 magic;			/* DAXFS_PCACHE_MAGIC */
 	__le32 version;			/* DAXFS_PCACHE_VERSION */
-	__le32 slot_count;
-	__le32 hash_shift;
 	__le64 slot_meta_offset;	/* From pcache_offset */
 	__le64 slot_data_offset;	/* From pcache_offset */
 	__le32 evict_hand;		/* Clock sweep position (atomic) */
 	__le32 pending_count;		/* Atomic: PENDING slots outstanding */
-	__u8   reserved[4096 - 40];
+	__u8   reserved[4096 - 32];
 };
 
 struct daxfs_pcache_slot {		/* 16 bytes per slot */
-	__le64 state_tag;		/* bits[1:0] = state, bits[63:2] = tag */
-					/* Packed so cmpxchg atomically sets both */
+	__le64 state_tag;		/* bits[1:0] = state, bits[5:2] = refcount,
+					 * bits[63:6] = tag. Packed so cmpxchg
+					 * atomically updates all three. */
 	__le32 ref_bit;			/* Clock algorithm: recently accessed */
 	__le32 reserved;
 };

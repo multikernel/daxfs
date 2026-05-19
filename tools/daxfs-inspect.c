@@ -4,14 +4,13 @@
  *
  * Copyright (C) 2026 Multikernel Technologies, Inc. All rights reserved.
  *
- * Read-only inspection of daxfs via physical memory (/dev/mem).
+ * Read-only inspection of daxfs via physical memory (/dev/mem) or dma-buf.
  * Can parse mount point to automatically get phys/size from mountinfo.
  *
  * Usage:
- *   daxfs-inspect list -m /mnt/daxfs
- *   daxfs-inspect list -p 0x100000000 -s 256M
- *   daxfs-inspect info -m /mnt/daxfs -b main
  *   daxfs-inspect status -m /mnt/daxfs
+ *   daxfs-inspect overlay -m /mnt/daxfs
+ *   daxfs-inspect status -p 0x100000000 -s 256M
  */
 
 #define _GNU_SOURCE
@@ -39,60 +38,9 @@
 
 static void *mem;
 static size_t mem_size;
-static int dmabuf_fd = -1;  /* Keep dma-buf fd open until munmap */
+static int dmabuf_fd = -1;
 static struct daxfs_super *super;
-static struct daxfs_branch *branch_table;
 
-static const char *state_to_string(uint32_t state)
-{
-	switch (state) {
-	case DAXFS_BRANCH_FREE:
-		return "free";
-	case DAXFS_BRANCH_ACTIVE:
-		return "active";
-	case DAXFS_BRANCH_COMMITTED:
-		return "committed";
-	case DAXFS_BRANCH_ABORTED:
-		return "aborted";
-	default:
-		return "unknown";
-	}
-}
-
-static struct daxfs_branch *find_branch_by_name(const char *name)
-{
-	uint32_t count = le32_to_cpu(super->branch_table_entries);
-
-	for (uint32_t i = 0; i < count; i++) {
-		struct daxfs_branch *b = &branch_table[i];
-		uint32_t state = le32_to_cpu(b->state);
-
-		if (state != DAXFS_BRANCH_FREE &&
-		    strncmp(b->name, name, sizeof(b->name)) == 0)
-			return b;
-	}
-	return NULL;
-}
-
-static struct daxfs_branch *find_branch_by_id(uint64_t id)
-{
-	uint32_t count = le32_to_cpu(super->branch_table_entries);
-
-	for (uint32_t i = 0; i < count; i++) {
-		struct daxfs_branch *b = &branch_table[i];
-		uint32_t state = le32_to_cpu(b->state);
-
-		if (state != DAXFS_BRANCH_FREE &&
-		    le64_to_cpu(b->branch_id) == id)
-			return b;
-	}
-	return NULL;
-}
-
-/*
- * Get size from /proc/self/mountinfo for a daxfs mount.
- * Returns 0 on success, -1 on failure.
- */
 static int get_mount_size(const char *mount_point, size_t *size)
 {
 	FILE *fp;
@@ -175,21 +123,14 @@ static int get_mount_size(const char *mount_point, size_t *size)
 	return 0;
 }
 
-/*
- * Open memory via mount point.
- * First tries ioctl to get dma-buf fd (no root needed for dma-buf mounts).
- * Returns 0 on success, -1 on failure.
- */
 static int open_mount(const char *mount_point)
 {
 	int fd;
 	size_t size;
 
-	/* Get size from mountinfo */
 	if (get_mount_size(mount_point, &size) < 0)
 		return -1;
 
-	/* Open mount point and try ioctl */
 	fd = open(mount_point, O_RDONLY);
 	if (fd < 0) {
 		perror(mount_point);
@@ -210,7 +151,6 @@ static int open_mount(const char *mount_point)
 		return -1;
 	}
 
-	/* mmap the dma-buf - keep fd open until munmap */
 	mem_size = size;
 	mem = mmap(NULL, size, PROT_READ, MAP_SHARED, dmabuf_fd, 0);
 
@@ -257,7 +197,6 @@ static int validate_and_setup(void)
 		return -1;
 	}
 
-	branch_table = mem + le64_to_cpu(super->branch_table_offset);
 	return 0;
 }
 
@@ -271,155 +210,13 @@ static void close_mem(void)
 	}
 }
 
-static int cmd_list(void)
-{
-	uint32_t count = le32_to_cpu(super->branch_table_entries);
-	uint32_t active = 0;
-
-	printf("%-4s  %-20s  %-10s  %-10s  %-8s  %-6s  %-12s  %s\n",
-	       "ID", "NAME", "STATE", "PARENT", "REFCNT", "GEN", "DELTA_USED", "DELTA_CAP");
-	printf("%-4s  %-20s  %-10s  %-10s  %-8s  %-6s  %-12s  %s\n",
-	       "----", "--------------------", "----------", "----------",
-	       "--------", "------", "------------", "------------");
-
-	for (uint32_t i = 0; i < count; i++) {
-		struct daxfs_branch *b = &branch_table[i];
-		uint32_t state = le32_to_cpu(b->state);
-
-		if (state == DAXFS_BRANCH_FREE)
-			continue;
-
-		active++;
-
-		uint64_t id = le64_to_cpu(b->branch_id);
-		uint64_t parent_id = le64_to_cpu(b->parent_id);
-		uint32_t refcount = le32_to_cpu(b->refcount);
-		uint32_t generation = le32_to_cpu(b->generation);
-		uint64_t delta_used = le64_to_cpu(b->delta_log_size);
-		uint64_t delta_cap = le64_to_cpu(b->delta_log_capacity);
-
-		char parent_str[32];
-		if (parent_id == 0) {
-			snprintf(parent_str, sizeof(parent_str), "-");
-		} else {
-			struct daxfs_branch *p = find_branch_by_id(parent_id);
-			if (p)
-				snprintf(parent_str, sizeof(parent_str), "%s", p->name);
-			else
-				snprintf(parent_str, sizeof(parent_str), "id:%lu", parent_id);
-		}
-
-		printf("%-4lu  %-20s  %-10s  %-10s  %-8u  %-6u  %-12lu  %lu\n",
-		       id, b->name, state_to_string(state), parent_str,
-		       refcount, generation, delta_used, delta_cap);
-	}
-
-	printf("\nTotal: %u branches, %u slots available\n",
-	       active, count - active);
-
-	return 0;
-}
-
-static int cmd_info(const char *name)
-{
-	struct daxfs_branch *b = find_branch_by_name(name);
-	if (!b) {
-		fprintf(stderr, "Error: branch '%s' not found\n", name);
-		return 1;
-	}
-
-	uint64_t id = le64_to_cpu(b->branch_id);
-	uint64_t parent_id = le64_to_cpu(b->parent_id);
-	uint32_t state = le32_to_cpu(b->state);
-	uint32_t refcount = le32_to_cpu(b->refcount);
-	uint32_t generation = le32_to_cpu(b->generation);
-	uint64_t delta_offset = le64_to_cpu(b->delta_log_offset);
-	uint64_t delta_used = le64_to_cpu(b->delta_log_size);
-	uint64_t delta_cap = le64_to_cpu(b->delta_log_capacity);
-	uint64_t next_ino = le64_to_cpu(b->next_local_ino);
-
-	printf("Branch: %s\n", b->name);
-	printf("  ID:              %lu\n", id);
-	printf("  State:           %s\n", state_to_string(state));
-	printf("  Generation:      %u\n", generation);
-
-	if (parent_id == 0) {
-		printf("  Parent:          (none - root branch)\n");
-	} else {
-		struct daxfs_branch *p = find_branch_by_id(parent_id);
-		if (p)
-			printf("  Parent:          %s (id:%lu)\n", p->name, parent_id);
-		else
-			printf("  Parent:          id:%lu (not found)\n", parent_id);
-	}
-
-	printf("  Reference count: %u\n", refcount);
-	printf("  Next inode:      %lu\n", next_ino);
-	printf("  Delta log:\n");
-	printf("    Offset:        0x%lx\n", delta_offset);
-	printf("    Used:          %lu bytes (%.2f KB)\n",
-	       delta_used, (double)delta_used / 1024);
-	printf("    Capacity:      %lu bytes (%.2f KB)\n",
-	       delta_cap, (double)delta_cap / 1024);
-	printf("    Usage:         %.1f%%\n",
-	       delta_cap ? (double)delta_used * 100 / delta_cap : 0);
-
-	/* Count delta entries */
-	if (delta_used > 0) {
-		void *delta_log = mem + delta_offset;
-		uint64_t offset = 0;
-		uint32_t entry_counts[9] = {0};
-
-		while (offset < delta_used) {
-			struct daxfs_delta_hdr *hdr = delta_log + offset;
-			uint32_t type = le32_to_cpu(hdr->type);
-			uint32_t size = le32_to_cpu(hdr->total_size);
-
-			if (size == 0 || offset + size > delta_used)
-				break;
-
-			if (type < 9)
-				entry_counts[type]++;
-
-			offset += size;
-		}
-
-		printf("  Delta entries:\n");
-		if (entry_counts[DAXFS_DELTA_WRITE])
-			printf("    WRITE:     %u\n", entry_counts[DAXFS_DELTA_WRITE]);
-		if (entry_counts[DAXFS_DELTA_CREATE])
-			printf("    CREATE:    %u\n", entry_counts[DAXFS_DELTA_CREATE]);
-		if (entry_counts[DAXFS_DELTA_DELETE])
-			printf("    DELETE:    %u\n", entry_counts[DAXFS_DELTA_DELETE]);
-		if (entry_counts[DAXFS_DELTA_TRUNCATE])
-			printf("    TRUNCATE:  %u\n", entry_counts[DAXFS_DELTA_TRUNCATE]);
-		if (entry_counts[DAXFS_DELTA_MKDIR])
-			printf("    MKDIR:     %u\n", entry_counts[DAXFS_DELTA_MKDIR]);
-		if (entry_counts[DAXFS_DELTA_RENAME])
-			printf("    RENAME:    %u\n", entry_counts[DAXFS_DELTA_RENAME]);
-		if (entry_counts[DAXFS_DELTA_SETATTR])
-			printf("    SETATTR:   %u\n", entry_counts[DAXFS_DELTA_SETATTR]);
-		if (entry_counts[DAXFS_DELTA_SYMLINK])
-			printf("    SYMLINK:   %u\n", entry_counts[DAXFS_DELTA_SYMLINK]);
-	}
-
-	return 0;
-}
-
 static int cmd_status(void)
 {
 	uint64_t total_size = le64_to_cpu(super->total_size);
 	uint64_t base_offset = le64_to_cpu(super->base_offset);
 	uint64_t base_size = le64_to_cpu(super->base_size);
-	uint64_t delta_region_offset = le64_to_cpu(super->delta_region_offset);
-	uint64_t delta_region_size = le64_to_cpu(super->delta_region_size);
-	uint64_t delta_alloc = le64_to_cpu(super->delta_alloc_offset);
-	uint32_t branch_entries = le32_to_cpu(super->branch_table_entries);
-	uint32_t active_branches = le32_to_cpu(super->active_branches);
-	uint64_t next_inode = le64_to_cpu(super->next_inode_id);
-	uint64_t next_branch = le64_to_cpu(super->next_branch_id);
-	uint64_t commit_seq = le64_to_cpu(super->coord.commit_sequence);
-	uint64_t last_committed = le64_to_cpu(super->coord.last_committed_id);
+	uint64_t overlay_offset = le64_to_cpu(super->overlay_offset);
+	uint64_t overlay_size = le64_to_cpu(super->overlay_size);
 
 	printf("DAXFS Memory Status\n");
 	printf("===================\n\n");
@@ -431,43 +228,57 @@ static int cmd_status(void)
 	printf("  Total size:      %lu bytes (%.2f MB)\n",
 	       total_size, (double)total_size / (1024 * 1024));
 
-	printf("\nBase image:\n");
-	printf("  Offset:          0x%lx\n", base_offset);
-	printf("  Size:            %lu bytes (%.2f MB)\n",
-	       base_size, (double)base_size / (1024 * 1024));
+	if (base_offset) {
+		uint32_t inode_count = le32_to_cpu(super->inode_count);
+		uint32_t root_inode = le32_to_cpu(super->root_inode);
 
-	printf("\nBranch table:\n");
-	printf("  Entries:         %u (max)\n", branch_entries);
-	printf("  Active:          %u\n", active_branches);
-	printf("  Next branch ID:  %lu\n", next_branch);
-
-	printf("\nGlobal coordination:\n");
-	printf("  Commit sequence: %lu\n", commit_seq);
-	if (last_committed > 0) {
-		struct daxfs_branch *b = find_branch_by_id(last_committed);
-		if (b)
-			printf("  Last committed:  %s (id:%lu)\n", b->name, last_committed);
-		else
-			printf("  Last committed:  id:%lu\n", last_committed);
+		printf("\nBase image:\n");
+		printf("  Offset:          0x%lx\n", base_offset);
+		printf("  Size:            %lu bytes (%.2f MB)\n",
+		       base_size, (double)base_size / (1024 * 1024));
+		printf("  Inode count:     %u\n", inode_count);
+		printf("  Root inode:      %u\n", root_inode);
+		printf("  Inode offset:    0x%lx (relative to base)\n",
+		       (unsigned long)le64_to_cpu(super->inode_offset));
+		printf("  Data offset:     0x%lx (relative to base)\n",
+		       (unsigned long)le64_to_cpu(super->data_offset));
 	} else {
-		printf("  Last committed:  (none)\n");
+		printf("\nBase image:        (none)\n");
 	}
 
-	printf("\nDelta region:\n");
-	printf("  Offset:          0x%lx\n", delta_region_offset);
-	printf("  Total size:      %lu bytes (%.2f MB)\n",
-	       delta_region_size, (double)delta_region_size / (1024 * 1024));
-	printf("  Allocated:       %lu bytes (%.2f MB)\n",
-	       delta_alloc - delta_region_offset,
-	       (double)(delta_alloc - delta_region_offset) / (1024 * 1024));
-	printf("  Free:            %lu bytes (%.2f MB)\n",
-	       delta_region_offset + delta_region_size - delta_alloc,
-	       (double)(delta_region_offset + delta_region_size - delta_alloc) / (1024 * 1024));
+	/* Overlay region */
+	if (overlay_offset) {
+		uint32_t bucket_count = le32_to_cpu(super->overlay_bucket_count);
 
-	printf("\nInodes:\n");
-	printf("  Next inode ID:   %lu\n", next_inode);
+		printf("\nOverlay:\n");
+		printf("  Offset:          0x%lx\n", overlay_offset);
+		printf("  Size:            %lu bytes (%.2f MB)\n",
+		       overlay_size, (double)overlay_size / (1024 * 1024));
+		printf("  Bucket count:    %u\n", bucket_count);
+		printf("  Bucket shift:    %u\n",
+		       le32_to_cpu(super->overlay_bucket_shift));
 
-	/* Page cache (backing store mode) */
+		if (overlay_offset + sizeof(struct daxfs_overlay_header) <= mem_size) {
+			struct daxfs_overlay_header *ohdr = mem + overlay_offset;
+
+			if (le32_to_cpu(ohdr->magic) == DAXFS_OVERLAY_MAGIC) {
+				uint64_t pool_size = le64_to_cpu(ohdr->pool_size);
+				uint64_t pool_alloc = le64_to_cpu(ohdr->pool_alloc);
+				uint64_t next_ino = le64_to_cpu(ohdr->next_ino);
+
+				printf("  Pool size:       %lu bytes (%.2f MB)\n",
+				       pool_size, (double)pool_size / (1024 * 1024));
+				printf("  Pool allocated:  %lu bytes (%.2f MB, %.1f%%)\n",
+				       pool_alloc, (double)pool_alloc / (1024 * 1024),
+				       pool_size ? (double)pool_alloc * 100 / pool_size : 0);
+				printf("  Next inode:      %lu\n", next_ino);
+			}
+		}
+	} else {
+		printf("\nOverlay:           (none - read-only)\n");
+	}
+
+	/* Page cache */
 	uint64_t pcache_offset = le64_to_cpu(super->pcache_offset);
 	if (pcache_offset) {
 		uint64_t pcache_size = le64_to_cpu(super->pcache_size);
@@ -481,24 +292,22 @@ static int cmd_status(void)
 		printf("  Hash shift:      %u\n",
 		       le32_to_cpu(super->pcache_hash_shift));
 
-		/* Read on-DAX pcache header for live stats */
 		if (pcache_offset + sizeof(struct daxfs_pcache_header) <= mem_size) {
 			struct daxfs_pcache_header *phdr = mem + pcache_offset;
 
 			if (le32_to_cpu(phdr->magic) == DAXFS_PCACHE_MAGIC) {
 				uint32_t pending = le32_to_cpu(phdr->pending_count);
-				uint32_t hdr_slots = le32_to_cpu(phdr->slot_count);
 				uint64_t meta_off = le64_to_cpu(phdr->slot_meta_offset);
 
 				printf("  Pending:         %u\n", pending);
 
-				/* Scan slot metadata for utilization */
 				void *slot_base = mem + pcache_offset + meta_off;
 				if (pcache_offset + meta_off +
-				    (uint64_t)hdr_slots * sizeof(struct daxfs_pcache_slot) <= mem_size) {
+				    (uint64_t)pcache_slots * sizeof(struct daxfs_pcache_slot) <= mem_size) {
 					uint32_t free_count = 0, valid_count = 0, pending_count = 0;
+					uint32_t ref_set_count = 0;
 
-					for (uint32_t i = 0; i < hdr_slots; i++) {
+					for (uint32_t i = 0; i < pcache_slots; i++) {
 						struct daxfs_pcache_slot *s = slot_base +
 							i * sizeof(struct daxfs_pcache_slot);
 						uint64_t st = le64_to_cpu(s->state_tag);
@@ -512,15 +321,26 @@ static int cmd_status(void)
 							break;
 						case PCACHE_STATE_VALID:
 							valid_count++;
+							if (le32_to_cpu(s->ref_bit))
+								ref_set_count++;
 							break;
 						}
 					}
 
 					printf("  Slot states:     %u valid, %u free, %u pending\n",
 					       valid_count, free_count, pending_count);
-					if (hdr_slots > 0)
+					if (pcache_slots > 0)
 						printf("  Occupancy:       %.1f%%\n",
-						       (double)valid_count * 100 / hdr_slots);
+						       (double)valid_count * 100 / pcache_slots);
+
+					printf("  Evict hand:      %u\n",
+					       le32_to_cpu(phdr->evict_hand));
+					if (valid_count > 0)
+						printf("  Ref bits set:    %u / %u valid (%.1f%% hot)\n",
+						       ref_set_count, valid_count,
+						       (double)ref_set_count * 100 / valid_count);
+					else
+						printf("  Ref bits set:    0 / 0 valid\n");
 				}
 			}
 		}
@@ -529,24 +349,150 @@ static int cmd_status(void)
 	return 0;
 }
 
+static int cmd_overlay(void)
+{
+	uint64_t overlay_offset = le64_to_cpu(super->overlay_offset);
+	struct daxfs_overlay_header *ohdr;
+	uint32_t bucket_count, used_buckets = 0;
+	uint32_t inode_count = 0, data_count = 0, dirent_count = 0, tombstone_count = 0;
+	uint64_t bucket_offset, pool_offset, pool_size, pool_alloc, next_ino;
+	void *bucket_base;
+
+	if (!overlay_offset) {
+		printf("No overlay region (read-only image)\n");
+		return 0;
+	}
+
+	if (overlay_offset + sizeof(struct daxfs_overlay_header) > mem_size) {
+		fprintf(stderr, "Error: overlay header out of bounds\n");
+		return 1;
+	}
+
+	ohdr = mem + overlay_offset;
+
+	if (le32_to_cpu(ohdr->magic) != DAXFS_OVERLAY_MAGIC) {
+		fprintf(stderr, "Error: invalid overlay magic 0x%x (expected 0x%x)\n",
+			le32_to_cpu(ohdr->magic), DAXFS_OVERLAY_MAGIC);
+		return 1;
+	}
+
+	bucket_count = le32_to_cpu(super->overlay_bucket_count);
+	bucket_offset = le64_to_cpu(ohdr->bucket_offset);
+	pool_offset = le64_to_cpu(ohdr->pool_offset);
+	pool_size = le64_to_cpu(ohdr->pool_size);
+	pool_alloc = le64_to_cpu(ohdr->pool_alloc);
+	next_ino = le64_to_cpu(ohdr->next_ino);
+
+	printf("Overlay Hash Table\n");
+	printf("==================\n\n");
+
+	printf("Header:\n");
+	printf("  Magic:           0x%x\n", le32_to_cpu(ohdr->magic));
+	printf("  Version:         %u\n", le32_to_cpu(ohdr->version));
+	printf("  Bucket count:    %u\n", bucket_count);
+	printf("  Bucket shift:    %u\n",
+	       le32_to_cpu(super->overlay_bucket_shift));
+	printf("  Bucket offset:   0x%lx\n", bucket_offset);
+	printf("  Pool offset:     0x%lx\n", pool_offset);
+	printf("  Pool size:       %lu bytes (%.2f MB)\n",
+	       pool_size, (double)pool_size / (1024 * 1024));
+	printf("  Pool allocated:  %lu bytes (%.2f MB)\n",
+	       pool_alloc, (double)pool_alloc / (1024 * 1024));
+	printf("  Pool usage:      %.1f%%\n",
+	       pool_size ? (double)pool_alloc * 100 / pool_size : 0);
+	printf("  Next inode:      %lu\n", next_ino);
+
+	/* Scan buckets */
+	bucket_base = mem + overlay_offset + bucket_offset;
+	if (overlay_offset + bucket_offset +
+	    (uint64_t)bucket_count * sizeof(struct daxfs_overlay_bucket) > mem_size) {
+		fprintf(stderr, "Warning: bucket array extends past memory\n");
+		return 1;
+	}
+
+	for (uint32_t i = 0; i < bucket_count; i++) {
+		struct daxfs_overlay_bucket *b = bucket_base +
+			i * sizeof(struct daxfs_overlay_bucket);
+		uint64_t state_key = le64_to_cpu(b->state_key);
+		uint64_t value = le64_to_cpu(b->value);
+
+		if (DAXFS_OVL_STATE(state_key) != DAXFS_OVL_USED)
+			continue;
+
+		used_buckets++;
+
+		/*
+		 * Classify entry. INODE/DIRLIST keys have unique
+		 * sentinel pgoff values.  For other keys, read the
+		 * pool entry type field: dirent/dirlist entries still
+		 * have a type header; data pages (v2) do not, so any
+		 * unrecognised type value means data.
+		 */
+		if (value < pool_alloc) {
+			uint64_t key = DAXFS_OVL_KEY(state_key);
+			uint64_t pgoff = DAXFS_OVL_KEY_PGOFF(key);
+
+			if (pgoff == 0xFFFFF) {
+				/* INODE sentinel */
+				inode_count++;
+			} else if (pgoff == 0xFFFFE) {
+				/* DIRLIST sentinel */
+			} else {
+				/*
+				 * Could be DATA or DIRENT. Check pool
+				 * entry type: dirents have type header,
+				 * data pages do not.
+				 */
+				void *entry = mem + overlay_offset +
+					      pool_offset + value;
+				if ((char *)entry + sizeof(uint32_t) <=
+				    (char *)mem + mem_size &&
+				    le32_to_cpu(*(uint32_t *)entry) ==
+				    DAXFS_OVL_DIRENT) {
+					struct daxfs_ovl_dirent_entry *de =
+						entry;
+					if (le32_to_cpu(de->flags) &
+					    DAXFS_OVL_DIRENT_TOMBSTONE)
+						tombstone_count++;
+					else
+						dirent_count++;
+				} else {
+					data_count++;
+				}
+			}
+		}
+	}
+
+	printf("\nBucket utilization:\n");
+	printf("  Used:            %u / %u (%.1f%%)\n",
+	       used_buckets, bucket_count,
+	       bucket_count ? (double)used_buckets * 100 / bucket_count : 0);
+	printf("  Free:            %u\n", bucket_count - used_buckets);
+
+	printf("\nEntry types:\n");
+	printf("  Inodes:          %u\n", inode_count);
+	printf("  Data pages:      %u\n", data_count);
+	printf("  Dirents:         %u\n", dirent_count);
+	printf("  Tombstones:      %u\n", tombstone_count);
+
+	return 0;
+}
+
 static void print_usage(const char *prog)
 {
 	fprintf(stderr, "Usage: %s <command> [options]\n", prog);
 	fprintf(stderr, "\nCommands:\n");
-	fprintf(stderr, "  list              List all branches\n");
-	fprintf(stderr, "  info              Show branch details\n");
-	fprintf(stderr, "  status            Show memory status\n");
+	fprintf(stderr, "  status            Show memory layout and status\n");
+	fprintf(stderr, "  overlay           Show overlay hash table details\n");
 	fprintf(stderr, "\nOptions:\n");
 	fprintf(stderr, "  -m, --mount PATH  Mount point (uses ioctl, no root for dma-buf)\n");
 	fprintf(stderr, "  -p, --phys ADDR   Physical memory address (via /dev/mem)\n");
 	fprintf(stderr, "  -s, --size SIZE   Memory size (required with -p)\n");
-	fprintf(stderr, "  -b, --branch NAME Branch name (for info command)\n");
 	fprintf(stderr, "  -h, --help        Show this help\n");
 	fprintf(stderr, "\nExamples:\n");
-	fprintf(stderr, "  %s list -m /mnt/daxfs\n", prog);
 	fprintf(stderr, "  %s status -m /mnt/daxfs\n", prog);
-	fprintf(stderr, "  %s info -m /mnt/daxfs -b main\n", prog);
-	fprintf(stderr, "  %s list -p 0x100000000 -s 256M\n", prog);
+	fprintf(stderr, "  %s overlay -m /mnt/daxfs\n", prog);
+	fprintf(stderr, "  %s status -p 0x100000000 -s 256M\n", prog);
 	fprintf(stderr, "\nNote: -m works without root for dma-buf backed mounts.\n");
 	fprintf(stderr, "      -p requires root or CAP_SYS_RAWIO for /dev/mem.\n");
 }
@@ -557,13 +503,11 @@ int main(int argc, char *argv[])
 		{"mount", required_argument, 0, 'm'},
 		{"phys", required_argument, 0, 'p'},
 		{"size", required_argument, 0, 's'},
-		{"branch", required_argument, 0, 'b'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
 	char *mount_point = NULL;
-	char *branch_name = NULL;
 	char *command = NULL;
 	unsigned long long phys_addr = 0;
 	size_t size = 0;
@@ -576,9 +520,9 @@ int main(int argc, char *argv[])
 	}
 
 	command = argv[1];
-	optind = 2;  /* Start parsing after command */
+	optind = 2;
 
-	while ((opt = getopt_long(argc, argv, "m:p:s:b:h", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "m:p:s:h", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'm':
 			mount_point = optarg;
@@ -595,9 +539,6 @@ int main(int argc, char *argv[])
 			else if (strchr(optarg, 'K') || strchr(optarg, 'k'))
 				size *= 1024;
 			break;
-		case 'b':
-			branch_name = optarg;
-			break;
 		case 'h':
 			print_usage(argv[0]);
 			return 0;
@@ -607,7 +548,6 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* Handle mount point option - use ioctl to get dma-buf */
 	if (mount_point) {
 		if (phys_addr || size) {
 			fprintf(stderr, "Error: cannot use -m with -p/-s\n");
@@ -633,17 +573,10 @@ int main(int argc, char *argv[])
 	if (validate_and_setup() < 0)
 		return 1;
 
-	if (strcmp(command, "list") == 0) {
-		ret = cmd_list();
-	} else if (strcmp(command, "info") == 0) {
-		if (!branch_name) {
-			fprintf(stderr, "Error: -b/--branch is required for info\n");
-			ret = 1;
-		} else {
-			ret = cmd_info(branch_name);
-		}
-	} else if (strcmp(command, "status") == 0) {
+	if (strcmp(command, "status") == 0) {
 		ret = cmd_status();
+	} else if (strcmp(command, "overlay") == 0) {
+		ret = cmd_overlay();
 	} else if (strcmp(command, "help") == 0 || strcmp(command, "-h") == 0 ||
 		   strcmp(command, "--help") == 0) {
 		print_usage(argv[0]);
