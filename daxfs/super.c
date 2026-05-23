@@ -414,4 +414,12 @@ module_exit(daxfs_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Cong Wang <cwang@multikernel.io>");
 MODULE_DESCRIPTION("DAX-based filesystem for shared memory");
+/*
+ * MODULE_IMPORT_NS took a bare token until Linux 6.13, where it switched
+ * to a string literal (the macro stopped stringifying its argument).
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS(DMA_BUF);
+#else
 MODULE_IMPORT_NS("DMA_BUF");
+#endif
