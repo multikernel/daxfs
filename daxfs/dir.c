@@ -169,8 +169,8 @@ static int daxfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	return 0;
 }
 
-static struct dentry *daxfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
-				  struct dentry *dentry, umode_t mode)
+static int __daxfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+			 struct dentry *dentry, umode_t mode)
 {
 	struct daxfs_info *info = DAXFS_SB(dir->i_sb);
 	struct daxfs_ovl_inode_entry ie;
@@ -179,10 +179,10 @@ static struct dentry *daxfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	int ret;
 
 	if (!info->overlay)
-		return ERR_PTR(-EROFS);
+		return -EROFS;
 
 	if (dentry->d_name.len > DAXFS_NAME_MAX)
-		return ERR_PTR(-ENAMETOOLONG);
+		return -ENAMETOOLONG;
 
 	new_ino = daxfs_overlay_alloc_ino(info);
 
@@ -196,26 +196,46 @@ static struct dentry *daxfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	ret = daxfs_overlay_set_inode(info, new_ino, &ie);
 	if (ret)
-		return ERR_PTR(ret);
+		return ret;
 
 	ret = daxfs_overlay_create_dirent(info, dir->i_ino, new_ino,
 					  mode | S_IFDIR,
 					  dentry->d_name.name,
 					  dentry->d_name.len);
 	if (ret)
-		return ERR_PTR(ret);
+		return ret;
 
 	inode = daxfs_iget(dir->i_sb, new_ino);
 	if (IS_ERR(inode))
-		return ERR_CAST(inode);
+		return PTR_ERR(inode);
 
 	inc_nlink(dir);
 	inode_set_mtime_to_ts(dir,
 		inode_set_ctime_to_ts(dir, current_time(dir)));
 
 	d_instantiate(dentry, inode);
-	return NULL;
+	return 0;
 }
+
+/*
+ * ->mkdir changed from returning int to returning struct dentry * in
+ * Linux 6.15 (a dentry may be substituted for the one passed in, NULL
+ * meaning "keep the original"). Wrap the shared helper accordingly.
+ * ERR_PTR(0) is NULL, so the success path maps cleanly.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+static struct dentry *daxfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+				  struct dentry *dentry, umode_t mode)
+{
+	return ERR_PTR(__daxfs_mkdir(idmap, dir, dentry, mode));
+}
+#else
+static int daxfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+		       struct dentry *dentry, umode_t mode)
+{
+	return __daxfs_mkdir(idmap, dir, dentry, mode);
+}
+#endif
 
 static int daxfs_unlink(struct inode *dir, struct dentry *dentry)
 {
