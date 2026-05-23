@@ -34,6 +34,7 @@
 #include <sys/ioctl.h>
 
 #include "daxfs_format.h"
+#include "daxfs_version.h"
 
 #define DAXFS_DEFAULT_OVERLAY_POOL	(64ULL * 1024 * 1024)	/* 64MB default pool */
 #define DAXFS_DEFAULT_BUCKET_COUNT	65536			/* 64K buckets = 1MB */
@@ -1096,6 +1097,13 @@ static size_t calculate_static_size(size_t base_size)
 	return block_size + base_size;
 }
 
+static void print_version(void)
+{
+	printf("mkdaxfs (daxfs) %s\n", DAXFS_RELEASE_STRING);
+	printf("on-disk format: super v%d, overlay v%d, pcache v%d\n",
+	       DAXFS_VERSION, DAXFS_OVERLAY_VERSION, DAXFS_PCACHE_VERSION);
+}
+
 static void print_usage(const char *prog)
 {
 	fprintf(stderr, "Usage: %s [OPTIONS]\n", prog);
@@ -1146,6 +1154,7 @@ int main(int argc, char *argv[])
 		{"empty", no_argument, 0, 'E'},
 		{"export", no_argument, 0, 'X'},
 		{"help", no_argument, 0, 'h'},
+		{"version", no_argument, 0, 'v'},
 		{0, 0, 0, 0}
 	};
 
@@ -1234,6 +1243,9 @@ int main(int argc, char *argv[])
 		case 'X':
 			export_mode = true;
 			break;
+		case 'v':
+			print_version();
+			return 0;
 		case 'h':
 		default:
 			print_usage(argv[0]);

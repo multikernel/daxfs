@@ -30,6 +30,7 @@
 #include <endian.h>
 
 #include "daxfs_format.h"
+#include "daxfs_version.h"
 
 /* Userspace endian conversion (kernel uses le32_to_cpu, etc.) */
 #define le16_to_cpu(x)	le16toh(x)
@@ -478,6 +479,13 @@ static int cmd_overlay(void)
 	return 0;
 }
 
+static void print_version(void)
+{
+	printf("daxfs-inspect (daxfs) %s\n", DAXFS_RELEASE_STRING);
+	printf("on-disk format: super v%d, overlay v%d, pcache v%d\n",
+	       DAXFS_VERSION, DAXFS_OVERLAY_VERSION, DAXFS_PCACHE_VERSION);
+}
+
 static void print_usage(const char *prog)
 {
 	fprintf(stderr, "Usage: %s <command> [options]\n", prog);
@@ -517,6 +525,11 @@ int main(int argc, char *argv[])
 	if (argc < 2) {
 		print_usage(argv[0]);
 		return 1;
+	}
+
+	if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0) {
+		print_version();
+		return 0;
 	}
 
 	command = argv[1];

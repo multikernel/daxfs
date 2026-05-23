@@ -14,6 +14,7 @@
 #include <linux/statfs.h>
 #include <linux/seq_file.h>
 #include "daxfs.h"
+#include "daxfs_version.h"
 
 enum daxfs_param {
 	Opt_phys,
@@ -414,6 +415,7 @@ module_exit(daxfs_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Cong Wang <cwang@multikernel.io>");
 MODULE_DESCRIPTION("DAX-based filesystem for shared memory");
+MODULE_VERSION(DAXFS_RELEASE_STRING);
 /*
  * MODULE_IMPORT_NS took a bare token until Linux 6.13, where it switched
  * to a string literal (the macro stopped stringifying its argument).

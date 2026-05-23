@@ -1,0 +1,26 @@
+# Kernel module build artifacts
+*.o
+*.o.*
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+*.symvers
+Module.symvers
+modules.order
+modules.builtin
+modules.builtin.modinfo
+.tmp_versions/
+
+# User-space tool binaries
+/tools/mkdaxfs
+/tools/daxfs-inspect
+
+# Release tarballs
+/daxfs-*.tar.gz
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store

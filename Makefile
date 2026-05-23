@@ -2,6 +2,8 @@
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
+DAXFS_RELEASE := $(shell sed -n 's/^#define DAXFS_RELEASE_STRING[[:space:]]*"\(.*\)".*/\1/p' include/daxfs_version.h)
+
 all: daxfs tools
 
 daxfs:
@@ -18,4 +20,12 @@ clean:
 	$(MAKE) -C tools clean
 	$(MAKE) -C tests clean
 
-.PHONY: all daxfs tools tests clean
+version:
+	@echo $(DAXFS_RELEASE)
+
+dist:
+	git archive --format=tar.gz --prefix=daxfs-$(DAXFS_RELEASE)/ \
+		-o daxfs-$(DAXFS_RELEASE).tar.gz HEAD
+	@echo "Created daxfs-$(DAXFS_RELEASE).tar.gz"
+
+.PHONY: all daxfs tools tests clean version dist
