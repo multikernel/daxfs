@@ -281,6 +281,16 @@ void *daxfs_pcache_get_page(struct daxfs_info *info, u64 ino, u64 pgoff,
 	if (unlikely(!pc))
 		return ERR_PTR(-ENOENT);
 
+	/*
+	 * PCACHE_TAG_MAKE packs pgoff into the low 20 bits. A pgoff past
+	 * DAXFS_OVL_MAX_PGOFF would alias an earlier page's slot (identical
+	 * tag) and, on fill, read the wrong backing offset, silently
+	 * returning corrupt data. Reject it, mirroring daxfs_overlay_get_page().
+	 * mkdaxfs refuses to build such images; this guards malformed ones.
+	 */
+	if (unlikely(pgoff > DAXFS_OVL_MAX_PGOFF))
+		return ERR_PTR(-EFBIG);
+
 	slot_idx = pcache_hash(pc, desired_tag);
 
 	val = slot_read(&pc->slots[slot_idx]);

@@ -278,7 +278,7 @@ static void build_tree(void)
  * Unified offset calculation for both static and split modes.
  * In split mode, regular file data goes to backing file offsets.
  */
-static void calculate_offsets(bool split, bool export)
+static int calculate_offsets(bool split, bool export)
 {
 	struct file_entry *e;
 	struct hardlink_entry *hl;
@@ -309,6 +309,35 @@ static void calculate_offsets(bool split, bool export)
 				if (hl)
 					hl->data_offset = e->data_offset;
 			}
+
+			/*
+			 * Split/export mode addresses file data through the
+			 * pcache, whose tag packs the page offset into 20 bits
+			 * (DAXFS_OVL_MAX_PGOFF). The last page of this file is
+			 * at (data_offset + size - 1) / block_size: in export
+			 * mode data_offset is 0 so this is the per-file offset;
+			 * in split mode it is the cumulative backing offset.
+			 * A larger page offset would alias an earlier page and
+			 * corrupt reads, so refuse to build the image.
+			 */
+			if (split && e->st.st_size > 0) {
+				uint64_t last_pgoff =
+					(e->data_offset +
+					 (uint64_t)e->st.st_size - 1) /
+					block_size;
+
+				if (last_pgoff > DAXFS_OVL_MAX_PGOFF) {
+					fprintf(stderr,
+						"Error: '%s' exceeds the split-mode addressable limit "
+						"(page offset %llu > max %llu, ~%llu bytes)\n",
+						e->path,
+						(unsigned long long)last_pgoff,
+						(unsigned long long)DAXFS_OVL_MAX_PGOFF,
+						(unsigned long long)((DAXFS_OVL_MAX_PGOFF + 1) *
+								     (uint64_t)block_size));
+					return -1;
+				}
+			}
 		} else if (S_ISLNK(e->st.st_mode)) {
 			e->data_offset = base_data_offset;
 			base_data_offset += ALIGN(e->st.st_size + 1, block_size);
@@ -321,6 +350,8 @@ static void calculate_offsets(bool split, bool export)
 
 	if (split)
 		backing_file_size = back_offset;
+
+	return 0;
 }
 
 /*
@@ -1356,7 +1387,8 @@ int main(int argc, char *argv[])
 		build_tree();
 
 		if (split_mode || export_mode) {
-			calculate_offsets(true, export_mode);
+			if (calculate_offsets(true, export_mode) < 0)
+				return 1;
 			base_size = calculate_base_size(true);
 
 			/* Auto-calculate pcache slots if not specified */
@@ -1407,7 +1439,7 @@ int main(int argc, char *argv[])
 			printf("Total DAX size: %zu bytes (%.2f MB)\n", total_size,
 			       (double)total_size / (1024 * 1024));
 		} else {
-			calculate_offsets(false, false);
+			(void)calculate_offsets(false, false);
 			base_size = calculate_base_size(false);
 			total_size = calculate_static_size(base_size);
 

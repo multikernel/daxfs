@@ -49,6 +49,7 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 	u64 base_size = le64_to_cpu(super->base_size);
 	u64 inode_offset, data_offset;
 	u32 inode_count, i;
+	bool pcache_present = le64_to_cpu(super->pcache_offset) != 0;
 
 	if (!base_offset)
 		return 0;
@@ -96,16 +97,46 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 		}
 
 		if (file_size > 0) {
-			/*
-			 * Validate data bounds for all file types with
-			 * inline data. Regular files in pcache/export mode
-			 * fetch data from backing store at runtime, but
-			 * their base image data_offset still must be valid
-			 * if non-zero (it's used to compute pcache tags in
-			 * split mode).
-			 */
-			if (!daxfs_valid_base_offset(info, file_data_offset, file_size)) {
-				pr_err("daxfs: inode %u has invalid data offset\n", i + 1);
+			if (pcache_present && S_ISREG(mode)) {
+				/*
+				 * Split/export regular file: its bytes live in
+				 * the backing store and are read through the
+				 * pcache, not the base image, so base-image
+				 * bounds do not apply. The pcache tag packs the
+				 * page offset into 20 bits (DAXFS_OVL_MAX_PGOFF),
+				 * so the file's last page,
+				 * (data_offset + size - 1) >> PAGE_SHIFT, must
+				 * stay within range or reads alias an earlier
+				 * page and silently return corrupt data
+				 * (data_offset is 0 in export mode, the
+				 * cumulative backing offset in split mode).
+				 */
+				u64 last_byte, last_pgoff;
+
+				if (check_add_overflow_u64(file_data_offset,
+							   file_size - 1,
+							   &last_byte)) {
+					pr_err("daxfs: inode %u data offset overflow\n",
+					       i + 1);
+					return -EINVAL;
+				}
+
+				last_pgoff = last_byte >> PAGE_SHIFT;
+				if (last_pgoff > DAXFS_OVL_MAX_PGOFF) {
+					pr_err("daxfs: inode %u page offset %llu exceeds split-mode max %llu\n",
+					       i + 1, last_pgoff,
+					       (u64)DAXFS_OVL_MAX_PGOFF);
+					return -EINVAL;
+				}
+			} else if (!daxfs_valid_base_offset(info,
+							    file_data_offset,
+							    file_size)) {
+				/*
+				 * Inline data (static regular files, dirs,
+				 * symlinks) must fit within the base image.
+				 */
+				pr_err("daxfs: inode %u has invalid data offset\n",
+				       i + 1);
 				return -EINVAL;
 			}
 		}
