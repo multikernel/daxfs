@@ -478,15 +478,14 @@ struct daxfs_ovl_inode_entry *daxfs_overlay_get_inode(struct daxfs_info *info,
  * a TOCTOU race where two hosts both see the key as absent, both
  * allocate, and one silently overwrites the other's in-place update.
  *
- * When an existing inode is replaced, the old pool entry is recycled
- * onto the inode free list for reuse.
+ * A replaced inode entry is deliberately NOT recycled (see below).
  */
 int daxfs_overlay_set_inode(struct daxfs_info *info, u64 ino,
 			    const struct daxfs_ovl_inode_entry *ie)
 {
 	struct daxfs_overlay *ovl = info->overlay;
 	u64 key = DAXFS_OVL_KEY_INODE(ino);
-	u64 pool_off, old_off;
+	u64 pool_off;
 	struct daxfs_ovl_inode_entry *dst;
 	int ret;
 
@@ -501,13 +500,26 @@ int daxfs_overlay_set_inode(struct daxfs_info *info, u64 ino,
 	*dst = *ie;
 	smp_wmb();
 
-	ret = overlay_insert(ovl, key, pool_off, &old_off, true);
+	ret = overlay_insert(ovl, key, pool_off, NULL, true);
 	if (ret)
 		return ret;
 
-	/* Recycle the old entry if we replaced one */
-	if (old_off != (u64)-1 && old_off != pool_off)
-		overlay_pool_free(ovl, old_off, DAXFS_OVL_INODE);
+	/*
+	 * Intentionally do NOT recycle the replaced inode entry. Lookups
+	 * (daxfs_overlay_get_inode) hand back raw DAX pool pointers, and the
+	 * hot update paths mutate the entry in place (size on write-extend,
+	 * fields on setattr). A reader or in-place writer on another CPU or
+	 * host may still hold the old pointer, and there is no cross-host
+	 * reclamation scheme (RCU/epochs do not span kernels), so putting the
+	 * entry on the reuse list could let a concurrent access observe or
+	 * clobber a recycled, overwritten entry.
+	 *
+	 * This replace path only fires on a rare insert/insert race (created
+	 * inodes get unique numbers from a shared counter, and all updates to
+	 * an existing entry are in place), so the leaked entry is negligible.
+	 * Revisit with generation-checked handles if an intentional
+	 * high-frequency replace path is ever added.
+	 */
 
 	return 0;
 }
