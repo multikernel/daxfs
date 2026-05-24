@@ -2,7 +2,9 @@
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
-DAXFS_RELEASE := $(shell sed -n 's/^#define DAXFS_RELEASE_STRING[[:space:]]*"\(.*\)".*/\1/p' include/daxfs_version.h)
+# Escape '#' as '\#' so GNU Make < 4.3 does not treat it as a comment
+# inside $(shell ...) (sed's BRE matches '\#' as a literal '#' either way).
+DAXFS_RELEASE := $(shell sed -n 's/^\#define DAXFS_RELEASE_STRING[[:space:]]*"\(.*\)".*/\1/p' include/daxfs_version.h)
 
 all: daxfs tools
 
