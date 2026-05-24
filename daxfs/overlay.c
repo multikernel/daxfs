@@ -689,31 +689,54 @@ static struct daxfs_ovl_dirent_entry *dirent_chain_walk(
 }
 
 /*
- * Append a new dirent entry to the end of a collision chain.
- * Uses CAS on each entry's 'next' field to handle concurrent appends.
- * Returns 0 on success.
+ * Append @new_pool_off to the chain rooted at @head, but only if no entry
+ * for the exact (parent_ino, name) already exists in the chain. This keeps
+ * directory names unique even when two hosts race to create the same name:
+ * overlay_insert()'s bucket CAS serializes only the hash key, so each racing
+ * host falls back to appending into the shared chain, and a plain append
+ * would leave two dirents for one name.
+ *
+ * While walking to the tail we check every entry for the exact name. If it
+ * is found, the caller lost the race: *existing_out is set and -EEXIST is
+ * returned (our entry is left unlinked, for the caller to free). If our CAS
+ * onto the tail loses, we re-walk the entries that just appeared (which may
+ * include the winner's matching entry) before retrying, so a duplicate can
+ * never slip in.
+ *
+ * Returns 0 if our entry was linked, -EEXIST if an exact match already
+ * exists, or -EIO/-ELOOP on a corrupt chain.
  */
-static int dirent_chain_append(struct daxfs_overlay *ovl,
-			       struct daxfs_ovl_dirent_entry *head,
-			       u64 new_pool_off)
+static int dirent_chain_append_unique(
+	struct daxfs_overlay *ovl, struct daxfs_ovl_dirent_entry *head,
+	u64 parent_ino, const char *name, u16 name_len, u64 new_pool_off,
+	struct daxfs_ovl_dirent_entry **existing_out)
 {
 	struct daxfs_ovl_dirent_entry *de = head;
 	int limit = 1024;
 
 	while (limit-- > 0) {
-		u64 next = le64_to_cpu(READ_ONCE(de->next));
+		u64 next;
 
+		if (dirent_matches(de, parent_ino, name, name_len)) {
+			if (existing_out)
+				*existing_out = de;
+			return -EEXIST;
+		}
+
+		next = le64_to_cpu(READ_ONCE(de->next));
 		if (next == DAXFS_OVL_NO_NEXT) {
-			u64 old;
-
-			old = cmpxchg((u64 *)&de->next,
-				      cpu_to_le64(DAXFS_OVL_NO_NEXT),
-				      cpu_to_le64(new_pool_off));
+			u64 old = cmpxchg((u64 *)&de->next,
+					  cpu_to_le64(DAXFS_OVL_NO_NEXT),
+					  cpu_to_le64(new_pool_off));
 			if (old == cpu_to_le64(DAXFS_OVL_NO_NEXT)) {
 				smp_wmb();
 				return 0;
 			}
-			/* Raced — another host appended; re-read */
+			/*
+			 * Raced: another host appended. Re-read this entry's
+			 * next (now pointing at the new entries) and keep
+			 * walking so we re-check them for our name.
+			 */
 			continue;
 		}
 
@@ -724,6 +747,20 @@ static int dirent_chain_append(struct daxfs_overlay *ovl,
 	}
 
 	return -ELOOP;
+}
+
+/*
+ * Point an existing dirent at a child inode and clear any tombstone.
+ * The target is published before the tombstone is cleared so a reader
+ * never observes a live entry with a stale child.
+ */
+static void dirent_set_live(struct daxfs_ovl_dirent_entry *de,
+			    u64 child_ino, u32 child_mode)
+{
+	WRITE_ONCE(de->child_ino, cpu_to_le64(child_ino));
+	WRITE_ONCE(de->child_mode, cpu_to_le32(child_mode));
+	smp_wmb();
+	WRITE_ONCE(de->flags, 0);
 }
 
 /*
@@ -863,7 +900,7 @@ int daxfs_overlay_create_dirent(struct daxfs_info *info,
 	struct daxfs_overlay *ovl = info->overlay;
 	u64 key;
 	u64 pool_off;
-	struct daxfs_ovl_dirent_entry *de, *head;
+	struct daxfs_ovl_dirent_entry *de, *head, *existing = NULL;
 	int ret;
 
 	if (!ovl)
@@ -871,69 +908,70 @@ int daxfs_overlay_create_dirent(struct daxfs_info *info,
 
 	key = fnv1a_hash(parent_ino, name, name_len);
 
-	/* Check if key already exists in hash table */
+	/* Fast path: an entry for this exact name already exists. */
 	head = overlay_lookup(ovl, info, key);
 	if (head) {
-		/* Walk chain for exact match (possibly tombstoned) */
 		de = dirent_chain_walk(ovl, head, parent_ino, name, name_len);
 		if (de) {
-			/* Reuse existing entry (e.g., un-delete) —
-			 * already on the dir list, just clear tombstone */
-			WRITE_ONCE(de->child_ino, cpu_to_le64(child_ino));
-			WRITE_ONCE(de->child_mode, cpu_to_le32(child_mode));
-			smp_wmb();
-			WRITE_ONCE(de->flags, 0);
+			/* Reuse existing entry (e.g. un-delete); it is already
+			 * on the dir list. */
+			dirent_set_live(de, child_ino, child_mode);
 			return 0;
 		}
-
-		/*
-		 * Hash collision: key exists but belongs to a different
-		 * dirent. Allocate new entry and append to chain.
-		 */
-		pool_off = overlay_pool_alloc(ovl, sizeof(*de),
-					      DAXFS_OVL_DIRENT);
-		if (pool_off == (u64)-1)
-			return -ENOSPC;
-
-		de = ovl->pool + pool_off;
-		dirent_init(de, parent_ino, child_ino, child_mode,
-			    name, name_len, 0);
-
-		ret = dirent_chain_append(ovl, head, pool_off);
-		if (ret == 0)
-			overlay_dirlist_prepend(ovl, info, parent_ino,
-						pool_off);
-		return ret;
 	}
 
-	/* Key doesn't exist — allocate and insert as new bucket entry */
+	/* Allocate our candidate entry. */
 	pool_off = overlay_pool_alloc(ovl, sizeof(*de), DAXFS_OVL_DIRENT);
 	if (pool_off == (u64)-1)
 		return -ENOSPC;
 
 	de = ovl->pool + pool_off;
-	dirent_init(de, parent_ino, child_ino, child_mode,
-		    name, name_len, 0);
+	dirent_init(de, parent_ino, child_ino, child_mode, name, name_len, 0);
 
-	ret = overlay_insert(ovl, key, pool_off, NULL, false);
-	if (ret == -ENOSPC)
-		return ret;
-	if (ret == -EEXIST) {
+	if (head) {
 		/*
-		 * Another host inserted the same key concurrently.
-		 * Append to their chain instead of overwriting.
+		 * Key present but our name absent (hash collision). Append
+		 * only if still unique — another host may have raced us onto
+		 * the same name in the meantime.
 		 */
-		head = overlay_lookup(ovl, info, key);
-		if (head)
-			ret = dirent_chain_append(ovl, head, pool_off);
-		else
-			ret = -EIO; /* Shouldn't happen */
+		ret = dirent_chain_append_unique(ovl, head, parent_ino,
+						 name, name_len, pool_off,
+						 &existing);
+	} else {
+		/* Key absent: try to become the bucket owner for it. */
+		ret = overlay_insert(ovl, key, pool_off, NULL, false);
+		if (ret == -EEXIST) {
+			/* Another host owns the key now; append-if-unique. */
+			head = overlay_lookup(ovl, info, key);
+			if (!head) {
+				overlay_pool_free(ovl, pool_off,
+						  DAXFS_OVL_DIRENT);
+				return -EIO; /* Shouldn't happen */
+			}
+			ret = dirent_chain_append_unique(ovl, head, parent_ino,
+							 name, name_len,
+							 pool_off, &existing);
+		}
 	}
 
-	if (ret == 0)
-		overlay_dirlist_prepend(ovl, info, parent_ino, pool_off);
+	if (ret == -EEXIST) {
+		/*
+		 * Lost a concurrent create of the same name on another host.
+		 * Drop our entry and adopt the winner's, preserving the
+		 * one-dirent-per-name invariant across hosts.
+		 */
+		overlay_pool_free(ovl, pool_off, DAXFS_OVL_DIRENT);
+		dirent_set_live(existing, child_ino, child_mode);
+		return 0;
+	}
+	if (ret) {
+		/* Our entry was never linked; reclaim it. */
+		overlay_pool_free(ovl, pool_off, DAXFS_OVL_DIRENT);
+		return ret;
+	}
 
-	return ret;
+	overlay_dirlist_prepend(ovl, info, parent_ino, pool_off);
+	return 0;
 }
 
 /*
@@ -949,7 +987,7 @@ int daxfs_overlay_delete_dirent(struct daxfs_info *info,
 {
 	struct daxfs_overlay *ovl = info->overlay;
 	u64 key;
-	struct daxfs_ovl_dirent_entry *de, *head;
+	struct daxfs_ovl_dirent_entry *de, *head, *existing = NULL;
 	u64 pool_off;
 	int ret;
 
@@ -958,12 +996,11 @@ int daxfs_overlay_delete_dirent(struct daxfs_info *info,
 
 	key = fnv1a_hash(parent_ino, name, name_len);
 
-	/* Check if dirent exists in overlay (walking chain) */
+	/* If the dirent already exists in overlay, just tombstone it. */
 	head = overlay_lookup(ovl, info, key);
 	if (head) {
 		de = dirent_chain_walk(ovl, head, parent_ino, name, name_len);
 		if (de) {
-			/* Mark as tombstone */
 			WRITE_ONCE(de->flags,
 				   cpu_to_le32(DAXFS_OVL_DIRENT_TOMBSTONE));
 			smp_wmb();
@@ -972,8 +1009,7 @@ int daxfs_overlay_delete_dirent(struct daxfs_info *info,
 	}
 
 	/*
-	 * Entry not in overlay — it's a base image entry.
-	 * Create a tombstone in overlay.
+	 * Entry not in overlay — it's a base image entry. Create a tombstone.
 	 */
 	pool_off = overlay_pool_alloc(ovl, sizeof(*de), DAXFS_OVL_DIRENT);
 	if (pool_off == (u64)-1)
@@ -984,26 +1020,44 @@ int daxfs_overlay_delete_dirent(struct daxfs_info *info,
 		    DAXFS_OVL_DIRENT_TOMBSTONE);
 
 	if (head) {
-		/* Key exists (hash collision) — append to chain */
-		ret = dirent_chain_append(ovl, head, pool_off);
+		/* Key present, name absent (hash collision): append-if-unique. */
+		ret = dirent_chain_append_unique(ovl, head, parent_ino,
+						 name, name_len, pool_off,
+						 &existing);
 	} else {
 		ret = overlay_insert(ovl, key, pool_off, NULL, false);
-		if (ret == -ENOSPC)
-			return ret;
 		if (ret == -EEXIST) {
-			/* Concurrent insert — append to their chain */
+			/* Concurrent insert — append-if-unique to their chain. */
 			head = overlay_lookup(ovl, info, key);
-			if (head)
-				ret = dirent_chain_append(ovl, head, pool_off);
-			else
-				ret = -EIO;
+			if (!head) {
+				overlay_pool_free(ovl, pool_off,
+						  DAXFS_OVL_DIRENT);
+				return -EIO;
+			}
+			ret = dirent_chain_append_unique(ovl, head, parent_ino,
+							 name, name_len,
+							 pool_off, &existing);
 		}
 	}
 
-	if (ret == 0)
-		overlay_dirlist_prepend(ovl, info, parent_ino, pool_off);
+	if (ret == -EEXIST) {
+		/*
+		 * Another host raced us onto the same name; drop our entry and
+		 * tombstone the existing one instead of appending a duplicate.
+		 */
+		overlay_pool_free(ovl, pool_off, DAXFS_OVL_DIRENT);
+		WRITE_ONCE(existing->flags,
+			   cpu_to_le32(DAXFS_OVL_DIRENT_TOMBSTONE));
+		smp_wmb();
+		return 0;
+	}
+	if (ret) {
+		overlay_pool_free(ovl, pool_off, DAXFS_OVL_DIRENT);
+		return ret;
+	}
 
-	return ret;
+	overlay_dirlist_prepend(ovl, info, parent_ino, pool_off);
+	return 0;
 }
 
 /*
