@@ -19,6 +19,7 @@
 #include <linux/mutex.h>
 #include <linux/xarray.h>
 #include "daxfs_format.h"
+#include "coherence.h"
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0)
 static inline unsigned int inode_state_read_once(struct inode *inode)
@@ -41,6 +42,7 @@ struct daxfs_pcache {
 	u32 hash_mask;                       /* slot_count - 1 */
 	u32 block_size;                      /* Cached from daxfs_info */
 	u32 block_shift;                     /* ilog2(block_size) */
+	enum daxfs_mem_model mem_model;      /* copied from daxfs_info */
 	struct list_head backing_files;      /* List of daxfs_pcache_backing */
 	struct task_struct *fill_thread;     /* Host kthread, NULL for spawn */
 	struct file **backing_array;         /* O(1) lookup by ino, [0..max_ino] */
@@ -65,6 +67,7 @@ struct daxfs_overlay {
 	void *pool;                          /* On-DAX pool area */
 	u32 bucket_count;
 	u32 bucket_mask;                     /* bucket_count - 1 */
+	enum daxfs_mem_model mem_model;      /* copied from daxfs_info */
 };
 
 /*
@@ -87,6 +90,9 @@ struct daxfs_info {
 
 	/* Cached block_size from superblock (== PAGE_SIZE, validated at mount) */
 	u32 block_size;
+
+	/* Shared-memory coherence backend (default DAXFS_MEM_COHERENT) */
+	enum daxfs_mem_model mem_model;
 
 	/* Base image access */
 	struct daxfs_base_inode *base_inodes;

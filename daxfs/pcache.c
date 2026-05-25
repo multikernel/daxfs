@@ -2,9 +2,10 @@
 /*
  * daxfs shared page cache
  *
- * Demand-paged cache in DAX memory for backing store mode. Because DAX
- * memory is physically shared across kernel instances, the cache is
- * automatically visible to all kernels with no coherency protocol.
+ * Demand-paged cache in DAX memory for backing store mode. Within one
+ * hardware cache-coherence domain (multikernel), the cache is visible to all
+ * kernels via hardware coherence with no software coherency protocol. Cross-
+ * host CXL sharing requires hardware coherence; see docs/COHERENCE.md.
  *
  * Multi-file support: tags encode (ino << 20 | pgoff), so each cache
  * slot is associated with a specific file and page offset. Multiple
@@ -24,14 +25,15 @@ static u32 pcache_hash(struct daxfs_pcache *pc, u64 tag)
 	return (u32)(tag & pc->hash_mask);
 }
 
-static u64 slot_cmpxchg(struct daxfs_pcache_slot *slot, u64 old_val, u64 new_val)
+static u64 slot_cmpxchg(struct daxfs_pcache *pc,
+			struct daxfs_pcache_slot *slot, u64 old_val, u64 new_val)
 {
-	return cmpxchg((u64 *)&slot->state_tag, old_val, new_val);
+	return daxfs_cas64(pc->mem_model, &slot->state_tag, old_val, new_val);
 }
 
-static u64 slot_read(struct daxfs_pcache_slot *slot)
+static u64 slot_read(struct daxfs_pcache *pc, struct daxfs_pcache_slot *slot)
 {
-	return le64_to_cpu(READ_ONCE(slot->state_tag));
+	return daxfs_load_once64(pc->mem_model, &slot->state_tag);
 }
 
 static void pcache_inc_pending(struct daxfs_pcache_header *hdr)
@@ -85,7 +87,7 @@ static int pcache_fill_slot(struct daxfs_pcache *pc, u32 slot_idx, u64 tag)
 		/* No backing file — revert slot to FREE so it can be reused */
 		old_val = PCACHE_MAKE(PCACHE_STATE_PENDING, tag);
 		new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
-		if (slot_cmpxchg(&pc->slots[slot_idx], old_val, new_val) ==
+		if (slot_cmpxchg(pc, &pc->slots[slot_idx], old_val, new_val) ==
 		    old_val)
 			pcache_dec_pending(pc->header);
 		return -ENOENT;
@@ -98,7 +100,7 @@ static int pcache_fill_slot(struct daxfs_pcache *pc, u32 slot_idx, u64 tag)
 		/* Revert to FREE so the slot can be retried later */
 		old_val = PCACHE_MAKE(PCACHE_STATE_PENDING, tag);
 		new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
-		if (slot_cmpxchg(&pc->slots[slot_idx], old_val, new_val) ==
+		if (slot_cmpxchg(pc, &pc->slots[slot_idx], old_val, new_val) ==
 		    old_val)
 			pcache_dec_pending(pc->header);
 		return (int)n;
@@ -107,12 +109,12 @@ static int pcache_fill_slot(struct daxfs_pcache *pc, u32 slot_idx, u64 tag)
 	if (n < bsize)
 		memset(dst + n, 0, bsize - n);
 
-	smp_wmb();
+	daxfs_publish_fence(pc->mem_model);
 
 	/* Transition PENDING → VALID */
 	old_val = PCACHE_MAKE(PCACHE_STATE_PENDING, tag);
 	new_val = PCACHE_MAKE(PCACHE_STATE_VALID, tag);
-	if (slot_cmpxchg(&pc->slots[slot_idx], old_val, new_val) == old_val)
+	if (slot_cmpxchg(pc, &pc->slots[slot_idx], old_val, new_val) == old_val)
 		pcache_dec_pending(pc->header);
 
 	return 0;
@@ -135,7 +137,7 @@ static int daxfs_pcache_fill_thread(void *data)
 		}
 
 		for (i = 0; i < pc->slot_count && !kthread_should_stop(); i++) {
-			u64 val = slot_read(&pc->slots[i]);
+			u64 val = slot_read(pc, &pc->slots[i]);
 
 			if (PCACHE_STATE(val) == PCACHE_STATE_PENDING)
 				pcache_fill_slot(pc, i, PCACHE_TAG(val));
@@ -157,7 +159,8 @@ static inline void pcache_touch(struct daxfs_pcache_slot *slot)
  * Pin a VALID slot by CAS-incrementing its refcount.
  * Returns true on success, false if slot state changed (caller retries).
  */
-static bool pcache_pin_slot(struct daxfs_pcache_slot *slot, u64 expected_val)
+static bool pcache_pin_slot(struct daxfs_pcache *pc,
+			    struct daxfs_pcache_slot *slot, u64 expected_val)
 {
 	u64 new_val;
 
@@ -165,7 +168,7 @@ static bool pcache_pin_slot(struct daxfs_pcache_slot *slot, u64 expected_val)
 		return false;
 
 	new_val = expected_val + PCACHE_REFCNT_INC;
-	return slot_cmpxchg(slot, expected_val, new_val) == expected_val;
+	return slot_cmpxchg(pc, slot, expected_val, new_val) == expected_val;
 }
 
 /*
@@ -180,13 +183,13 @@ void daxfs_pcache_put_page(struct daxfs_info *info, s32 slot_idx)
 		return;
 
 	do {
-		val = slot_read(&pc->slots[slot_idx]);
+		val = slot_read(pc, &pc->slots[slot_idx]);
 		if (PCACHE_REFCNT(val) == 0) {
 			WARN_ON_ONCE(1);
 			return;
 		}
 		new_val = val - PCACHE_REFCNT_INC;
-	} while (slot_cmpxchg(&pc->slots[slot_idx], val, new_val) != val);
+	} while (slot_cmpxchg(pc, &pc->slots[slot_idx], val, new_val) != val);
 }
 
 /*
@@ -207,7 +210,7 @@ static void pcache_clock_sweep(struct daxfs_pcache *pc)
 
 	for (i = 0; i < PCACHE_SWEEP_BATCH; i++) {
 		u32 idx = (old_hand + i) & pc->hash_mask;
-		u64 val = slot_read(&pc->slots[idx]);
+		u64 val = slot_read(pc, &pc->slots[idx]);
 
 		if (PCACHE_STATE(val) == PCACHE_STATE_VALID)
 			WRITE_ONCE(pc->slots[idx].ref_bit, cpu_to_le32(0));
@@ -226,16 +229,16 @@ static void *pcache_wait_valid(struct daxfs_pcache *pc, u32 target_idx,
 	int timeout_us = 10000;
 
 	while (timeout_us > 0) {
-		u64 val = slot_read(&pc->slots[target_idx]);
+		u64 val = slot_read(pc, &pc->slots[target_idx]);
 
 		if (PCACHE_STATE(val) == PCACHE_STATE_VALID &&
 		    PCACHE_TAG(val) == desired_tag) {
-			if (!pcache_pin_slot(&pc->slots[target_idx], val)) {
+			if (!pcache_pin_slot(pc, &pc->slots[target_idx], val)) {
 				cpu_relax();
 				timeout_us--;
 				continue;
 			}
-			smp_rmb();
+			daxfs_observe_fence(pc->mem_model);
 			pcache_touch(&pc->slots[target_idx]);
 			if (pinned_slot)
 				*pinned_slot = (s32)target_idx;
@@ -293,13 +296,13 @@ void *daxfs_pcache_get_page(struct daxfs_info *info, u64 ino, u64 pgoff,
 
 	slot_idx = pcache_hash(pc, desired_tag);
 
-	val = slot_read(&pc->slots[slot_idx]);
+	val = slot_read(pc, &pc->slots[slot_idx]);
 
 	/* Fast path: VALID with matching tag and refcount 0 */
 	if (likely(PCACHE_STATE(val) == PCACHE_STATE_VALID &&
 		   PCACHE_TAG(val) == desired_tag)) {
-		if (pcache_pin_slot(&pc->slots[slot_idx], val)) {
-			smp_rmb();
+		if (pcache_pin_slot(pc, &pc->slots[slot_idx], val)) {
+			daxfs_observe_fence(pc->mem_model);
 			pcache_touch(&pc->slots[slot_idx]);
 			if (pinned_slot)
 				*pinned_slot = (s32)slot_idx;
@@ -333,15 +336,15 @@ restart:
 		for (i = 0; i < PCACHE_PROBE_LEN; i++) {
 			u32 idx = (slot_idx + i) & pc->hash_mask;
 
-			val = slot_read(&pc->slots[idx]);
+			val = slot_read(pc, &pc->slots[idx]);
 
 			switch (PCACHE_STATE(val)) {
 			case PCACHE_STATE_VALID:
 				if (PCACHE_TAG(val) == desired_tag) {
-					if (!pcache_pin_slot(&pc->slots[idx],
+					if (!pcache_pin_slot(pc, &pc->slots[idx],
 							     val))
 						goto restart;
-					smp_rmb();
+					daxfs_observe_fence(pc->mem_model);
 					pcache_touch(&pc->slots[idx]);
 					if (pinned_slot)
 						*pinned_slot = (s32)idx;
@@ -374,12 +377,12 @@ restart:
 		if (first_free >= 0) {
 			u32 free_idx = (u32)first_free;
 
-			val = slot_read(&pc->slots[free_idx]);
+			val = slot_read(pc, &pc->slots[free_idx]);
 			if (PCACHE_STATE(val) != PCACHE_STATE_FREE)
 				goto restart;
 
 			new_val = PCACHE_MAKE(PCACHE_STATE_PENDING, desired_tag);
-			if (slot_cmpxchg(&pc->slots[free_idx], val, new_val) != val)
+			if (slot_cmpxchg(pc, &pc->slots[free_idx], val, new_val) != val)
 				goto restart;
 
 			pcache_inc_pending(pc->header);
@@ -387,10 +390,10 @@ restart:
 			if (!list_empty(&pc->backing_files)) {
 				pcache_fill_slot(pc, free_idx, desired_tag);
 				/* Pin the freshly-filled slot */
-				val = slot_read(&pc->slots[free_idx]);
+				val = slot_read(pc, &pc->slots[free_idx]);
 				if (PCACHE_STATE(val) == PCACHE_STATE_VALID &&
 				    PCACHE_TAG(val) == desired_tag &&
-				    pcache_pin_slot(&pc->slots[free_idx], val)) {
+				    pcache_pin_slot(pc, &pc->slots[free_idx], val)) {
 					pcache_touch(&pc->slots[free_idx]);
 					if (pinned_slot)
 						*pinned_slot = (s32)free_idx;
@@ -420,12 +423,12 @@ restart:
 	for (i = 0; i < PCACHE_PROBE_LEN; i++) {
 		u32 idx = (slot_idx + i) & pc->hash_mask;
 
-		val = slot_read(&pc->slots[idx]);
+		val = slot_read(pc, &pc->slots[idx]);
 		if (PCACHE_STATE(val) == PCACHE_STATE_VALID &&
 		    PCACHE_REFCNT(val) == 0 &&
 		    !le32_to_cpu(READ_ONCE(pc->slots[idx].ref_bit))) {
 			new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
-			if (slot_cmpxchg(&pc->slots[idx], val, new_val) == val)
+			if (slot_cmpxchg(pc, &pc->slots[idx], val, new_val) == val)
 				goto restart;
 		}
 	}
@@ -447,12 +450,12 @@ restart:
 	for (i = 0; i < PCACHE_PROBE_LEN; i++) {
 		u32 idx = (slot_idx + i) & pc->hash_mask;
 
-		val = slot_read(&pc->slots[idx]);
+		val = slot_read(pc, &pc->slots[idx]);
 		if (PCACHE_STATE(val) == PCACHE_STATE_VALID &&
 		    PCACHE_REFCNT(val) == 0 &&
 		    !le32_to_cpu(READ_ONCE(pc->slots[idx].ref_bit))) {
 			new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
-			if (slot_cmpxchg(&pc->slots[idx], val, new_val) == val)
+			if (slot_cmpxchg(pc, &pc->slots[idx], val, new_val) == val)
 				goto restart;
 		}
 	}
@@ -464,11 +467,11 @@ restart:
 	for (i = 0; i < PCACHE_PROBE_LEN; i++) {
 		u32 idx = (slot_idx + i) & pc->hash_mask;
 
-		val = slot_read(&pc->slots[idx]);
+		val = slot_read(pc, &pc->slots[idx]);
 		if (PCACHE_STATE(val) == PCACHE_STATE_VALID &&
 		    PCACHE_REFCNT(val) == 0) {
 			new_val = PCACHE_MAKE(PCACHE_STATE_FREE, 0);
-			if (slot_cmpxchg(&pc->slots[idx], val, new_val) == val)
+			if (slot_cmpxchg(pc, &pc->slots[idx], val, new_val) == val)
 				goto restart;
 		}
 	}
@@ -703,6 +706,7 @@ int daxfs_pcache_init(struct daxfs_info *info, const char *backing_path)
 		return -ENOMEM;
 
 	INIT_LIST_HEAD(&pc->backing_files);
+	pc->mem_model = info->mem_model;
 	pc->block_size = info->block_size;
 	pc->block_shift = ilog2(info->block_size);
 

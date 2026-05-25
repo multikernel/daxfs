@@ -24,6 +24,7 @@ enum daxfs_param {
 	Opt_validate,
 	Opt_backing,
 	Opt_export,
+	Opt_mem_model,
 };
 
 static const struct fs_parameter_spec daxfs_fs_parameters[] = {
@@ -34,6 +35,7 @@ static const struct fs_parameter_spec daxfs_fs_parameters[] = {
 	fsparam_flag("validate", Opt_validate),
 	fsparam_string("backing", Opt_backing),
 	fsparam_string("export", Opt_export),
+	fsparam_string("mem_model", Opt_mem_model),
 	{}
 };
 
@@ -44,6 +46,7 @@ struct daxfs_fs_context {
 	struct file *dmabuf_file;	/* dma-buf file from FSCONFIG_SET_FD */
 	char *backing_path;		/* backing file path for pcache */
 	char *export_path;		/* directory to export into namespace */
+	char *mem_model;		/* "coherent" | "cxl3" (optional override) */
 	bool validate;			/* validate image on mount */
 };
 
@@ -90,6 +93,12 @@ static int daxfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		if (!ctx->export_path)
 			return -ENOMEM;
 		break;
+	case Opt_mem_model:
+		kfree(ctx->mem_model);
+		ctx->mem_model = kstrdup(param->string, GFP_KERNEL);
+		if (!ctx->mem_model)
+			return -ENOMEM;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -107,6 +116,20 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
 	if (!info)
 		return -ENOMEM;
+
+	/* Optional explicit backend override; default (0) is COHERENT. */
+	if (ctx->mem_model) {
+		if (!strcmp(ctx->mem_model, "coherent")) {
+			info->mem_model = DAXFS_MEM_COHERENT;
+		} else if (!strcmp(ctx->mem_model, "cxl3")) {
+			info->mem_model = DAXFS_MEM_CXL3;
+		} else {
+			pr_err("daxfs: unknown mem_model '%s' (use coherent|cxl3)\n",
+			       ctx->mem_model);
+			ret = -EINVAL;
+			goto err_free;
+		}
+	}
 
 	/* Initialize memory mapping via storage layer */
 	if (ctx->dmabuf_file) {
@@ -287,6 +310,7 @@ static void daxfs_free_fc(struct fs_context *fc)
 		kfree(ctx->name);
 		kfree(ctx->backing_path);
 		kfree(ctx->export_path);
+		kfree(ctx->mem_model);
 		kfree(ctx);
 	}
 }

@@ -42,6 +42,9 @@
 /* Block size = native page size (stored in superblock, validated at mount) */
 static uint32_t block_size;
 
+/* Optional coherence backend override passed to the mount ("coherent"|"cxl3") */
+static const char *mem_model_opt;
+
 /* From linux/dma-heap.h */
 struct dma_heap_allocation_data {
 	uint64_t len;
@@ -932,6 +935,15 @@ static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint,
 		}
 	}
 
+	if (mem_model_opt) {
+		if (sys_fsconfig(fs_fd, FSCONFIG_SET_STRING, "mem_model",
+				 mem_model_opt, 0) < 0) {
+			perror("fsconfig(mem_model)");
+			close(fs_fd);
+			return -1;
+		}
+	}
+
 	if (validate) {
 		if (sys_fsconfig(fs_fd, FSCONFIG_SET_FLAG, "validate", NULL, 0) < 0) {
 			perror("fsconfig(FSCONFIG_SET_FLAG, validate)");
@@ -1005,6 +1017,15 @@ static int mount_daxfs_phys(unsigned long long phys_addr, size_t size,
 		if (sys_fsconfig(fs_fd, FSCONFIG_SET_STRING, "export",
 				 export_path, 0) < 0) {
 			perror("fsconfig(export)");
+			close(fs_fd);
+			return -1;
+		}
+	}
+
+	if (mem_model_opt) {
+		if (sys_fsconfig(fs_fd, FSCONFIG_SET_STRING, "mem_model",
+				 mem_model_opt, 0) < 0) {
+			perror("fsconfig(mem_model)");
 			close(fs_fd);
 			return -1;
 		}
@@ -1152,6 +1173,7 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  -B, --buckets N        Overlay bucket count (power of 2, default 65536)\n");
 	fprintf(stderr, "  -E, --empty            Empty mode (no base image, overlay + pcache only)\n");
 	fprintf(stderr, "  -X, --export           Export mode (metadata+overlay+pcache in DAX, files from source dir)\n");
+	fprintf(stderr, "  -M, --mem-model MODEL  Coherence backend at mount: coherent (default) or cxl3\n");
 	fprintf(stderr, "  -h, --help             Show this help\n");
 	fprintf(stderr, "\nBy default, creates a static read-only image.\n");
 	fprintf(stderr, "Use -O/--overlay to add a writable overlay region.\n");
@@ -1184,6 +1206,7 @@ int main(int argc, char *argv[])
 		{"buckets", required_argument, 0, 'B'},
 		{"empty", no_argument, 0, 'E'},
 		{"export", no_argument, 0, 'X'},
+		{"mem-model", required_argument, 0, 'M'},
 		{"help", no_argument, 0, 'h'},
 		{"version", no_argument, 0, 'v'},
 		{0, 0, 0, 0}
@@ -1225,7 +1248,7 @@ int main(int argc, char *argv[])
 			block_size = DAXFS_MIN_BLOCK_SIZE;
 	}
 
-	while ((opt = getopt_long(argc, argv, "d:o:H:D:m:p:s:C:O:B:EXVh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:H:D:m:p:s:C:O:B:M:EXVh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			src_dir = optarg;
@@ -1273,6 +1296,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'X':
 			export_mode = true;
+			break;
+		case 'M':
+			mem_model_opt = optarg;
 			break;
 		case 'v':
 			print_version();
