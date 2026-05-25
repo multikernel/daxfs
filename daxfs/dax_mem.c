@@ -43,6 +43,15 @@ int daxfs_mem_init_dmabuf(struct daxfs_info *info, struct file *dmabuf_file)
 	info->mem = info->dma_map.vaddr;
 	info->size = dmabuf->size;
 
+	/*
+	 * dma-buf / dma_heap memory is cache-coherent within this host, so the
+	 * default COHERENT backend is correct. A CXL device source will select
+	 * DAXFS_MEM_CXL3 here in phase 2; an explicit mem_model= override (set
+	 * before mapping) is left untouched, so do not assign here.
+	 */
+	pr_info("daxfs: coherence backend = %s\n",
+		info->mem_model == DAXFS_MEM_CXL3 ? "cxl3" : "coherent");
+
 	return 0;
 }
 
@@ -66,6 +75,10 @@ int daxfs_mem_init_phys(struct daxfs_info *info, phys_addr_t phys_addr,
 		       &phys_addr, size);
 		return -ENOMEM;
 	}
+
+	/* WB-mapped physical memory is coherent within this host (see dmabuf). */
+	pr_info("daxfs: coherence backend = %s\n",
+		info->mem_model == DAXFS_MEM_CXL3 ? "cxl3" : "coherent");
 
 	return 0;
 }

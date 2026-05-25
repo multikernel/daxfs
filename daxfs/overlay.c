@@ -53,15 +53,17 @@ static u64 fnv1a_hash(u64 parent_ino, const char *name, u16 name_len)
  * ============================================================================
  */
 
-static u64 bucket_read(struct daxfs_overlay_bucket *b)
+static u64 bucket_read(struct daxfs_overlay *ovl,
+		       struct daxfs_overlay_bucket *b)
 {
-	return le64_to_cpu(READ_ONCE(b->state_key));
+	return daxfs_load_once64(ovl->mem_model, &b->state_key);
 }
 
-static u64 bucket_cmpxchg(struct daxfs_overlay_bucket *b, u64 old_val,
-			   u64 new_val)
+static u64 bucket_cmpxchg(struct daxfs_overlay *ovl,
+			  struct daxfs_overlay_bucket *b, u64 old_val,
+			  u64 new_val)
 {
-	return cmpxchg((u64 *)&b->state_key, old_val, new_val);
+	return daxfs_cas64(ovl->mem_model, &b->state_key, old_val, new_val);
 }
 
 /*
@@ -96,7 +98,7 @@ static void *overlay_lookup(struct daxfs_overlay *ovl, struct daxfs_info *info,
 	for (i = 0; i < ovl->bucket_count; i++) {
 		u32 probe = (idx + i) & ovl->bucket_mask;
 		struct daxfs_overlay_bucket *b = &ovl->buckets[probe];
-		u64 sk = bucket_read(b);
+		u64 sk = bucket_read(ovl, b);
 
 		if (DAXFS_OVL_STATE(sk) == DAXFS_OVL_FREE)
 			return NULL;	/* Empty slot — key doesn't exist */
@@ -104,8 +106,8 @@ static void *overlay_lookup(struct daxfs_overlay *ovl, struct daxfs_info *info,
 		if (DAXFS_OVL_KEY(sk) == key) {
 			u64 pool_off;
 
-			smp_rmb(); /* Pair with smp_wmb() in overlay_insert */
-			pool_off = le64_to_cpu(READ_ONCE(b->value));
+			daxfs_observe_fence(ovl->mem_model); /* pair publish in insert */
+			pool_off = daxfs_load_once64(ovl->mem_model, &b->value);
 			return overlay_pool_ptr(ovl, pool_off, 1);
 		}
 	}
@@ -139,7 +141,7 @@ static int overlay_insert(struct daxfs_overlay *ovl, u64 key, u64 pool_offset,
 	for (i = 0; i < ovl->bucket_count; i++) {
 		u32 probe = (idx + i) & ovl->bucket_mask;
 		struct daxfs_overlay_bucket *b = &ovl->buckets[probe];
-		u64 sk = bucket_read(b);
+		u64 sk = bucket_read(ovl, b);
 
 		if (DAXFS_OVL_STATE(sk) == DAXFS_OVL_FREE) {
 			u64 new_sk = DAXFS_OVL_MAKE(DAXFS_OVL_USED, key);
@@ -159,10 +161,10 @@ static int overlay_insert(struct daxfs_overlay *ovl, u64 key, u64 pool_offset,
 			 * to all CPUs before the CAS publishes the key.
 			 * Paired with smp_rmb() in overlay_lookup().
 			 */
-			WRITE_ONCE(b->value, cpu_to_le64(pool_offset));
-			smp_wmb();
+			daxfs_store_once64(ovl->mem_model, &b->value, pool_offset);
+			daxfs_publish_fence(ovl->mem_model);
 
-			old = bucket_cmpxchg(b, sk, new_sk);
+			old = bucket_cmpxchg(ovl, b, sk, new_sk);
 			if (old != sk) {
 				/* Raced — re-check this slot */
 				i--;
@@ -174,8 +176,8 @@ static int overlay_insert(struct daxfs_overlay *ovl, u64 key, u64 pool_offset,
 		if (DAXFS_OVL_KEY(sk) == key) {
 			u64 cur_val;
 
-			smp_rmb();
-			cur_val = le64_to_cpu(READ_ONCE(b->value));
+			daxfs_observe_fence(ovl->mem_model);
+			cur_val = daxfs_load_once64(ovl->mem_model, &b->value);
 
 			if (!replace) {
 				if (old_value)
@@ -184,16 +186,15 @@ static int overlay_insert(struct daxfs_overlay *ovl, u64 key, u64 pool_offset,
 			}
 
 			/* CAS-update value to avoid double-free races */
-			while (cmpxchg((u64 *)&b->value,
-				       cpu_to_le64(cur_val),
-				       cpu_to_le64(pool_offset)) !=
-			       cpu_to_le64(cur_val)) {
-				cur_val = le64_to_cpu(READ_ONCE(b->value));
+			while (daxfs_cas64(ovl->mem_model, &b->value,
+					   cur_val, pool_offset) != cur_val) {
+				cur_val = daxfs_load_once64(ovl->mem_model,
+							   &b->value);
 			}
 
 			if (old_value)
 				*old_value = cur_val;
-			smp_wmb();
+			daxfs_publish_fence(ovl->mem_model);
 			return 0;
 		}
 	}
@@ -281,19 +282,18 @@ static void overlay_pool_free(struct daxfs_overlay *ovl, u64 pool_off, u32 type)
 		return;
 
 	do {
-		old_tagged = le64_to_cpu(READ_ONCE(*head));
+		old_tagged = daxfs_load_once64(ovl->mem_model, head);
 		/* Store raw offset in link (not tagged) */
 		if (freelist_is_end(old_tagged))
-			WRITE_ONCE(*link, cpu_to_le64(DAXFS_OVL_FREE_END));
+			daxfs_store_once64(ovl->mem_model, link,
+					   DAXFS_OVL_FREE_END);
 		else
-			WRITE_ONCE(*link, cpu_to_le64(
-				freelist_offset(old_tagged)));
-		smp_wmb();
+			daxfs_store_once64(ovl->mem_model, link,
+					   freelist_offset(old_tagged));
+		daxfs_publish_fence(ovl->mem_model);
 		new_tagged = freelist_make(pool_off, old_tagged);
-	} while (cmpxchg((u64 *)head,
-			 cpu_to_le64(old_tagged),
-			 cpu_to_le64(new_tagged)) !=
-		 cpu_to_le64(old_tagged));
+	} while (daxfs_cas64(ovl->mem_model, head,
+			     old_tagged, new_tagged) != old_tagged);
 }
 
 /*
@@ -309,20 +309,18 @@ static u64 overlay_pool_alloc_free(struct daxfs_overlay *ovl, u32 type)
 		return (u64)-1;
 
 	do {
-		old_tagged = le64_to_cpu(READ_ONCE(*head));
+		old_tagged = daxfs_load_once64(ovl->mem_model, head);
 		if (freelist_is_end(old_tagged))
 			return (u64)-1;
 
 		off = freelist_offset(old_tagged);
-		smp_rmb();
+		daxfs_observe_fence(ovl->mem_model);
 		/* Link stores raw offset */
-		next_raw = le64_to_cpu(READ_ONCE(
-			*((__le64 *)(ovl->pool + off))));
+		next_raw = daxfs_load_once64(ovl->mem_model,
+					     (__le64 *)(ovl->pool + off));
 		new_tagged = freelist_make(next_raw, old_tagged);
-	} while (cmpxchg((u64 *)head,
-			 cpu_to_le64(old_tagged),
-			 cpu_to_le64(new_tagged)) !=
-		 cpu_to_le64(old_tagged));
+	} while (daxfs_cas64(ovl->mem_model, head,
+			     old_tagged, new_tagged) != old_tagged);
 
 	return off;
 }
@@ -344,14 +342,13 @@ static u64 overlay_pool_bump(struct daxfs_overlay *ovl, size_t size,
 	size = ALIGN(size, 8);
 
 	do {
-		old_alloc = le64_to_cpu(READ_ONCE(hdr->pool_alloc));
+		old_alloc = daxfs_load_once64(ovl->mem_model, &hdr->pool_alloc);
 		aligned_off = ALIGN(old_alloc, align);
 		new_alloc = aligned_off + size;
 		if (new_alloc > pool_size)
 			return (u64)-1;
-	} while (cmpxchg((u64 *)&hdr->pool_alloc,
-			 cpu_to_le64(old_alloc),
-			 cpu_to_le64(new_alloc)) != cpu_to_le64(old_alloc));
+	} while (daxfs_cas64(ovl->mem_model, &hdr->pool_alloc,
+			     old_alloc, new_alloc) != old_alloc);
 
 	return aligned_off;
 }
@@ -386,14 +383,13 @@ static u64 overlay_pool_bump_batch(struct daxfs_overlay *ovl,
 	u64 old_alloc, new_alloc, aligned_off;
 
 	do {
-		old_alloc = le64_to_cpu(READ_ONCE(hdr->pool_alloc));
+		old_alloc = daxfs_load_once64(ovl->mem_model, &hdr->pool_alloc);
 		aligned_off = ALIGN(old_alloc, PAGE_SIZE);
 		new_alloc = aligned_off + total;
 		if (new_alloc > pool_size)
 			return (u64)-1;
-	} while (cmpxchg((u64 *)&hdr->pool_alloc,
-			 cpu_to_le64(old_alloc),
-			 cpu_to_le64(new_alloc)) != cpu_to_le64(old_alloc));
+	} while (daxfs_cas64(ovl->mem_model, &hdr->pool_alloc,
+			     old_alloc, new_alloc) != old_alloc);
 
 	return aligned_off;
 }
@@ -432,6 +428,7 @@ int daxfs_overlay_init(struct daxfs_info *info)
 	}
 
 	ovl->header = hdr;
+	ovl->mem_model = info->mem_model;
 	ovl->bucket_count = le32_to_cpu(info->super->overlay_bucket_count);
 	ovl->bucket_mask = ovl->bucket_count - 1;
 	ovl->buckets = daxfs_mem_ptr(info,
@@ -500,7 +497,7 @@ int daxfs_overlay_set_inode(struct daxfs_info *info, u64 ino,
 
 	dst = ovl->pool + pool_off;
 	*dst = *ie;
-	smp_wmb();
+	daxfs_publish_fence(ovl->mem_model);
 
 	ret = overlay_insert(ovl, key, pool_off, NULL, true);
 	if (ret)
@@ -595,7 +592,7 @@ void *daxfs_overlay_publish_page(struct daxfs_info *info, u64 ino,
 	int ret;
 
 	/* Ensure page data is globally visible before publishing key */
-	smp_wmb();
+	daxfs_publish_fence(ovl->mem_model);
 
 	ret = overlay_insert(ovl, key, pool_off, NULL, false);
 	if (ret == -EEXIST) {
@@ -682,7 +679,7 @@ static struct daxfs_ovl_dirent_entry *dirent_chain_walk(
 		if (le64_to_cpu(de->next) == DAXFS_OVL_NO_NEXT)
 			return NULL;
 
-		smp_rmb(); /* Ensure we see the full next entry */
+		daxfs_observe_fence(ovl->mem_model); /* see the full next entry */
 		de = overlay_pool_ptr(ovl, le64_to_cpu(de->next),
 				      sizeof(*de));
 	}
@@ -725,13 +722,12 @@ static int dirent_chain_append_unique(
 			return -EEXIST;
 		}
 
-		next = le64_to_cpu(READ_ONCE(de->next));
+		next = daxfs_load_once64(ovl->mem_model, &de->next);
 		if (next == DAXFS_OVL_NO_NEXT) {
-			u64 old = cmpxchg((u64 *)&de->next,
-					  cpu_to_le64(DAXFS_OVL_NO_NEXT),
-					  cpu_to_le64(new_pool_off));
-			if (old == cpu_to_le64(DAXFS_OVL_NO_NEXT)) {
-				smp_wmb();
+			u64 old = daxfs_cas64(ovl->mem_model, &de->next,
+					      DAXFS_OVL_NO_NEXT, new_pool_off);
+			if (old == DAXFS_OVL_NO_NEXT) {
+				daxfs_publish_fence(ovl->mem_model);
 				return 0;
 			}
 			/*
@@ -742,7 +738,7 @@ static int dirent_chain_append_unique(
 			continue;
 		}
 
-		smp_rmb();
+		daxfs_observe_fence(ovl->mem_model);
 		de = overlay_pool_ptr(ovl, next, sizeof(*de));
 		if (!de)
 			return -EIO;
@@ -756,12 +752,15 @@ static int dirent_chain_append_unique(
  * The target is published before the tombstone is cleared so a reader
  * never observes a live entry with a stale child.
  */
-static void dirent_set_live(struct daxfs_ovl_dirent_entry *de,
+static void dirent_set_live(enum daxfs_mem_model model,
+			    struct daxfs_ovl_dirent_entry *de,
 			    u64 child_ino, u32 child_mode)
 {
-	WRITE_ONCE(de->child_ino, cpu_to_le64(child_ino));
+	daxfs_store_once64(model, &de->child_ino, child_ino);
+	/* child_mode/flags are 32-bit; not routed through the 64-bit helpers
+	 * (see docs/COHERENCE.md). The publish fence below orders them. */
 	WRITE_ONCE(de->child_mode, cpu_to_le32(child_mode));
-	smp_wmb();
+	daxfs_publish_fence(model);
 	WRITE_ONCE(de->flags, 0);
 }
 
@@ -790,7 +789,8 @@ struct daxfs_ovl_dirent_entry *daxfs_overlay_lookup_dirent(
 /*
  * Initialize a new dirent pool entry.
  */
-static void dirent_init(struct daxfs_ovl_dirent_entry *de,
+static void dirent_init(enum daxfs_mem_model model,
+			struct daxfs_ovl_dirent_entry *de,
 			u64 parent_ino, u64 child_ino, u32 child_mode,
 			const char *name, u16 name_len, u32 flags)
 {
@@ -805,7 +805,7 @@ static void dirent_init(struct daxfs_ovl_dirent_entry *de,
 	de->dir_next = cpu_to_le64(DAXFS_OVL_NO_NEXT);
 	memcpy(de->name, name, name_len);
 	de->name[name_len] = '\0';
-	smp_wmb();
+	daxfs_publish_fence(model);
 }
 
 /*
@@ -843,7 +843,7 @@ static struct daxfs_ovl_dirlist_entry *overlay_get_dirlist(
 		dl->type = cpu_to_le32(DAXFS_OVL_DIRLIST);
 		dl->reserved = 0;
 		dl->first = cpu_to_le64(DAXFS_OVL_NO_NEXT);
-		smp_wmb();
+		daxfs_publish_fence(ovl->mem_model);
 
 		ret = overlay_insert(ovl, key, pool_off, NULL, false);
 		if (ret == -EEXIST) {
@@ -878,13 +878,11 @@ static void overlay_dirlist_prepend(struct daxfs_overlay *ovl,
 	de = ovl->pool + dirent_pool_off;
 
 	do {
-		old_first = le64_to_cpu(READ_ONCE(dl->first));
-		WRITE_ONCE(de->dir_next, cpu_to_le64(old_first));
-		smp_wmb();
-	} while (cmpxchg((u64 *)&dl->first,
-			 cpu_to_le64(old_first),
-			 cpu_to_le64(dirent_pool_off)) !=
-		 cpu_to_le64(old_first));
+		old_first = daxfs_load_once64(ovl->mem_model, &dl->first);
+		daxfs_store_once64(ovl->mem_model, &de->dir_next, old_first);
+		daxfs_publish_fence(ovl->mem_model);
+	} while (daxfs_cas64(ovl->mem_model, &dl->first,
+			     old_first, dirent_pool_off) != old_first);
 }
 
 /*
@@ -917,7 +915,7 @@ int daxfs_overlay_create_dirent(struct daxfs_info *info,
 		if (de) {
 			/* Reuse existing entry (e.g. un-delete); it is already
 			 * on the dir list. */
-			dirent_set_live(de, child_ino, child_mode);
+			dirent_set_live(ovl->mem_model, de, child_ino, child_mode);
 			return 0;
 		}
 	}
@@ -928,7 +926,8 @@ int daxfs_overlay_create_dirent(struct daxfs_info *info,
 		return -ENOSPC;
 
 	de = ovl->pool + pool_off;
-	dirent_init(de, parent_ino, child_ino, child_mode, name, name_len, 0);
+	dirent_init(ovl->mem_model, de, parent_ino, child_ino, child_mode,
+		    name, name_len, 0);
 
 	if (head) {
 		/*
@@ -963,7 +962,7 @@ int daxfs_overlay_create_dirent(struct daxfs_info *info,
 		 * one-dirent-per-name invariant across hosts.
 		 */
 		overlay_pool_free(ovl, pool_off, DAXFS_OVL_DIRENT);
-		dirent_set_live(existing, child_ino, child_mode);
+		dirent_set_live(ovl->mem_model, existing, child_ino, child_mode);
 		return 0;
 	}
 	if (ret) {
@@ -1005,7 +1004,7 @@ int daxfs_overlay_delete_dirent(struct daxfs_info *info,
 		if (de) {
 			WRITE_ONCE(de->flags,
 				   cpu_to_le32(DAXFS_OVL_DIRENT_TOMBSTONE));
-			smp_wmb();
+			daxfs_publish_fence(ovl->mem_model);
 			return 0;
 		}
 	}
@@ -1018,7 +1017,7 @@ int daxfs_overlay_delete_dirent(struct daxfs_info *info,
 		return -ENOSPC;
 
 	de = ovl->pool + pool_off;
-	dirent_init(de, parent_ino, 0, 0, name, name_len,
+	dirent_init(ovl->mem_model, de, parent_ino, 0, 0, name, name_len,
 		    DAXFS_OVL_DIRENT_TOMBSTONE);
 
 	if (head) {
@@ -1050,7 +1049,7 @@ int daxfs_overlay_delete_dirent(struct daxfs_info *info,
 		overlay_pool_free(ovl, pool_off, DAXFS_OVL_DIRENT);
 		WRITE_ONCE(existing->flags,
 			   cpu_to_le32(DAXFS_OVL_DIRENT_TOMBSTONE));
-		smp_wmb();
+		daxfs_publish_fence(ovl->mem_model);
 		return 0;
 	}
 	if (ret) {
@@ -1076,11 +1075,10 @@ u64 daxfs_overlay_alloc_ino(struct daxfs_info *info)
 
 	hdr = ovl->header;
 	do {
-		old_ino = le64_to_cpu(READ_ONCE(hdr->next_ino));
+		old_ino = daxfs_load_once64(ovl->mem_model, &hdr->next_ino);
 		new_ino = old_ino + 1;
-	} while (cmpxchg((u64 *)&hdr->next_ino,
-			 cpu_to_le64(old_ino),
-			 cpu_to_le64(new_ino)) != cpu_to_le64(old_ino));
+	} while (daxfs_cas64(ovl->mem_model, &hdr->next_ino,
+			     old_ino, new_ino) != old_ino);
 
 	return old_ino;
 }
@@ -1146,12 +1144,12 @@ bool daxfs_overlay_dir_has_entries(struct daxfs_info *info, u64 parent_ino)
 	if (!dl)
 		return false;
 
-	off = le64_to_cpu(READ_ONCE(dl->first));
+	off = daxfs_load_once64(ovl->mem_model, &dl->first);
 
 	while (off != DAXFS_OVL_NO_NEXT && limit-- > 0) {
 		struct daxfs_ovl_dirent_entry *de;
 
-		smp_rmb();
+		daxfs_observe_fence(ovl->mem_model);
 		de = overlay_pool_ptr(ovl, off, sizeof(*de));
 		if (!de)
 			return false;
@@ -1160,7 +1158,7 @@ bool daxfs_overlay_dir_has_entries(struct daxfs_info *info, u64 parent_ino)
 		    !(le32_to_cpu(de->flags) & DAXFS_OVL_DIRENT_TOMBSTONE))
 			return true;
 
-		off = le64_to_cpu(READ_ONCE(de->dir_next));
+		off = daxfs_load_once64(ovl->mem_model, &de->dir_next);
 	}
 
 	return false;
@@ -1191,12 +1189,12 @@ int daxfs_overlay_iterate_dir(struct daxfs_info *info,
 	if (!dl)
 		return 0; /* No overlay entries for this directory */
 
-	off = le64_to_cpu(READ_ONCE(dl->first));
+	off = daxfs_load_once64(ovl->mem_model, &dl->first);
 
 	while (off != DAXFS_OVL_NO_NEXT && limit-- > 0) {
 		struct daxfs_ovl_dirent_entry *de;
 
-		smp_rmb();
+		daxfs_observe_fence(ovl->mem_model);
 		de = overlay_pool_ptr(ovl, off, sizeof(*de));
 		if (!de)
 			return -EIO;
@@ -1204,7 +1202,7 @@ int daxfs_overlay_iterate_dir(struct daxfs_info *info,
 		if (!overlay_emit_dirent(de, parent_ino, ctx, pos))
 			return 0;
 
-		off = le64_to_cpu(READ_ONCE(de->dir_next));
+		off = daxfs_load_once64(ovl->mem_model, &de->dir_next);
 	}
 
 	return 0;

@@ -14,9 +14,9 @@ and synchronization with `cmpxchg`.
 ## Features
 
 - **Zero-copy reads** - Direct memory access, no page cache overhead
-- **Lock-free writes** - CAS-based hash overlay, no locks across kernels or hosts
-- **Shared page cache** - Demand-paged cache in DAX memory, automatically visible to all kernels and hosts
-- **Multi-kernel/multi-host namespace** - Each kernel or CXL host exports local storage into a shared filesystem
+- **Lock-free writes** - CAS-based hash overlay, no locks between participants in one cache-coherence domain (see [Coherence model](docs/COHERENCE.md))
+- **Shared page cache** - Demand-paged cache in DAX memory, visible to all participants sharing a cache-coherent domain
+- **Multi-kernel namespace** - Each kernel instance exports local storage into a shared filesystem (multikernel, single coherence domain); cross-host CXL is gated future work (see [Coherence model](docs/COHERENCE.md))
 - **Flexible backing** - Physical address, DAX device, or dma-buf
 - **Security by simplicity** - Flat directory format, bounded validation, no pointer chasing
 
@@ -51,13 +51,15 @@ CXL shared memory, but they differ fundamentally in architecture:
 | **Allocation** | Self-contained image with internal bump allocator | Per-file extent lists allocated by master |
 | **File operations** | Create, read, write (COW), delete (tombstone) | Pre-allocate only (no append, truncate, or delete) |
 | **Image model** | Self-contained: superblock + base image + overlay + pcache in one region | No images; files are individually mapped extents |
-| **CXL multi-host atomics** | Core design primitive: all metadata and cache transitions use `cmpxchg` on shared memory | Not used; relies on single-writer log for metadata consistency |
+| **Coherence model** | Lock-free `cmpxchg` within one hardware cache-coherence domain (multikernel); cross-host CXL requires CXL 3.0 hardware coherence and is gated/unvalidated (see [Coherence model](docs/COHERENCE.md)) | Single-writer log; user manages coherency |
 | **Layered storage** | Base image + overlay (shared base with per-instance COW) | No layering concept |
 
 FamFS is a thin mapping layer that exposes pre-allocated files on shared memory.
-DAXFS is a general-purpose shared in-memory filesystem that uses CXL shared memory
-atomics for lock-free multi-host coordination: concurrent writes, cooperative
-caching, and layered storage without a central coordinator.
+DAXFS is a general-purpose shared in-memory filesystem that uses shared-memory
+atomics for lock-free coordination within a cache-coherence domain: concurrent
+writes, cooperative caching, and layered storage without a central coordinator.
+Cross-host CXL operation requires hardware coherence and is gated future work;
+see [Coherence model](docs/COHERENCE.md).
 
 ## Building
 
@@ -162,9 +164,12 @@ Write path: COW from base image into overlay data page.
 
 ### Shared Page Cache
 
-Direct-mapped cache in DAX memory for backing store mode. Because DAX memory is
-physically shared across kernel instances and CXL hosts, the cache is automatically
-visible to all participants with no coherency protocol.
+Direct-mapped cache in DAX memory for backing store mode. Within a single
+hardware cache-coherence domain (e.g. multiple kernel instances on one
+coherent machine), the cache is visible to all participants via hardware
+coherence with no software coherency protocol. Cross-host CXL sharing requires
+hardware coherence (CXL 3.0) and is gated future work; see
+[Coherence model](docs/COHERENCE.md).
 
 - **3-state machine**: FREE → PENDING → VALID, all transitions via `cmpxchg`
 - **Multi-file tags**: `tag = (ino << 20) | pgoff`, multiple backing files share one cache
