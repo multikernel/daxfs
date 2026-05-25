@@ -198,6 +198,8 @@ static int overlay_insert(struct daxfs_overlay *ovl, u64 key, u64 pool_offset,
 		}
 	}
 
+	pr_warn_ratelimited("daxfs: overlay hash table full (%u buckets); increase -B at mkfs\n",
+			    ovl->bucket_count);
 	return -ENOSPC;
 }
 

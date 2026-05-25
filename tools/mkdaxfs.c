@@ -390,6 +390,21 @@ static uint32_t prev_power_of_2(uint32_t v)
 	return v - (v >> 1);
 }
 
+/*
+ * Smallest power of 2 >= v, clamped to 2^31 so the result fits the __le32
+ * overlay_bucket_count field.
+ */
+static uint32_t next_power_of_2_u64(uint64_t v)
+{
+	uint32_t p = 1;
+
+	if (v == 0)
+		return 1;
+	while (p < v && p < (1u << 31))
+		p <<= 1;
+	return p;
+}
+
 static uint32_t calc_ilog2(uint32_t v)
 {
 	uint32_t r = 0;
@@ -1320,11 +1335,9 @@ int main(int argc, char *argv[])
 			print_usage(argv[0]);
 			return 1;
 		}
-		/* Default overlay settings for empty mode */
+		/* Default overlay pool for empty mode (buckets auto-sized below) */
 		if (!overlay_pool_size)
 			overlay_pool_size = DAXFS_DEFAULT_OVERLAY_POOL;
-		if (!overlay_buckets)
-			overlay_buckets = DAXFS_DEFAULT_BUCKET_COUNT;
 	} else if (!src_dir) {
 		fprintf(stderr, "Error: -d/--directory is required (or use --empty)\n");
 		print_usage(argv[0]);
@@ -1343,17 +1356,30 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	/* Default overlay for split/export mode */
+	/* Default overlay pool for split/export mode (buckets auto-sized below) */
 	if (split_mode || export_mode) {
 		if (!overlay_pool_size)
 			overlay_pool_size = DAXFS_DEFAULT_OVERLAY_POOL;
-		if (!overlay_buckets)
-			overlay_buckets = DAXFS_DEFAULT_BUCKET_COUNT;
 	}
 
-	/* Default bucket count when overlay specified */
-	if (overlay_pool_size && !overlay_buckets)
-		overlay_buckets = DAXFS_DEFAULT_BUCKET_COUNT;
+	/*
+	 * Auto-size the overlay bucket count from the pool unless the user gave
+	 * -B. Each overlay object (data page, inode, dirent) consumes one
+	 * bucket, so writable capacity is min(pool_pages, buckets); a fixed
+	 * default would cap a large pool (e.g. 64K buckets => 256MB at 4K pages
+	 * regardless of -O). Target ~2x pool pages so the open-addressed table
+	 * stays near 0.5 load (linear probing degrades badly when full) and
+	 * leaves room for metadata buckets. Floor at the historical default so
+	 * small pools and existing behavior are unchanged.
+	 */
+	if (overlay_pool_size && !overlay_buckets) {
+		uint64_t pool_pages = (overlay_pool_size + block_size - 1) /
+				      block_size;
+
+		overlay_buckets = next_power_of_2_u64(pool_pages * 2);
+		if (overlay_buckets < DAXFS_DEFAULT_BUCKET_COUNT)
+			overlay_buckets = DAXFS_DEFAULT_BUCKET_COUNT;
+	}
 
 	has_overlay = (overlay_pool_size > 0);
 

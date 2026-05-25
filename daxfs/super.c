@@ -338,15 +338,23 @@ static int daxfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_ffree = 0;
 
 	if (info->overlay) {
-		/* Estimate free space from overlay pool */
 		struct daxfs_overlay *ovl = info->overlay;
 		u64 pool_used = le64_to_cpu(ovl->header->pool_alloc);
 		u64 pool_size = le64_to_cpu(ovl->header->pool_size);
+		u64 used_pages = pool_used / info->block_size;
+		/*
+		 * Each overlay object consumes one hash bucket, so writable
+		 * capacity is bounded by both the pool and the fixed bucket
+		 * count, whichever is smaller. Report that instead of the raw
+		 * DAX region size so df reflects the real limit (a large pool
+		 * with too few buckets otherwise looks far emptier than it is).
+		 */
+		u64 cap_pages = min_t(u64, pool_size / info->block_size,
+				      (u64)ovl->bucket_count);
 
-		if (pool_size > pool_used) {
-			buf->f_bfree = (pool_size - pool_used) / info->block_size;
-			buf->f_bavail = buf->f_bfree;
-		}
+		buf->f_blocks = cap_pages;
+		buf->f_bfree = cap_pages > used_pages ? cap_pages - used_pages : 0;
+		buf->f_bavail = buf->f_bfree;
 		buf->f_ffree = UINT_MAX;
 	}
 
