@@ -341,7 +341,7 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
-	loff_t pos = iocb->ki_pos;
+	loff_t pos;
 	size_t len = iov_iter_count(from);
 	size_t total = 0;
 
@@ -350,6 +350,16 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	if (len == 0)
 		return 0;
+
+	/*
+	 * O_APPEND: the write must land at the current end of file. The
+	 * VFS leaves IOCB_APPEND positioning to the filesystem's write_iter,
+	 * so without this an append-mode fd writes at its stale ki_pos
+	 * (0 on a freshly opened fd), corrupting the file.
+	 */
+	if (iocb->ki_flags & IOCB_APPEND)
+		iocb->ki_pos = i_size_read(inode);
+	pos = iocb->ki_pos;
 
 	/* Batch-preallocate overlay pages for multi-page writes */
 	{
