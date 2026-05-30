@@ -253,6 +253,23 @@ static int daxfs_unlink(struct inode *dir, struct dentry *dentry)
 		return ret;
 
 	drop_nlink(inode);
+
+	/*
+	 * Persist the decremented link count so a hard-linked inode reports
+	 * the right nlink after remount. Only meaningful when an overlay
+	 * inode entry exists (it always does for a still-referenced inode
+	 * that was created or hard-linked in the overlay).
+	 */
+	{
+		struct daxfs_ovl_inode_entry *oie;
+
+		oie = daxfs_overlay_get_inode(info, inode->i_ino);
+		if (oie) {
+			WRITE_ONCE(oie->nlink, cpu_to_le32(inode->i_nlink));
+			smp_wmb();
+		}
+	}
+
 	inode_set_ctime_current(inode);
 	inode_set_mtime_to_ts(dir,
 		inode_set_ctime_to_ts(dir, current_time(dir)));
@@ -364,6 +381,82 @@ static int daxfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	inode_set_mtime_to_ts(dir,
 		inode_set_ctime_to_ts(dir, current_time(dir)));
 
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+/*
+ * Hard link: add a second name in @dir for the inode behind @old_dentry.
+ *
+ * The new dirent points at the existing inode number, so lookup of either
+ * name resolves to the same overlay inode entry. The link count is bumped
+ * both on the VFS inode and in the persisted overlay entry; if the target
+ * still lives only in the read-only base image, an overlay entry is
+ * materialized from current VFS state first (same copy-up as ->setattr).
+ */
+static int daxfs_link(struct dentry *old_dentry, struct inode *dir,
+		      struct dentry *dentry)
+{
+	struct daxfs_info *info = DAXFS_SB(dir->i_sb);
+	struct inode *inode = d_inode(old_dentry);
+	struct daxfs_ovl_inode_entry *existing;
+	u32 new_nlink;
+	int ret;
+
+	if (!info->overlay)
+		return -EROFS;
+
+	if (dentry->d_name.len > DAXFS_NAME_MAX)
+		return -ENAMETOOLONG;
+
+	/* VFS rejects directory hard links before calling us; guard anyway. */
+	if (S_ISDIR(inode->i_mode))
+		return -EPERM;
+
+	new_nlink = inode->i_nlink + 1;
+
+	/* Persist the bumped link count in the overlay inode entry. */
+	existing = daxfs_overlay_get_inode(info, inode->i_ino);
+	if (existing) {
+		WRITE_ONCE(existing->nlink, cpu_to_le32(new_nlink));
+		smp_wmb();
+	} else {
+		struct daxfs_ovl_inode_entry ie;
+
+		ie.type = cpu_to_le32(DAXFS_OVL_INODE);
+		ie.mode = cpu_to_le32(inode->i_mode);
+		ie.uid = cpu_to_le32(from_kuid(&init_user_ns, inode->i_uid));
+		ie.gid = cpu_to_le32(from_kgid(&init_user_ns, inode->i_gid));
+		ie.size = cpu_to_le64(inode->i_size);
+		ie.nlink = cpu_to_le32(new_nlink);
+		ie.flags = 0;
+
+		ret = daxfs_overlay_set_inode(info, inode->i_ino, &ie);
+		if (ret)
+			return ret;
+	}
+
+	/* New name -> same inode number. */
+	ret = daxfs_overlay_create_dirent(info, dir->i_ino, inode->i_ino,
+					  inode->i_mode,
+					  dentry->d_name.name,
+					  dentry->d_name.len);
+	if (ret) {
+		/* Roll back the link-count bump on failure. */
+		existing = daxfs_overlay_get_inode(info, inode->i_ino);
+		if (existing) {
+			WRITE_ONCE(existing->nlink, cpu_to_le32(new_nlink - 1));
+			smp_wmb();
+		}
+		return ret;
+	}
+
+	inc_nlink(inode);
+	inode_set_ctime_current(inode);
+	inode_set_mtime_to_ts(dir,
+		inode_set_ctime_to_ts(dir, current_time(dir)));
+
+	ihold(inode);
 	d_instantiate(dentry, inode);
 	return 0;
 }
@@ -487,6 +580,7 @@ const struct inode_operations daxfs_dir_inode_ops = {
 	.lookup		= daxfs_lookup,
 	.create		= daxfs_create,
 	.mkdir		= daxfs_mkdir,
+	.link		= daxfs_link,
 	.unlink		= daxfs_unlink,
 	.rmdir		= daxfs_rmdir,
 	.rename		= daxfs_rename,
