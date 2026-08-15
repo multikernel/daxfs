@@ -159,6 +159,15 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	info->sb = sb;
 	sb->s_time_gran = 1;
 
+	/*
+	 * The alloc_super() default is MAX_NON_LFS (2 GiB), which caps llseek
+	 * and writes far below what a base image can hold; shared model
+	 * weights are routinely larger. Writable files have a tighter ceiling
+	 * from the overlay's 20-bit page offset, but that is per-inode and
+	 * enforced where pages are allocated, not here.
+	 */
+	sb->s_maxbytes = MAX_LFS_FILESIZE;
+
 	if (ctx->backing_path && ctx->export_path) {
 		pr_err("daxfs: 'backing' and 'export' are mutually exclusive\n");
 		ret = -EINVAL;
