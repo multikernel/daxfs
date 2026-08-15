@@ -138,9 +138,23 @@ void *daxfs_base_file_data(struct daxfs_info *info,
 		return page + intra;
 	}
 
-	return daxfs_mem_ptr(info,
-			     le64_to_cpu(info->super->base_offset) +
-			     data_offset + pos);
+	/*
+	 * Bound the run against the mapped region, not just its start: the
+	 * caller copies *out_len bytes from this pointer, and a truncated or
+	 * malformed image can put data_offset+size past the end.
+	 */
+	{
+		u64 off = le64_to_cpu(info->super->base_offset) +
+			  data_offset + pos;
+
+		if (off >= info->size)
+			return NULL;
+		if (len > info->size - off)
+			len = info->size - off;
+		if (out_len)
+			*out_len = len;
+		return info->mem + off;
+	}
 }
 
 /*
@@ -217,8 +231,8 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 						      (size_t)PAGE_SIZE);
 				}
 
-				if (copy_to_iter(page + intra, contig,
-						 to) != contig)
+				if (daxfs_copy_to_iter(info, page + intra,
+						       contig, to) != contig)
 					return total ? total : -EFAULT;
 
 				pos += contig;
@@ -235,7 +249,7 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			break;
 		}
 
-		if (copy_to_iter(src, chunk, to) != chunk) {
+		if (daxfs_copy_to_iter(info, src, chunk, to) != chunk) {
 			daxfs_pcache_put_page(info, pcslot);
 			return total ? total : -EFAULT;
 		}
@@ -421,7 +435,8 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 				 GFP_KERNEL);
 		}
 
-		if (copy_from_iter(page + intra, chunk, from) != chunk)
+		if (daxfs_copy_from_iter(info, page + intra, chunk,
+					 from) != chunk)
 			return total ? total : -EFAULT;
 
 		pos += chunk;

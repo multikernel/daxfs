@@ -167,6 +167,10 @@ extern void daxfs_mem_exit(struct daxfs_info *info);
 
 /* Pointer/offset conversion */
 extern void *daxfs_mem_ptr(struct daxfs_info *info, u64 offset);
+extern size_t daxfs_copy_to_iter(struct daxfs_info *info, void *src,
+				 size_t len, struct iov_iter *to);
+extern size_t daxfs_copy_from_iter(struct daxfs_info *info, void *dst,
+				   size_t len, struct iov_iter *from);
 extern u64 daxfs_mem_offset(struct daxfs_info *info, void *ptr);
 extern phys_addr_t daxfs_mem_phys(struct daxfs_info *info, u64 offset);
 

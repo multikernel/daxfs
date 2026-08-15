@@ -12,6 +12,7 @@
 #include <linux/slab.h>
 #include <linux/dma-buf.h>
 #include <linux/mm.h>
+#include <linux/uio.h>
 #include "daxfs.h"
 
 /**
@@ -111,6 +112,54 @@ void *daxfs_mem_ptr(struct daxfs_info *info, u64 offset)
 	if (offset >= info->size)
 		return NULL;
 	return info->mem + offset;
+}
+
+/* Is [ptr, ptr+len) entirely inside the mapped DAX region? */
+static bool daxfs_in_region(struct daxfs_info *info, void *ptr, size_t len)
+{
+	size_t off;
+
+	if (!info->mem || ptr < info->mem)
+		return false;
+
+	off = (char *)ptr - (char *)info->mem;
+	if (off > info->size)
+		return false;
+
+	return len <= info->size - off;
+}
+
+/*
+ * Copy between the DAX region and userspace.
+ *
+ * copy_to_iter() runs hardened usercopy's check_heap_object() on the source,
+ * and for a vmalloc address that means find_vmap_area(): a vmap node spinlock
+ * per call, plus a walk backwards across nodes because one vmap_area spans
+ * the whole region while addr_to_node_id() changes every vmap_zone_size
+ * bytes. Every backend lands there except memremap() over system RAM
+ * (dma_buf_vmap() vmaps, and memremap() falls back to ioremap() for memory
+ * the kernel does not own, which is the multikernel spawn case).
+ *
+ * Bypass the check as drivers/dax/super.c does, after bounds-checking the
+ * range ourselves. The userspace side is already validated by access_ok()
+ * in the vfs read/write path.
+ */
+size_t daxfs_copy_to_iter(struct daxfs_info *info, void *src, size_t len,
+			  struct iov_iter *to)
+{
+	if (WARN_ON_ONCE(!daxfs_in_region(info, src, len)))
+		return 0;
+
+	return _copy_to_iter(src, len, to);
+}
+
+size_t daxfs_copy_from_iter(struct daxfs_info *info, void *dst, size_t len,
+			    struct iov_iter *from)
+{
+	if (WARN_ON_ONCE(!daxfs_in_region(info, dst, len)))
+		return 0;
+
+	return _copy_from_iter(dst, len, from);
 }
 
 /**
