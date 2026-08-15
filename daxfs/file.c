@@ -30,8 +30,10 @@ static void daxfs_refresh_isize(struct inode *inode, struct daxfs_info *info)
 	if (oie) {
 		loff_t ovl_size = le64_to_cpu(READ_ONCE(oie->size));
 
-		if (ovl_size != inode->i_size)
+		if (ovl_size != inode->i_size) {
 			i_size_write(inode, ovl_size);
+			daxfs_update_blocks(inode);
+		}
 	}
 }
 
@@ -434,6 +436,7 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		struct daxfs_ovl_inode_entry *oie;
 
 		inode->i_size = pos;
+		daxfs_update_blocks(inode);
 		oie = daxfs_overlay_get_inode(info, inode->i_ino);
 		if (oie) {
 			/*
@@ -512,8 +515,10 @@ static int daxfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	 * must update i_size itself.  Use truncate_setsize() which
 	 * also invalidates any stale pagecache above the new size.
 	 */
-	if (attr->ia_valid & ATTR_SIZE)
+	if (attr->ia_valid & ATTR_SIZE) {
 		truncate_setsize(inode, attr->ia_size);
+		daxfs_update_blocks(inode);
+	}
 
 	setattr_copy(idmap, inode, attr);
 	return 0;

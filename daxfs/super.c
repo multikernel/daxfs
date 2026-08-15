@@ -193,6 +193,15 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto err_unmap;
 	}
 
+	/*
+	 * Left unset, s_blocksize_bits stays 0, every inode inherits
+	 * i_blkbits == 0, and stat() reports st_blksize == 1. Tools that size
+	 * their I/O buffer from st_blksize (cp, tar, stdio) then fall back to
+	 * one byte per syscall.
+	 */
+	sb->s_blocksize = info->block_size;
+	sb->s_blocksize_bits = ilog2(info->block_size);
+
 	/* Validate overall image structure bounds (if requested) */
 	if (ctx->validate) {
 		ret = daxfs_validate_super(info);
