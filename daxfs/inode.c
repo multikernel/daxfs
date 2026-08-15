@@ -103,6 +103,7 @@ found:
 	inode->i_uid = make_kuid(&init_user_ns, uid);
 	inode->i_gid = make_kgid(&init_user_ns, gid);
 	inode->i_size = size;
+	daxfs_update_blocks(inode);
 	set_nlink(inode, nlink);
 
 	inode_set_mtime_to_ts(inode,

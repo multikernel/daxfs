@@ -146,6 +146,16 @@ extern void *daxfs_base_file_data(struct daxfs_info *info,
 				  loff_t pos, size_t len, size_t *out_len,
 				  s32 *pinned_slot);
 
+/*
+ * Keep i_blocks in sync with i_size. daxfs has no block allocator, but
+ * stat() consumers treat st_blocks == 0 as a fully sparse file: swapon(8)
+ * refuses such a file outright, and du/tar/rsync misreport it.
+ */
+static inline void daxfs_update_blocks(struct inode *inode)
+{
+	inode->i_blocks = (i_size_read(inode) + 511) >> 9;
+}
+
 /* inode.c */
 extern struct inode *daxfs_alloc_inode(struct super_block *sb);
 extern void daxfs_free_inode(struct inode *inode);
