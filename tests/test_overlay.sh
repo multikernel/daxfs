@@ -556,6 +556,44 @@ test_overlay_truncate() {
     pass "Truncate via overlay"
 }
 
+test_overlay_truncate_zeroes() {
+    run_test "Truncate discards data (no stale bytes on re-extend)"
+
+    local f="$MNT/trunc-stale.bin"
+
+    printf 'AAAAAAAAAAAAAAAA' > "$f" \
+        || { fail "Truncate zeroes" "Failed to create file"; return; }
+    truncate -s 0 "$f" \
+        || { fail "Truncate zeroes" "Failed to truncate"; return; }
+
+    # Re-extend past the old data. Everything below the write must read zero.
+    dd if=/dev/zero of="$f" bs=1 count=1 seek=65536 conv=notrunc status=none \
+        || { fail "Truncate zeroes" "Failed to re-extend"; return; }
+
+    local head
+    head=$(dd if="$f" bs=16 count=1 status=none | tr -d '\0')
+    if [ -n "$head" ]; then
+        fail "Truncate zeroes" "stale data after truncate: '$head'"
+        return
+    fi
+
+    # Same again for a partial page: the tail of the surviving page must go.
+    printf 'BBBBBBBBBBBBBBBB' > "$f"
+    truncate -s 4 "$f"
+    dd if=/dev/zero of="$f" bs=1 count=1 seek=4096 conv=notrunc status=none \
+        || { fail "Truncate zeroes" "Failed to re-extend (partial)"; return; }
+
+    local tail
+    tail=$(dd if="$f" bs=1 skip=4 count=12 status=none | tr -d '\0')
+    if [ -n "$tail" ]; then
+        fail "Truncate zeroes" "stale tail in partial page: '$tail'"
+        return
+    fi
+
+    rm -f "$f"
+    pass "Truncate discards data (no stale bytes on re-extend)"
+}
+
 #
 # Empty mode tests
 #
@@ -815,6 +853,7 @@ main() {
     test_overlay_symlink
     test_overlay_rename
     test_overlay_truncate
+    test_overlay_truncate_zeroes
 
     # Empty mode tests
     setup_empty

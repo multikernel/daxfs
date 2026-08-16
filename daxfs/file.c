@@ -471,6 +471,37 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	return total;
 }
 
+/*
+ * Discard overlay data from @from up to the old end of file @to.
+ *
+ * The pages are zeroed rather than unmapped and freed. Freeing them would
+ * mean deleting keys from the open-addressed overlay hash, which needs
+ * tombstones it has no state bit for, and for an inode with base image data
+ * behind it dropping the overlay page would re-expose the base contents
+ * instead of the zeros POSIX requires. Zeroing is correct for both cases and
+ * leaves the pages ready to be reused if the file is extended again.
+ */
+static void daxfs_truncate_overlay(struct daxfs_info *info,
+				   struct inode *inode, loff_t from, loff_t to)
+{
+	u64 pgoff = from >> PAGE_SHIFT;
+	u32 intra = from & (PAGE_SIZE - 1);
+	void *page;
+
+	if (intra) {
+		page = daxfs_overlay_get_page_cached(info, inode, pgoff);
+		if (page)
+			memset(page + intra, 0, PAGE_SIZE - intra);
+		pgoff++;
+	}
+
+	for (; ((loff_t)pgoff << PAGE_SHIFT) < to; pgoff++) {
+		page = daxfs_overlay_get_page_cached(info, inode, pgoff);
+		if (page)
+			memset(page, 0, PAGE_SIZE);
+	}
+}
+
 static int daxfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			 struct iattr *attr)
 {
@@ -478,6 +509,7 @@ static int daxfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
 	struct daxfs_ovl_inode_entry ie;
 	struct daxfs_ovl_inode_entry *existing;
+	loff_t old_size;
 	int ret;
 
 	if (!info->overlay)
@@ -488,12 +520,24 @@ static int daxfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		return ret;
 
 	/*
+	 * Capture the old size before anything overwrites it. Another host may
+	 * have extended the file past our cached i_size, and those pages need
+	 * discarding too.
+	 */
+	old_size = i_size_read(inode);
+
+	/*
 	 * If overlay inode exists, update individual fields in-place.
 	 * Each WRITE_ONCE is atomic for its field width, so concurrent
 	 * setattr calls touching different fields won't clobber each other.
 	 */
 	existing = daxfs_overlay_get_inode(info, inode->i_ino);
 	if (existing) {
+		loff_t ovl_size = le64_to_cpu(READ_ONCE(existing->size));
+
+		if (ovl_size > old_size)
+			old_size = ovl_size;
+
 		if (attr->ia_valid & ATTR_SIZE)
 			WRITE_ONCE(existing->size, cpu_to_le64(attr->ia_size));
 		if (attr->ia_valid & ATTR_MODE)
@@ -534,6 +578,11 @@ static int daxfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (attr->ia_valid & ATTR_SIZE) {
 		truncate_setsize(inode, attr->ia_size);
 		daxfs_update_blocks(inode);
+
+		/* After i_size shrinks, so readers cannot see the stale tail */
+		if (attr->ia_size < old_size)
+			daxfs_truncate_overlay(info, inode, attr->ia_size,
+					       old_size);
 	}
 
 	setattr_copy(idmap, inode, attr);
