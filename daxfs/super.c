@@ -222,12 +222,25 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (le64_to_cpu(info->super->base_offset)) {
 		u64 base_off = le64_to_cpu(info->super->base_offset);
 		struct daxfs_super *s = info->super;
+		u64 inode_off = base_off + le64_to_cpu(s->inode_offset);
+		u32 inode_count = le32_to_cpu(s->inode_count);
 
-		info->base_inodes = daxfs_mem_ptr(info,
-			base_off + le64_to_cpu(s->inode_offset));
+		/*
+		 * inode_count bounds every &base_inodes[ino - 1] lookup and
+		 * nothing downstream re-checks it, so the table has to be
+		 * mapped even when the caller did not ask for validation.
+		 */
+		if (!daxfs_valid_offset(info, inode_off, (u64)inode_count *
+					sizeof(struct daxfs_base_inode))) {
+			pr_err("daxfs: base inode table exceeds image bounds\n");
+			ret = -EINVAL;
+			goto err_unmap;
+		}
+
+		info->base_inodes = daxfs_mem_ptr(info, inode_off);
 		info->base_data_offset = base_off +
 			le64_to_cpu(s->data_offset);
-		info->base_inode_count = le32_to_cpu(s->inode_count);
+		info->base_inode_count = inode_count;
 
 		/* Validate base image structure (if requested) */
 		if (ctx->validate) {
