@@ -556,6 +556,55 @@ test_overlay_truncate() {
     pass "Truncate via overlay"
 }
 
+test_overlay_hole_reads() {
+    run_test "Holes read as zeros, not short"
+
+    local f="$MNT/hole.bin"
+    local pagesize=$(getconf PAGESIZE)
+    local size=$((pagesize * 4))
+
+    # A file extended by truncate has no overlay pages behind it at all.
+    : > "$f" || { fail "Hole reads" "Failed to create file"; return; }
+    truncate -s "$size" "$f" \
+        || { fail "Hole reads" "Failed to extend"; return; }
+
+    local got
+    got=$(wc -c < "$f")
+    if [ "$got" -ne "$size" ]; then
+        fail "Hole reads" "stat size is $got, expected $size"
+        return
+    fi
+
+    # read() must return the whole range as zeros rather than EOF at 0
+    got=$(dd if="$f" bs="$size" count=1 status=none | wc -c)
+    if [ "$got" -ne "$size" ]; then
+        fail "Hole reads" "read returned $got bytes, expected $size"
+        return
+    fi
+
+    if [ -n "$(dd if="$f" bs="$size" count=1 status=none | tr -d '\0')" ]; then
+        fail "Hole reads" "hole did not read as zeros"
+        return
+    fi
+
+    # A hole followed by real data: the read must cross the hole and find it
+    printf 'TAIL' | dd of="$f" bs=1 seek=$((size - 4)) conv=notrunc status=none
+    got=$(dd if="$f" bs=1 skip=$((size - 4)) count=4 status=none)
+    if [ "$got" != "TAIL" ]; then
+        fail "Hole reads" "data after hole not readable: '$got'"
+        return
+    fi
+
+    got=$(dd if="$f" bs="$size" count=1 status=none | wc -c)
+    if [ "$got" -ne "$size" ]; then
+        fail "Hole reads" "full read after hole returned $got, expected $size"
+        return
+    fi
+
+    rm -f "$f"
+    pass "Holes read as zeros, not short"
+}
+
 #
 # Empty mode tests
 #
@@ -815,6 +864,7 @@ main() {
     test_overlay_symlink
     test_overlay_rename
     test_overlay_truncate
+    test_overlay_hole_reads
 
     # Empty mode tests
     setup_empty
