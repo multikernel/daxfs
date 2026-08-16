@@ -56,6 +56,10 @@ static void daxfs_refresh_isize(struct inode *inode, struct daxfs_info *info)
  * If data comes from pcache, the slot is pinned (refcount incremented).
  * Caller MUST call daxfs_pcache_put_page(info, *pinned_slot) when done.
  * pinned_slot is set to -1 when data does not come from pcache.
+ *
+ * Returns a pointer to the data, NULL if the range is a hole (nothing in the
+ * overlay and nothing behind it in the base image), or ERR_PTR on failure.
+ * The two are not interchangeable: a hole reads as zeros, an error must not.
  */
 /*
  * Look up an overlay page, checking the per-inode DRAM cache first.
@@ -133,7 +137,7 @@ void *daxfs_base_file_data(struct daxfs_info *info,
 
 		page = daxfs_pcache_get_page(info, ino, pgoff, pinned_slot);
 		if (IS_ERR(page))
-			return NULL;
+			return ERR_CAST(page);
 		intra = pcache_off & (PAGE_SIZE - 1);
 		if (out_len)
 			*out_len = min(len, (size_t)(PAGE_SIZE - intra));
@@ -246,9 +250,29 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 		src = daxfs_base_file_data(info, inode, pos, count,
 					   &chunk, &pcslot);
+		if (IS_ERR(src))
+			return total ? total : PTR_ERR(src);
+
 		if (!src || chunk == 0) {
+			/*
+			 * A hole inside i_size: nothing in the overlay and
+			 * nothing behind it, which is what a file extended by
+			 * truncate looks like. POSIX reads that as zeros;
+			 * stopping here instead reports a false EOF mid-file.
+			 * Zero a page at a time so data after the hole is
+			 * still found on the next iteration.
+			 */
+			size_t hole = min(count, (size_t)(PAGE_SIZE -
+						(pos & (PAGE_SIZE - 1))));
+
 			daxfs_pcache_put_page(info, pcslot);
-			break;
+			if (iov_iter_zero(hole, to) != hole)
+				return total ? total : -EFAULT;
+
+			pos += hole;
+			count -= hole;
+			total += hole;
+			continue;
 		}
 
 		if (daxfs_copy_to_iter(info, src, chunk, to) != chunk) {
@@ -330,6 +354,15 @@ static void daxfs_write_prealloc(struct daxfs_info *info, struct inode *inode,
 			base_data = daxfs_base_file_data(info, inode,
 					(loff_t)pgoff << PAGE_SHIFT,
 					PAGE_SIZE, &base_len, &pcslot);
+			if (IS_ERR(base_data)) {
+				/*
+				 * Leave the page unpublished rather than COW
+				 * zeros over data we failed to read. The
+				 * per-page path retries and reports the error.
+				 */
+				pages[i] = NULL;
+				continue;
+			}
 			if (base_data && base_len > 0)
 				memcpy(page, base_data,
 				       min(base_len, (size_t)PAGE_SIZE));
@@ -417,6 +450,9 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 					inode,
 					(loff_t)pgoff << PAGE_SHIFT,
 					PAGE_SIZE, &base_len, &pcslot);
+				if (IS_ERR(base_data))
+					return total ? total :
+						PTR_ERR(base_data);
 				if (base_data && base_len > 0)
 					memcpy(page, base_data,
 					       min(base_len, (size_t)PAGE_SIZE));
@@ -607,15 +643,24 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 				base = daxfs_base_file_data(info, inode,
 							    pos, PAGE_SIZE,
 							    &base_len, &pcslot);
-				daxfs_copy_page(data, base, base_len);
-				daxfs_pcache_put_page(info, pcslot);
+				if (IS_ERR(base)) {
+					/* Do not COW zeros over data we
+					 * could not read; fall through to
+					 * the SIGBUS below.
+					 */
+					data = NULL;
+				} else {
+					daxfs_copy_page(data, base, base_len);
+					daxfs_pcache_put_page(info, pcslot);
 
-				/* Publish AFTER COW */
-				data = daxfs_overlay_publish_page(info,
-					inode->i_ino, pgoff, pool_off, data);
-				if (data)
-					xa_store(&DAXFS_I(inode)->ovl_pages,
-						 pgoff, data, GFP_KERNEL);
+					/* Publish AFTER COW */
+					data = daxfs_overlay_publish_page(info,
+						inode->i_ino, pgoff, pool_off,
+						data);
+					if (data)
+						xa_store(&DAXFS_I(inode)->ovl_pages,
+							 pgoff, data, GFP_KERNEL);
+				}
 			}
 		}
 		sb_end_pagefault(inode->i_sb);
@@ -642,6 +687,8 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 
 		data = daxfs_base_file_data(info, inode, pos,
 					    PAGE_SIZE, &len, &pcslot);
+		if (IS_ERR(data))
+			return VM_FAULT_SIGBUS;
 
 		/*
 		 * MAP_SHARED with page-aligned data: use direct PFN mapping.
@@ -719,14 +766,18 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 			base = daxfs_base_file_data(info, inode,
 						    pos, PAGE_SIZE,
 						    &base_len, &pcslot);
-			daxfs_copy_page(data, base, base_len);
-			daxfs_pcache_put_page(info, pcslot);
+			if (IS_ERR(base)) {
+				data = NULL;
+			} else {
+				daxfs_copy_page(data, base, base_len);
+				daxfs_pcache_put_page(info, pcslot);
 
-			data = daxfs_overlay_publish_page(info,
-				inode->i_ino, pgoff, pool_off, data);
-			if (data)
-				xa_store(&DAXFS_I(inode)->ovl_pages, pgoff,
-					 data, GFP_KERNEL);
+				data = daxfs_overlay_publish_page(info,
+					inode->i_ino, pgoff, pool_off, data);
+				if (data)
+					xa_store(&DAXFS_I(inode)->ovl_pages,
+						 pgoff, data, GFP_KERNEL);
+			}
 		}
 	}
 	sb_end_pagefault(inode->i_sb);
