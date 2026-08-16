@@ -696,6 +696,7 @@ int daxfs_pcache_init(struct daxfs_info *info, const char *backing_path)
 {
 	struct daxfs_pcache *pc;
 	u64 pcache_offset = le64_to_cpu(info->super->pcache_offset);
+	u64 pcache_size = le64_to_cpu(info->super->pcache_size);
 	struct daxfs_pcache_header *hdr;
 
 	if (!pcache_offset)
@@ -710,6 +711,12 @@ int daxfs_pcache_init(struct daxfs_info *info, const char *backing_path)
 	pc->block_size = info->block_size;
 	pc->block_shift = ilog2(info->block_size);
 
+	if (!daxfs_valid_offset(info, pcache_offset, sizeof(*hdr))) {
+		pr_err("daxfs: pcache header outside image bounds\n");
+		kfree(pc);
+		return -EINVAL;
+	}
+
 	hdr = daxfs_mem_ptr(info, pcache_offset);
 	if (le32_to_cpu(hdr->magic) != DAXFS_PCACHE_MAGIC) {
 		pr_err("daxfs: invalid pcache magic 0x%x\n",
@@ -722,10 +729,36 @@ int daxfs_pcache_init(struct daxfs_info *info, const char *backing_path)
 	/* Read layout from main superblock */
 	pc->slot_count = le32_to_cpu(info->super->pcache_slot_count);
 	pc->hash_mask = pc->slot_count - 1;
-	pc->slots = daxfs_mem_ptr(info,
-		pcache_offset + le64_to_cpu(hdr->slot_meta_offset));
-	pc->data = daxfs_mem_ptr(info,
-		pcache_offset + le64_to_cpu(hdr->slot_data_offset));
+
+	{
+		u64 meta_offset = le64_to_cpu(hdr->slot_meta_offset);
+		u64 data_offset = le64_to_cpu(hdr->slot_data_offset);
+		u64 meta_bytes = (u64)pc->slot_count *
+				 sizeof(struct daxfs_pcache_slot);
+		u64 data_bytes = (u64)pc->slot_count * pc->block_size;
+
+		/*
+		 * Same exposure as the overlay: every slot index in
+		 * [0, slot_count) is dereferenced without further checking,
+		 * so both arrays must be inside the pcache region and the
+		 * mapping.
+		 */
+		if (meta_offset > pcache_size ||
+		    meta_bytes > pcache_size - meta_offset ||
+		    data_offset > pcache_size ||
+		    data_bytes > pcache_size - data_offset ||
+		    !daxfs_valid_offset(info, pcache_offset + meta_offset,
+					meta_bytes) ||
+		    !daxfs_valid_offset(info, pcache_offset + data_offset,
+					data_bytes)) {
+			pr_err("daxfs: pcache slot arrays exceed region bounds\n");
+			kfree(pc);
+			return -EINVAL;
+		}
+
+		pc->slots = daxfs_mem_ptr(info, pcache_offset + meta_offset);
+		pc->data = daxfs_mem_ptr(info, pcache_offset + data_offset);
+	}
 
 	info->pcache = pc;
 

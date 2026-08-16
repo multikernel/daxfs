@@ -404,37 +404,88 @@ int daxfs_overlay_init(struct daxfs_info *info)
 {
 	struct daxfs_overlay *ovl;
 	u64 ovl_offset = le64_to_cpu(info->super->overlay_offset);
+	u64 ovl_size = le64_to_cpu(info->super->overlay_size);
 	struct daxfs_overlay_header *hdr;
+	u64 bucket_offset, bucket_bytes, pool_offset, pool_size;
+	u32 bucket_count;
 
 	if (!ovl_offset)
 		return 0;
 
-	ovl = kzalloc(sizeof(*ovl), GFP_KERNEL);
-	if (!ovl)
-		return -ENOMEM;
+	/* The header is dereferenced immediately below */
+	if (!daxfs_valid_offset(info, ovl_offset, sizeof(*hdr))) {
+		pr_err("daxfs: overlay header outside image bounds\n");
+		return -EINVAL;
+	}
 
 	hdr = daxfs_mem_ptr(info, ovl_offset);
 	if (le32_to_cpu(hdr->magic) != DAXFS_OVERLAY_MAGIC) {
 		pr_err("daxfs: invalid overlay magic 0x%x\n",
 		       le32_to_cpu(hdr->magic));
-		kfree(ovl);
 		return -EINVAL;
 	}
 	if (le32_to_cpu(hdr->version) != DAXFS_OVERLAY_VERSION) {
 		pr_err("daxfs: unsupported overlay version %u (expected %u)\n",
 		       le32_to_cpu(hdr->version), DAXFS_OVERLAY_VERSION);
-		kfree(ovl);
 		return -EINVAL;
 	}
 
+	bucket_count = le32_to_cpu(info->super->overlay_bucket_count);
+	bucket_offset = le64_to_cpu(hdr->bucket_offset);
+	pool_offset = le64_to_cpu(hdr->pool_offset);
+	pool_size = le64_to_cpu(hdr->pool_size);
+
+	/*
+	 * bucket_mask is bucket_count - 1 and is applied to every probe, so a
+	 * non-power-of-two count silently stops covering the array.
+	 */
+	if (!bucket_count || !is_power_of_2(bucket_count)) {
+		pr_err("daxfs: overlay bucket_count %u is not a power of 2\n",
+		       bucket_count);
+		return -EINVAL;
+	}
+
+	bucket_bytes = (u64)bucket_count *
+		       sizeof(struct daxfs_overlay_bucket);
+
+	/*
+	 * These three come from the image and are never re-checked: every
+	 * index in [0, bucket_count) is dereferenced by the probe loops, and
+	 * overlay_pool_ptr() bounds pool offsets against pool_size alone. Both
+	 * spans must therefore sit inside the overlay region and the mapping,
+	 * or a malformed image reads and CAS-writes outside it.
+	 */
+	if (bucket_offset > ovl_size ||
+	    bucket_bytes > ovl_size - bucket_offset ||
+	    pool_offset > ovl_size ||
+	    pool_size > ovl_size - pool_offset) {
+		pr_err("daxfs: overlay bucket/pool exceed the overlay region\n");
+		return -EINVAL;
+	}
+
+	if (!daxfs_valid_offset(info, ovl_offset + bucket_offset,
+				bucket_bytes) ||
+	    !daxfs_valid_offset(info, ovl_offset + pool_offset, pool_size)) {
+		pr_err("daxfs: overlay bucket/pool exceed image bounds\n");
+		return -EINVAL;
+	}
+
+	if (bucket_offset < pool_offset + pool_size &&
+	    pool_offset < bucket_offset + bucket_bytes) {
+		pr_err("daxfs: overlay bucket array overlaps the pool\n");
+		return -EINVAL;
+	}
+
+	ovl = kzalloc(sizeof(*ovl), GFP_KERNEL);
+	if (!ovl)
+		return -ENOMEM;
+
 	ovl->header = hdr;
 	ovl->mem_model = info->mem_model;
-	ovl->bucket_count = le32_to_cpu(info->super->overlay_bucket_count);
-	ovl->bucket_mask = ovl->bucket_count - 1;
-	ovl->buckets = daxfs_mem_ptr(info,
-		ovl_offset + le64_to_cpu(hdr->bucket_offset));
-	ovl->pool = daxfs_mem_ptr(info,
-		ovl_offset + le64_to_cpu(hdr->pool_offset));
+	ovl->bucket_count = bucket_count;
+	ovl->bucket_mask = bucket_count - 1;
+	ovl->buckets = daxfs_mem_ptr(info, ovl_offset + bucket_offset);
+	ovl->pool = daxfs_mem_ptr(info, ovl_offset + pool_offset);
 
 	info->overlay = ovl;
 
